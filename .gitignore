@@ -1,0 +1,12 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+*.log
+.env
+dist-mobile/
+mobile/src-tauri/gen/schemas/
+mobile/src-tauri/gen/android/.gradle/
+mobile/src-tauri/gen/android/app/src/main/jniLibs/
+*.jks
+keystore.properties

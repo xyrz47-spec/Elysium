@@ -1,0 +1,93 @@
+/* Elysium — 회색 계열 바탕에 차분한 청록(#79b8b3) 한 가지만 강조로 쓴다.
+   다크(먹색)와 화이트(옅은 회색) 두 테마. 모든 요소는 들어올 때·누를 때·바뀔 때 움직인다. */
+:root {
+  --c1: #121316;
+  --c2: #1b1d21;
+  --c3: #5d6168;
+  --c4: #79b8b3;
+  --c5: #b9d8d5;
+  --spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --font: "Pretendard Variable", "Pretendard", "Malgun Gothic", system-ui, sans-serif;
+  --display: "Orbitron Variable", "Pretendard Variable", sans-serif;
+  --mono: "JetBrains Mono Variable", "Cascadia Mono", Consolas, monospace;
+}
+/* 다크(기본) */
+:root, :root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #131417;
+  --ink: #ececee;
+  --muted: #a7a9b0;
+  --dim: #6f727a;
+  --line: rgba(255, 255, 255, 0.07);
+  --line-2: rgba(255, 255, 255, 0.13);
+  --surface: rgba(30, 32, 37, 0.78);
+  --surface-2: #1c1e22;
+  --card: #1f2125;
+  --rail: rgba(22, 23, 27, 0.82);
+  --off: #33363c;
+  --accent: #79b8b3;
+  --accent-2: #a9c3d0;
+  --hl: #8fd0ca;
+  --accent-rgb: 121, 184, 179;
+  --accent2-rgb: 169, 195, 208;
+  --hl-rgb: 143, 208, 202;
+  --shade-rgb: 0, 0, 0;
+  --err-rgb: 232, 120, 112;
+  --err: #e87870;
+  --accent-ink: #9fd3ce;
+  --warn-ink: #e0b26c;
+  --on-grad: #131417;
+  --strong: #ffffff;
+  --grad: linear-gradient(135deg, #8cc6c1, #b4c9d4);
+  --grad-ai: linear-gradient(135deg, #5d6168, #79b8b3);
+  --code-bg: #0d0e10;
+  --code-head: #17181b;
+  --code-ink: #e4ecea;
+  --code-dim: #858a92;
+  --shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  --shadow-lg: 0 24px 60px rgba(0, 0, 0, 0.5);
+  --ambient-1: rgba(255, 255, 255, 0.05);
+  --ambient-2: rgba(121, 184, 179, 0.1);
+  --ambient-3: rgba(169, 195, 208, 0.06);
+}
+/* 화이트 */
+:root[data-theme="light"] {
+  color-scheme: light;
+  /* 바탕은 차가운 중간 회색, 그 위의 카드·패널·칩은 흰색이라 경계가 분명하다 */
+  --bg: #dfe2e6;
+  --ink: #15171a;
+  --muted: #40444c;
+  --dim: #5f636c;
+  --line: rgba(20, 24, 30, 0.12);
+  --line-2: rgba(20, 24, 30, 0.22);
+  --surface: rgba(255, 255, 255, 0.92);
+  --surface-2: #edf0f3;
+  --card: #ffffff;
+  --rail: rgba(255, 255, 255, 0.9);
+  --off: #c3c7ce;
+  --accent: #3f8f8a;
+  --accent-2: #6b8fa3;
+  --hl: #5aa7a1;
+  --accent-rgb: 63, 143, 138;
+  --accent2-rgb: 107, 143, 163;
+  --hl-rgb: 90, 167, 161;
+  --shade-rgb: 20, 22, 26;
+  --err-rgb: 200, 70, 62;
+  --err: #c8463e;
+  --accent-ink: #256b66;
+  --warn-ink: #8a5c12;
+  --on-grad: #ffffff;
+  --strong: #111214;
+  --grad: linear-gradient(135deg, #4c9c96, #6b8fa3);
+  --grad-ai: linear-gradient(135deg, #8b8e96, #5aa7a1);
+  --code-bg: #1b1d21;
+  --code-head: #25272c;
+  --code-ink: #e9eeed;
+  --code-dim: #8f949c;
+  --shadow: 0 1px 2px rgba(20, 22, 26, 0.08), 0 10px 28px rgba(20, 22, 26, 0.12);
+  --shadow-lg: 0 2px 4px rgba(20, 22, 26, 0.08), 0 24px 56px rgba(20, 22, 26, 0.18);
+  --ambient-1: rgba(0, 0, 0, 0.035);
+  --ambient-2: rgba(63, 143, 138, 0.1);
+  --ambient-3: rgba(107, 143, 163, 0.08);
+}

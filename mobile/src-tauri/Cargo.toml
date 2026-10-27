@@ -1,0 +1,32 @@
+[package]
+name = "elysium-remote"
+version = "0.1.0"
+description = "Elysium Remote: 폰에서 PC의 엘리시움 세션을 제어한다"
+edition = "2021"
+
+[lib]
+name = "elysium_remote_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2.12", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "handshake", "__rustls-tls"] }
+futures-util = "0.3"
+sha2 = "0.10"
+
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+tauri-plugin-barcode-scanner = "2"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

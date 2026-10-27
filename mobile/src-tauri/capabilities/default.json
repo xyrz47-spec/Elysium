@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/mobile-schema.json",
+  "identifier": "default",
+  "description": "화면은 코어 이벤트와 QR 스캔만 쓴다. PC와의 통신은 Rust 명령(지문 고정 TLS)으로만 한다.",
+  "windows": ["main"],
+  "platforms": ["android", "iOS"],
+  "permissions": ["core:default", "barcode-scanner:default"]
+}

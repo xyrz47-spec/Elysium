@@ -1,0 +1,3 @@
+# OneDrive 동기화 폴더에 빌드 산출물이 올라가지 않도록 target을 밖으로 둔다.
+[build]
+target-dir = "C:/Users/HOYA/.elysium-build/mobile-target"
