@@ -1,5 +1,6 @@
 # Elysium
 
+<<<<<<< HEAD
 여러 AI(CLI: Claude Code·Codex·Antigravity, API: Claude·OpenAI·Gemini·NVIDIA)를 엮어 완성도 높은 답과 결과를 내는 데스크톱 AI 클라이언트입니다(Tauri 2 + Rust + React/TS, Windows 11).
 2026-10-17에 JARVIS에서 방향을 바꿨습니다. 음성·로컬 LLM 기능과 예전 코드·모델은 정리했습니다(2026-10-17 휴지통으로 이동).
 
@@ -178,3 +179,6 @@ CLI(확인·다시 찾기), API 키(저장·지우기·모델·확인), JEV(켜�
 - 프로젝트 폴더 이름은 아직 `Desktop\JARVIS`입니다.
 #   E l y s i u m  
  
+=======
+README안써
+>>>>>>> refs/remotes/origin/main
