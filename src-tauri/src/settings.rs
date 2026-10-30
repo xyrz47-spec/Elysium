@@ -23,15 +23,17 @@ pub struct Settings {
     /// AI CLI가 일하는 폴더. 작업 모드에서는 이 안에서만 파일을 고친다. None이면 문서\Elysium.
     pub workspace_dir: Option<String>,
     pub review: ReviewMode,
-    /// TypeSafe Jev로 요청 종류·난이도를 판단해 AI와 검토 여부를 고른다(요청 글이 TypeSafe로 전송됨).
+    /// TypeSafe Jev로 요청 종류·난이도를 판단해 AI와 검토 여부를 고르고, 세션 기억 중 필요한 부분만 골라 전달한다(요청 글·세션 기억이 TypeSafe로 전송됨).
     pub jev_enabled: bool,
     /// API 엔진별 모델 이름(engine id → model). 없으면 기본 모델.
     pub models: BTreeMap<String, String>,
+    /// 대화 요청마다 동시에 돌릴 에이전트 수(1이면 끔, 최대 5). 요청 글에서 따로 정하면 그 수를 쓴다.
+    pub agents: u8,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { workspace_dir: None, review: ReviewMode::Auto, jev_enabled: false, models: BTreeMap::new() }
+        Settings { workspace_dir: None, review: ReviewMode::Auto, jev_enabled: false, models: BTreeMap::new(), agents: 1 }
     }
 }
 
@@ -46,6 +48,7 @@ impl Settings {
     pub fn sanitized(mut self) -> Self {
         self.workspace_dir = self.workspace_dir.map(|d| d.trim().to_string()).filter(|d| !d.is_empty());
         self.models = self.models.into_iter().map(|(k, v)| (k, v.trim().to_string())).filter(|(_, v)| !v.is_empty()).collect();
+        self.agents = self.agents.clamp(1, crate::intent::MAX_AGENTS as u8);
         self
     }
 }
@@ -87,5 +90,10 @@ mod tests {
         assert_eq!(back.review, ReviewMode::Off);
         // 빈 문자열은 기본 폴더로
         assert!(Settings { workspace_dir: Some("   ".into()), ..Default::default() }.sanitized().workspace_dir.is_none());
+        // 예전 설정(에이전트 수 없음)은 1개로, 범위 밖은 1~5로
+        let old: Settings = serde_json::from_str(r#"{"review":"auto","jevEnabled":false,"models":{}}"#).unwrap();
+        assert_eq!(old.agents, 1);
+        assert_eq!(Settings { agents: 9, ..Default::default() }.sanitized().agents, 5);
+        assert_eq!(Settings { agents: 0, ..Default::default() }.sanitized().agents, 1);
     }
 }

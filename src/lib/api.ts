@@ -1,16 +1,18 @@
 // Rust 명령과 1:1로 대응하는 타입이 지정된 IPC 래퍼.
 import { invoke } from "@tauri-apps/api/core";
 
-export type CliId = "claude" | "codex" | "gemini";
+export type CliId = "claude" | "codex" | "antigravity";
 export type ApiId = "claude-api" | "openai" | "gemini-api" | "nvidia";
 export type EngineId = CliId | ApiId;
 export type EngineChoice = "auto" | EngineId;
 export type ReviewMode = "auto" | "always" | "off" | "debate";
 
-export const ENGINE_LABEL: Record<EngineId, string> = {
+/** 엔진 이름. 예전 기록의 "gemini"(Gemini CLI)는 Antigravity로 보인다. */
+export const ENGINE_LABEL: Record<string, string> = {
   claude: "Claude Code",
   codex: "Codex",
-  gemini: "Gemini CLI",
+  antigravity: "Antigravity",
+  gemini: "Antigravity",
   "claude-api": "Claude API",
   openai: "OpenAI API",
   "gemini-api": "Gemini API",
@@ -25,6 +27,8 @@ export interface Settings {
   review: ReviewMode;
   jevEnabled: boolean;
   models: Record<string, string>;
+  /** 대화 요청마다 동시에 돌릴 에이전트 수(1이면 끔, 최대 5) */
+  agents: number;
 }
 
 export interface EngineInfo {
@@ -67,7 +71,7 @@ export const TIER_LABEL: Record<Budget["tier"], string> = { light: "가볍게", 
 export interface Step {
   engine: EngineId;
   label: string;
-  role: "draft" | "review" | "debate" | "rebuttal" | "judge";
+  role: "draft" | "review" | "debate" | "rebuttal" | "judge" | "agent" | "synth";
   effort: string | null;
   model: string | null;
   ok: boolean;
@@ -106,6 +110,12 @@ export interface DebatePlan {
   rebuttal: boolean;
 }
 
+/** 동시 에이전트: 여러 AI가 같은 요청에 따로 답하고 종합 AI가 정리 */
+export interface TeamPlan {
+  agents: { engine: EngineId; model: string | null }[];
+  synth: EngineId;
+}
+
 export interface MessageData {
   steps?: Step[];
   work?: boolean;
@@ -115,6 +125,8 @@ export interface MessageData {
   draftedBy?: EngineId;
   reviewedBy?: EngineId;
   judgedBy?: EngineId;
+  synthBy?: EngineId;
+  team?: { agents: { engine: EngineId; model: string | null; ok: boolean; text: string }[]; synth: EngineId | null };
   debate?: { participants: EngineId[]; judge: EngineId | null; rounds: { round: number; engine: EngineId; text: string }[] };
   primary?: EngineId;
   reviewer?: EngineId | null;
@@ -123,6 +135,8 @@ export interface MessageData {
   error?: string;
   rejected?: boolean;
   engine?: EngineId | null;
+  /** '만들기'로 보낸 요청(사용자 메시지에 저장) */
+  build?: boolean;
 }
 
 export interface Message {
@@ -202,9 +216,12 @@ export const api = {
   conversationDelete: (conversationId: string) => invoke<void>("conversation_delete", { conversationId }),
   conversationSetWorkspace: (conversationId: string, path: string | null) => invoke<void>("conversation_set_workspace", { conversationId, path }),
   pickFolder: () => invoke<string | null>("pick_folder"),
-  chatSend: (conversationId: string | null, text: string, engine: EngineChoice, work: boolean, workspace: string | null) =>
-    invoke<{ conversationId: string; taskId: string; userMessageId: string }>("chat_send", { conversationId, text, engine, work, workspace }),
+  /** work: 작업 모드(허락을 받은 뒤 파일 수정) · build: '만들기' — 승인 없이 폴더 안에서 끝까지 완성(작업 모드 포함) */
+  chatSend: (conversationId: string | null, text: string, engine: EngineChoice, work: boolean, build: boolean, workspace: string | null) =>
+    invoke<{ conversationId: string; taskId: string; userMessageId: string }>("chat_send", { conversationId, text, engine, work: work || build, build, workspace }),
   taskCancel: (taskId: string) => invoke<boolean>("task_cancel", { taskId }),
+  /** 작업 중 메시지: API 작업 모드가 다음 차례에 읽는다. 받지 않는 AI면 오류 */
+  taskSteer: (taskId: string, text: string) => invoke<void>("task_steer", { taskId, text }),
   cancelAll: () => invoke<number>("cancel_all"),
   approvalList: () => invoke<Approval[]>("approval_list"),
   approvalDecide: (approvalId: string, approve: boolean) => invoke<Approval>("approval_decide", { approvalId, approve }),
@@ -220,6 +237,7 @@ export const api = {
   conversationExport: (conversationId: string) => invoke<string>("conversation_export", { conversationId }),
   memoryClear: (conversationId: string) => invoke<MemoryView>("memory_clear", { conversationId }),
   usageSummary: (range: UsageRange) => invoke<UsageSummary>("usage_summary", { range }),
+  pricingList: () => invoke<ModelPrice[]>("pricing_list"),
   remoteStatus: () => invoke<RemoteStatus>("remote_status"),
   remoteConfigure: (enabled: boolean, allowApprove: boolean) => invoke<RemoteStatus>("remote_configure", { enabled, allowApprove }),
   remotePairStart: () => invoke<PairInfo>("remote_pair_start"),
@@ -268,10 +286,22 @@ export interface EngineUsage {
   lastAt: string | null;
 }
 
+export interface ModelPrice {
+  engine: string;
+  engineLabel: string;
+  kind: "cli" | "api" | "jev";
+  model: string;
+  displayName: string;
+  inputUsdPerM: number;
+  outputUsdPerM: number;
+  description: string;
+}
+
 export interface UsageSummary {
   range: UsageRange;
   engines: EngineUsage[];
   days: { date: string; calls: number; tokens: number; costUsd: number }[];
+  pricing?: ModelPrice[];
 }
 
 export function errorText(e: unknown): string {

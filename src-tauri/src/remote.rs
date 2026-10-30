@@ -408,7 +408,8 @@ async fn send(State(ctx): State<Ctx>, Authed(d): Authed, Json(req): Json<SendReq
         None => None,
     };
     audit::record(&ctx.st.db, "remote", "remote.send", "ok", json!({ "device": d.name, "work": req.work }));
-    let r = orchestrator::send(&ctx.app, &ctx.st, req.conversation_id, req.text, choice, req.work, None).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
+    // 폰에서 보낸 작업은 '만들기'가 아니라 PC·폰의 허락을 받는 작업 모드로 돈다.
+    let r = orchestrator::send(&ctx.app, &ctx.st, req.conversation_id, req.text, choice, req.work, false, None).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
     Ok(Json(r))
 }
 

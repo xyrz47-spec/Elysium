@@ -15,7 +15,7 @@ import { FolderIcon } from "./components/Icons";
 
 /** 세션 머리: 제목과 이 세션의 작업 폴더(눌러서 바꾸기) */
 function SessionHead() {
-  const { conversations, conversationId, chooseFolder, engines, live } = useApp();
+  const { conversations, conversationId, chooseFolder, live } = useApp();
   const c = conversations.find((x) => x.id === conversationId);
   const busy = live.some((l) => l.conversationId === conversationId);
   return (
@@ -31,15 +31,6 @@ function SessionHead() {
       )}
       {c && <MemoryButton conversationId={c.id} />}
       <div className="spacer" />
-      <div className="head-engines" title="쓸 수 있는 AI">
-        {engines
-          .filter((e) => e.installed)
-          .map((e) => (
-            <span key={e.id} className={`mini-eng ${e.kind}`}>
-              {e.label}
-            </span>
-          ))}
-      </div>
     </header>
   );
 }

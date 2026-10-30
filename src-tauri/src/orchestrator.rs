@@ -4,7 +4,8 @@ use crate::audit;
 use crate::db::{new_id, Db};
 use crate::jev;
 use crate::secrets::{self, SecretName};
-use crate::engines::{self, EngineId, EngineInfo, Event, Outcome, RunSpec};
+use crate::engines::{self, EngineId, EngineInfo, Event, Outcome, RunSpec, Steer};
+use crate::intent;
 use crate::settings::{ReviewMode, Settings};
 use crate::skills::{self, Catalog, Skill};
 use crate::memory;
@@ -26,6 +27,8 @@ pub struct AppState {
     pub settings: RwLock<Settings>,
     pub engines: RwLock<Vec<EngineInfo>>,
     pub tasks: Mutex<HashMap<String, CancellationToken>>,
+    /// 작업 중 메시지 칸(작업 번호 → 칸). 작업이 끝나면 지운다.
+    pub steers: Mutex<HashMap<String, Steer>>,
     pub approvals: Mutex<HashMap<String, oneshot::Sender<bool>>>,
 }
 
@@ -85,6 +88,26 @@ pub struct Plan {
     pub budget: Option<Budget>,
     /// 정확도가 중요할 때: 두 AI가 따로 답하고(필요하면 서로 반론) 판정 AI가 정리한다
     pub debate: Option<Debate>,
+    /// 요청 글에서 고른 모델(엔진 → 모델). 그 엔진이 답할 때 기본값·JEV 모델보다 먼저 쓴다.
+    pub models: Vec<(EngineId, String)>,
+    /// 동시 에이전트: 여러 AI가 같은 요청에 동시에 따로 답하고 종합 AI가 하나로 정리한다(검토·토론 대신).
+    pub team: Option<Team>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamAgent {
+    pub engine: EngineId,
+    /// None이면 그 엔진의 기본(또는 JEV) 모델
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Team {
+    pub agents: Vec<TeamAgent>,
+    /// 답들을 하나로 종합하는 AI
+    pub synth: EngineId,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -164,6 +187,24 @@ pub async fn judge(http: &reqwest::Client, key: &str, text: &str) -> Result<Judg
     })
 }
 
+/// JEV 기억 거르기 결과(사용량 기록용 시간·비용 포함)
+pub struct MemoryFilter {
+    pub selection: memory::Selection,
+    pub ms: u64,
+    pub cost_usd: f64,
+}
+
+/// 세션 메모리(요약 항목·최근 대화)를 하나씩 "지금 요청에 필요한가"로 JEV에게 물어 필요한 것만 남긴다.
+/// 질문은 한 번의 요청으로 묶어 보낸다. Ok(None)은 거를 만큼 기억이 길지 않아 부르지 않은 것.
+pub async fn filter_memory(http: &reqwest::Client, key: &str, text: &str, summary: Option<&str>, history: &[memory::Turn]) -> Result<Option<MemoryFilter>, String> {
+    let Some(c) = memory::candidates(summary, history) else { return Ok(None) };
+    let (state, questions) = memory::filter_questions(text, &c, history);
+    let r = jev::ask(http, key, "jev-latest", state, questions, 1, Duration::from_secs(12)).await.map_err(|e| secrets::redact(&e.to_string()))?;
+    let a = &r.response.answers;
+    let selection = memory::select(&c, |k| jev::prob(a, k, "needed"));
+    Ok(Some(MemoryFilter { selection, ms: r.latency_ms, cost_usd: r.response.usage.input_tokens as f64 * JEV_PRICE / 1e6 }))
+}
+
 /// JEV 난이도로 정한 노력 단계. 쉬운 요청에 큰 모델·높은 노력을 쓰지 않아 토큰을 아낀다.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -198,7 +239,7 @@ fn strength(e: EngineId) -> u8 {
         EngineId::Claude => 7,
         EngineId::ClaudeApi => 6,
         EngineId::OpenAi | EngineId::Codex => 5,
-        EngineId::GeminiApi | EngineId::Gemini => 4,
+        EngineId::GeminiApi | EngineId::Antigravity => 4,
         EngineId::Nvidia => 2,
     }
 }
@@ -225,11 +266,11 @@ fn tier_label(t: &str) -> &'static str {
 fn order_for(kind: &str) -> Vec<EngineId> {
     use EngineId::*;
     match kind {
-        "code" => vec![Claude, Codex, Gemini, ClaudeApi, OpenAi, GeminiApi, Nvidia],
-        "research" => vec![Gemini, Claude, GeminiApi, ClaudeApi, OpenAi, Codex, Nvidia],
-        "chat" | "translate" => vec![GeminiApi, Nvidia, ClaudeApi, OpenAi, Claude, Gemini, Codex],
-        "writing" | "analysis" => vec![Claude, ClaudeApi, Gemini, GeminiApi, OpenAi, Codex, Nvidia],
-        _ => vec![Claude, Gemini, Codex, ClaudeApi, GeminiApi, OpenAi, Nvidia],
+        "code" => vec![Claude, Codex, Antigravity, ClaudeApi, OpenAi, GeminiApi, Nvidia],
+        "research" => vec![Antigravity, Claude, GeminiApi, ClaudeApi, OpenAi, Codex, Nvidia],
+        "chat" | "translate" => vec![GeminiApi, Nvidia, ClaudeApi, OpenAi, Claude, Antigravity, Codex],
+        "writing" | "analysis" => vec![Claude, ClaudeApi, Antigravity, GeminiApi, OpenAi, Codex, Nvidia],
+        _ => vec![Claude, Antigravity, Codex, ClaudeApi, GeminiApi, OpenAi, Nvidia],
     }
 }
 
@@ -267,7 +308,14 @@ fn complex(t: &str) -> bool {
     t.chars().count() >= 140 || DEEP_WORDS.iter().any(|w| t.contains(w))
 }
 
+#[cfg(test)]
 pub fn plan(text: &str, choice: Option<EngineId>, work_requested: bool, installed: &[EngineId], catalog: &Catalog, review: ReviewMode, jev: Option<&Judgment>) -> Result<Plan, String> {
+    plan_with(text, choice, work_requested, installed, catalog, review, jev, 1)
+}
+
+/// agents: 설정의 기본 동시 에이전트 수(1이면 끔). 요청 글에서 수나 모델을 여럿 정하면 그쪽이 먼저다.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_with(text: &str, choice: Option<EngineId>, work_requested: bool, installed: &[EngineId], catalog: &Catalog, review: ReviewMode, jev: Option<&Judgment>, agents: u8) -> Result<Plan, String> {
     let mut reasons = vec![];
     // 1) 스킬
     let (skill, prompt): (Option<&Skill>, String) = match catalog.explicit(text) {
@@ -283,6 +331,8 @@ pub fn plan(text: &str, choice: Option<EngineId>, work_requested: bool, installe
             None => (None, text.trim().to_string()),
         },
     };
+    // 모델·에이전트 수 지시("opus를 사용하여", "에이전트 3개로")는 엔진을 고르는 데만 쓰고 AI에게는 할 일만 넘긴다.
+    let prompt = intent::strip_directives(&prompt);
     if prompt.is_empty() {
         return Err("요청 내용이 비어 있습니다".into());
     }
@@ -293,7 +343,7 @@ pub fn plan(text: &str, choice: Option<EngineId>, work_requested: bool, installe
 
     // 2) 엔진
     if installed.is_empty() {
-        return Err("사용할 수 있는 AI가 없습니다. Claude Code·Codex·Gemini CLI를 설치하거나 설정에서 API 키를 넣으세요".into());
+        return Err("사용할 수 있는 AI가 없습니다. Claude Code·Codex·Antigravity를 설치하거나 설정에서 API 키를 넣으세요".into());
     }
     // 요청 종류: JEV가 충분히 확신하면 그 판단을, 아니면 규칙을 쓴다.
     let jev_task = jev.and_then(|j| j.task.clone().filter(|_| j.task_confidence.unwrap_or(0.0) >= JEV_MIN_CONFIDENCE));
@@ -302,21 +352,49 @@ pub fn plan(text: &str, choice: Option<EngineId>, work_requested: bool, installe
         reasons.push(format!("JEV: {} 요청으로 판단(확신 {:.0}%)", kind_label(t), j.task_confidence.unwrap_or(0.0) * 100.0));
     }
     let order = order_for(&kind);
-    // 작업 모드는 파일을 다룰 수 있는 CLI만 쓴다.
-    let usable = |e: &EngineId| installed.contains(e) && !(work && e.is_api());
-    let available: Vec<EngineId> = order.iter().copied().filter(usable).collect();
+    // 작업 모드도 API를 쓸 수 있다(엘리시움이 파일·PowerShell 도구를 대신 실행). 다만 CLI가 있으면 CLI가 먼저다.
+    let usable = |e: &EngineId| installed.contains(e);
+    let mut available: Vec<EngineId> = order.iter().copied().filter(usable).collect();
+    if work {
+        available.sort_by_key(|e| e.is_api());
+    }
     if available.is_empty() {
-        return Err("작업 모드(파일 수정)는 Claude Code·Codex·Gemini CLI 중 하나가 필요합니다. API로는 파일을 고칠 수 없습니다".into());
+        return Err("사용할 수 있는 AI가 없습니다".into());
     }
     let skill_engine = skill.and_then(|s| s.engine.as_deref()).and_then(EngineId::parse);
-    let (primary, fallbacks) = if let Some(c) = choice {
+    // 요청 글에서 고른 모델: 입력창에서 고른 AI보다 먼저 따른다(그 AI로 그 모델을 쓸 수 있으면 그 AI로).
+    let wanted = intent::requested_models(text, installed, work);
+    for m in &wanted.missing {
+        reasons.push(format!("요청하신 {m} 모델을 사용할 수 없어 사용 가능한 AI를 자동으로 선택했습니다"));
+    }
+    let mut models: Vec<(EngineId, String)> = vec![];
+    let picked = wanted.picks.first().map(|mp| match choice.and_then(|c| mp.alts.iter().find(|(e, _)| *e == c)) {
+        Some((e, m)) => (*e, m.clone(), mp),
+        None => (mp.engine, mp.model.clone(), mp),
+    });
+    let (primary, fallbacks) = if let Some((engine, model, mp)) = picked {
+        let (label, name) = (engine.label(), mp.name.as_str());
+        reasons.push(format!("요청하신 {name} 모델에 맞춰 {label}에서 답변을 생성합니다."));
+        if let Some(m) = model {
+            models.push((engine, m));
+        }
+        // 같은 모델을 쓸 수 있는 다른 AI가 있으면 실패할 때 그쪽으로 넘어간다.
+        let mut fb = vec![];
+        for (e, m) in mp.alts.iter().filter(|(e, _)| *e != engine) {
+            if let Some(m) = m {
+                models.push((*e, m.clone()));
+            }
+            fb.push(*e);
+        }
+        (engine, fb)
+    } else if let Some(c) = choice {
         if !installed.contains(&c) {
             return Err(format!("{}를 쓸 수 없습니다({})", c.label(), if c.is_api() { "API 키 없음" } else { "설치 안 됨" }));
         }
-        if work && c.is_api() {
-            return Err(format!("{}로는 파일을 고칠 수 없습니다. 작업 모드는 CLI를 고르세요", c.label()));
-        }
         reasons.push(format!("직접 고른 {}", c.label()));
+        if work && c.is_api() {
+            reasons.push(format!("{}는 엘리시움의 파일·PowerShell 도구로 작업합니다", c.label()));
+        }
         (c, vec![])
     } else if let Some(e) = skill_engine.filter(|e| usable(e)) {
         reasons.push(format!("스킬이 {}를 지정했습니다", e.label()));
@@ -327,10 +405,58 @@ pub fn plan(text: &str, choice: Option<EngineId>, work_requested: bool, installe
         (p, available[1..].to_vec())
     };
 
+    // 동시 에이전트: 요청 글의 모델 여럿 > 요청 글의 에이전트 수 > 설정의 기본 수
+    let asked_agents = intent::requested_agents(text);
+    let want = if wanted.picks.len() >= 2 { wanted.picks.len() } else { asked_agents.unwrap_or(agents as usize) }.min(intent::MAX_AGENTS);
+    let team = if want < 2 {
+        None
+    } else if work {
+        reasons.push("작업 모드에서는 파일 충돌을 방지하기 위해 단일 AI만 파일을 편집합니다. 병렬 실행은 채팅 모드에서 지원됩니다.".to_string());
+        None
+    } else {
+        let mut list: Vec<TeamAgent> = vec![];
+        if wanted.picks.len() >= 2 {
+            for mp in &wanted.picks {
+                list.push(TeamAgent { engine: mp.engine, model: mp.model.clone() });
+            }
+        } else {
+            list.push(TeamAgent { engine: primary, model: models.iter().find(|(e, _)| *e == primary).map(|(_, m)| m.clone()) });
+            // 다른 회사의 AI → 다른 엔진 → (모자라면) 같은 엔진을 새 세션으로 더 띄운다.
+            let pool: Vec<EngineId> = order.iter().copied().filter(usable).collect();
+            for e in &pool {
+                if list.len() < want && !list.iter().any(|a| a.engine.vendor() == e.vendor()) {
+                    list.push(TeamAgent { engine: *e, model: None });
+                }
+            }
+            for e in &pool {
+                if list.len() < want && !list.iter().any(|a| a.engine == *e) {
+                    list.push(TeamAgent { engine: *e, model: None });
+                }
+            }
+            for e in pool.iter().cycle().take(want * pool.len().max(1)) {
+                if list.len() >= want {
+                    break;
+                }
+                list.push(TeamAgent { engine: *e, model: None });
+            }
+        }
+        // 종합은 쓸 수 있는 AI 중 가장 강한 AI가(같으면 먼저 오는 쪽)
+        let synth = order.iter().copied().filter(usable).enumerate().max_by_key(|(i, e)| (strength(*e), std::cmp::Reverse(*i))).map(|(_, e)| e).unwrap_or(primary);
+        let n = list.len();
+        let names = list.iter().map(|a| match &a.model { Some(m) => format!("{}({m})", a.engine.label()), None => a.engine.label().to_string() }).collect::<Vec<_>>().join(", ");
+        let synth_label = synth.label();
+        if asked_agents.is_none() && wanted.picks.len() < 2 {
+            reasons.push(format!("설정에 지정된 기본 실행 수에 따라 {n}개의 에이전트를 동시에 실행합니다."));
+        }
+        reasons.push(format!("{n}개 에이전트({names})의 개별 답변을 {synth_label}에서 하나로 종합하여 전달합니다."));
+        Some(Team { agents: list, synth })
+    };
+
     // 3) 검토: 스킬 설정 > JEV 난이도 > 규칙 (토론으로 바뀌면 아래에서 검토 이유를 지운다)
     let review_reasons_from = reasons.len();
     let jev_hard = jev.and_then(|j| j.difficulty.filter(|_| j.difficulty_confidence.unwrap_or(0.0) >= JEV_MIN_CONFIDENCE));
-    let wants_review = match review {
+    let wants_review = team.is_none()
+        && match review {
         // 토론 모드: 검토 대신 토론한다
         ReviewMode::Off | ReviewMode::Debate => false,
         ReviewMode::Always => true,
@@ -361,6 +487,7 @@ pub fn plan(text: &str, choice: Option<EngineId>, work_requested: bool, installe
     let jev_stakes = jev.and_then(|j| j.stakes.filter(|_| j.stakes_confidence.unwrap_or(0.0) >= JEV_MIN_CONFIDENCE));
     let skill_debate = skill.and_then(|s| s.debate);
     let wants_debate = !work
+        && team.is_none()
         && match review {
             ReviewMode::Debate => true,
             ReviewMode::Off => false,
@@ -424,7 +551,7 @@ pub fn plan(text: &str, choice: Option<EngineId>, work_requested: bool, installe
             b.max_tokens
         ));
     }
-    Ok(Plan { primary, fallbacks, reviewer, skill, prompt, work, reasons, jev: jev.cloned(), budget, debate })
+    Ok(Plan { primary, fallbacks, reviewer, skill, prompt, work, reasons, jev: jev.cloned(), budget, debate, models, team })
 }
 
 pub fn system_prompt(work: bool, workspace: &str, skill: Option<&(SkillRef, String)>) -> String {
@@ -434,15 +561,23 @@ pub fn system_prompt(work: bool, workspace: &str, skill: Option<&(SkillRef, Stri
     );
     s.push_str(&format!("작업 폴더: {workspace}\n"));
     if work {
-        s.push_str("작업 모드: 사용자가 이 작업 폴더 안의 파일 수정을 허락했습니다. 요청한 변경만 하고, 끝나면 바꾼 파일과 내용을 짧게 요약하세요.\n");
+        s.push_str("작업 모드: 사용자가 이 작업 폴더 안의 파일 수정과 PowerShell 명령 실행을 허락했습니다(명령 도구가 있는 AI만). 요청한 변경만 하고, 명령은 작업 폴더 안에서만 쓰세요. 끝나면 바꾼 파일과 내용을 짧게 요약하세요.\n");
     } else {
-        s.push_str("대화 모드: 파일을 읽을 수는 있지만 고치거나 명령을 실행하지 마세요. 파일을 바꿔야 하면 바꿀 내용을 보여 주고 작업 모드로 다시 요청하라고 안내하세요.\n");
+        s.push_str("대화 모드: 파일을 읽을 수는 있지만 고치거나 명령을 실행하지 마세요. 파일을 바꿔야 하면 바꿀 내용을 보여 주고 '만들기' 버튼으로 다시 요청하라고 안내하세요.\n");
     }
     if let Some((r, body)) = skill {
         s.push_str(&format!("\n[스킬: {}]\n{}\n", r.name, body));
     }
     s
 }
+
+/// '만들기': 버튼 한 번으로 폴더 안에서 결과물을 끝까지 완성한다(작업 모드 지시 뒤에 붙는다).
+pub const BUILD_SYSTEM: &str = "\n[만들기] 사용자가 '만들기'를 눌러 이 작업 폴더 안에서 요청을 끝까지 완성해 달라고 했습니다. 파일을 만들고 고치는 것은 이미 허락받았습니다.\n\
+- 되묻지 말고 합리적으로 가정해 끝까지 진행하세요. 가정한 것은 마지막 요약에 적으세요.\n\
+- 폴더에 기존 프로젝트가 있으면 그 구조와 스타일을 따르고, 비어 있으면 실행할 수 있는 프로젝트를 처음부터 만드세요.\n\
+- TODO·생략·자리만 잡은 코드를 남기지 말고 바로 쓸 수 있는 완성본을 만드세요. 새 프로젝트면 README에 설치·실행 방법을 적으세요.\n\
+- PowerShell 명령을 쓸 수 있으면 의존성 설치·빌드·테스트를 직접 돌려 실제로 동작하는지 확인하고 오류를 고치세요. 작업 폴더 밖을 지우거나 바꾸는 명령은 쓰지 마세요. 명령을 쓸 수 없으면 사용자가 그대로 따라 할 수 있게 적으세요.\n\
+- 끝나면 만든·바꾼 파일, 실행 방법, 가정을 짧게 요약하세요.\n";
 
 /// 토론 라운드 시간 한도: 한 AI가 너무 오래 걸리면 기다리지 않고 들어온 답으로 진행한다.
 const DEBATE_ROUND1: Duration = Duration::from_secs(180);
@@ -476,6 +611,25 @@ pub fn judge_prompt(request: &str, a_label: &str, a: &str, b_label: &str, b: &st
         "두 AI가 같은 질문에 따로 답하고 토론한 결과입니다. 판정자로서 사실, 숫자, 계산, 논리를 하나씩 확인해 맞는 쪽을 따르고, 둘 다 틀렸으면 바로잡아 하나의 완성된 최종 답을 쓰세요.\n\
          두 답이 갈린 핵심 쟁점이 있었다면 답 끝에 '### 토론에서 갈린 점' 짧은 목록으로 무엇이 왜 맞는지 적으세요(갈린 점이 없으면 생략). 확실하지 않은 부분은 그렇다고 밝히세요.\n\
          '답 1은', 'A는' 같은 토론 과정 서술로 시작하지 말고 바로 답하세요.",
+    );
+    s
+}
+
+/// 동시 에이전트에게 붙이는 지시
+pub fn team_system(n: usize) -> String {
+    format!("\n[동시 에이전트] 이 요청은 AI 에이전트 {n}개가 동시에 따로 답하고, 종합 AI가 각 답의 좋은 점을 모아 하나로 정리합니다. 다른 에이전트를 기다리지 말고 혼자서 완성된 답을 쓰세요. 확실하지 않은 부분은 '확실하지 않음'이라고 표시하고, 모르는 것을 지어내지 마세요.\n")
+}
+
+/// 종합 AI에게 줄 요청. answers: (에이전트 이름, 답)
+pub fn team_prompt(request: &str, answers: &[(String, &str)]) -> String {
+    let mut s = format!("[질문]\n{request}\n\n");
+    for (i, (who, text)) in answers.iter().enumerate() {
+        s.push_str(&format!("[에이전트 {}: {who}]\n{text}\n\n", i + 1));
+    }
+    s.push_str(
+        "여러 AI 에이전트가 같은 질문에 동시에 따로 답했습니다. 종합자로서 각 답의 맞는 내용과 좋은 점을 모으고, 서로 다르거나 틀린 부분은 사실·숫자·논리를 확인해 바로잡아 하나의 완성된 최종 답을 쓰세요.\n\
+         답들이 크게 갈린 점이 있었다면 답 끝에 '### 에이전트 사이에 갈린 점' 짧은 목록으로 무엇이 왜 맞는지 적으세요(없으면 생략).\n\
+         '에이전트 1은' 같은 과정 서술로 시작하지 말고 바로 답하세요.",
     );
     s
 }
@@ -531,28 +685,53 @@ pub fn decide_approval(app: &AppHandle, st: &AppState, approval_id: &str, approv
     Ok(a)
 }
 
-pub fn send(app: &AppHandle, st: &std::sync::Arc<AppState>, conversation_id: Option<String>, text: String, choice: Option<EngineId>, work: bool, workspace: Option<String>) -> Result<SendResult, String> {
+/// build: '만들기' 버튼. 작업 모드로 돌고, 누른 것이 곧 허락이라 승인을 묻지 않는다.
+#[allow(clippy::too_many_arguments)]
+pub fn send(app: &AppHandle, st: &std::sync::Arc<AppState>, conversation_id: Option<String>, text: String, choice: Option<EngineId>, work: bool, build: bool, workspace: Option<String>) -> Result<SendResult, String> {
     let text = text.trim().to_string();
     if text.is_empty() {
         return Err("보낼 내용이 없습니다".into());
     }
+    let work = work || build;
     let conv = match conversation_id {
         Some(c) if store::conversation_exists(&st.db, &c).map_err(|e| e.to_string())? => c,
         // 새 대화는 입력창에서 고른 폴더(없으면 기본 작업 폴더)로 시작한다.
-        _ => store::create_conversation(&st.db, &text, workspace.as_deref()).map_err(|e| e.to_string())?,
+        // 폴더를 고르지 않고 '만들기'로 시작하면 기본 작업 폴더 안에 새 프로젝트 폴더를 만들어 다른 결과물과 섞이지 않게 한다.
+        _ => {
+            let workspace = match workspace {
+                None if build => Some(new_project_dir(&st.settings().workspace())?),
+                w => w,
+            };
+            store::create_conversation(&st.db, &text, workspace.as_deref()).map_err(|e| e.to_string())?
+        }
     };
-    let user_message_id = store::insert_message(&st.db, &conv, "user", &text, Some(&json!({ "work": work, "engine": choice.map(|c| c.as_str()) }))).map_err(|e| e.to_string())?;
+    let user_message_id = store::insert_message(&st.db, &conv, "user", &text, Some(&json!({ "work": work, "build": build, "engine": choice.map(|c| c.as_str()) }))).map_err(|e| e.to_string())?;
     let task_id = new_id();
     let cancel = CancellationToken::new();
     st.tasks.lock().unwrap_or_else(|p| p.into_inner()).insert(task_id.clone(), cancel.clone());
+    st.steers.lock().unwrap_or_else(|p| p.into_inner()).insert(task_id.clone(), Steer::default());
     let (app2, st2, conv2, task2) = (app.clone(), st.clone(), conv.clone(), task_id.clone());
     tauri::async_runtime::spawn(async move {
-        run_task(&app2, &st2, &conv2, &task2, &text, choice, work, cancel).await;
+        run_task(&app2, &st2, &conv2, &task2, &text, choice, work, build, cancel).await;
         st2.tasks.lock().unwrap_or_else(|p| p.into_inner()).remove(&task2);
+        st2.steers.lock().unwrap_or_else(|p| p.into_inner()).remove(&task2);
         emit(&app2, "task:done", json!({ "taskId": task2, "conversationId": conv2 }));
         refresh_memory(&app2, &st2, &conv2).await;
     });
     Ok(SendResult { conversation_id: conv, task_id, user_message_id })
+}
+
+/// 기본 작업 폴더 안의 새 프로젝트 폴더(project-20261030-143015). 같은 이름이 있으면 뒤에 수를 붙인다.
+fn new_project_dir(base: &std::path::Path) -> Result<String, String> {
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let mut dir = base.join(format!("project-{stamp}"));
+    let mut n = 2;
+    while dir.exists() {
+        dir = base.join(format!("project-{stamp}-{n}"));
+        n += 1;
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| format!("프로젝트 폴더를 만들 수 없습니다({}): {e}", dir.display()))?;
+    Ok(dir.to_string_lossy().to_string())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -576,7 +755,23 @@ fn spec_effort(p: &Plan) -> Option<String> {
     p.budget.as_ref().map(|b| b.effort.to_string())
 }
 
+/// 이 엔진에 줄 모델: 요청 글에서 고른 모델 > (Claude Code) JEV 단계의 모델 > 설정의 모델. None이면 엔진 기본값.
+fn model_for(p: &Plan, engine: EngineId, s: &Settings) -> Option<String> {
+    if let Some((_, m)) = p.models.iter().find(|(e, _)| *e == engine) {
+        return Some(m.clone());
+    }
+    if engine == EngineId::Claude {
+        p.budget.as_ref().and_then(|b| b.claude_model).map(str::to_string)
+    } else {
+        s.models.get(engine.as_str()).cloned()
+    }
+}
+
+/// 기록에 남길 모델 이름(API는 기본 모델 이름까지)
 fn spec_model(p: &Plan, engine: EngineId, s: &Settings) -> Option<String> {
+    if let Some((_, m)) = p.models.iter().find(|(e, _)| *e == engine) {
+        return Some(m.clone());
+    }
     if engine == EngineId::Claude {
         p.budget.as_ref().and_then(|b| b.claude_model).map(str::to_string)
     } else if engine.is_api() {
@@ -614,12 +809,15 @@ fn message_data(steps: &[Step], p: &Plan, extra: Value) -> Value {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_engine(app: &AppHandle, st: &AppState, conv: &str, task: &str, mid: &str, role: &'static str, spec: RunSpec, timeout: Duration, cancel: &CancellationToken) -> Outcome {
-    run_engine_as(app, st, conv, task, mid, role, spec, timeout, cancel, true).await
+    let key = format!("{role}:{}", spec.engine.as_str());
+    run_engine_as(app, st, conv, task, mid, role, spec, timeout, cancel, true, &key).await
 }
 
-/// stream=false: 토론처럼 여러 AI가 동시에 쓸 때. 글자를 흘리지 않고 시작·끝만 알린다(task:debate).
+/// stream=false: 토론·동시 에이전트처럼 여러 AI가 동시에 쓸 때. 글자를 흘리지 않고 시작·끝만 알린다(task:debate).
+/// key: 이 실행을 가리키는 이름(오른쪽 "에이전트" 탭이 실행마다 상태·활동을 보여 준다). 같은 엔진이 여럿이면 key로 구분한다.
 #[allow(clippy::too_many_arguments)]
-async fn run_engine_as(app: &AppHandle, st: &AppState, conv: &str, task: &str, mid: &str, role: &'static str, spec: RunSpec, timeout: Duration, cancel: &CancellationToken, stream: bool) -> Outcome {
+async fn run_engine_as(app: &AppHandle, st: &AppState, conv: &str, task: &str, mid: &str, role: &'static str, spec: RunSpec, timeout: Duration, cancel: &CancellationToken, stream: bool, key: &str) -> Outcome {
+    emit(app, "task:agent", json!({ "taskId": task, "conversationId": conv, "key": key, "engine": spec.engine, "label": spec.engine.label(), "role": role, "model": spec.model, "effort": spec.effort, "work": spec.work, "state": "run", "at": crate::db::now() }));
     if stream {
         emit(app, "task:phase", json!({ "taskId": task, "conversationId": conv, "messageId": mid, "phase": role, "engine": spec.engine, "label": spec.engine.label(), "effort": spec.effort, "model": spec.model }));
     } else {
@@ -627,10 +825,17 @@ async fn run_engine_as(app: &AppHandle, st: &AppState, conv: &str, task: &str, m
     }
     let o = engines::run(&st.http, &spec, timeout, cancel, |ev| match ev {
         Event::Text(t) if stream => emit(app, "task:delta", json!({ "taskId": task, "conversationId": conv, "messageId": mid, "phase": role, "delta": t })),
-        Event::Activity(a) if stream => emit(app, "task:activity", json!({ "taskId": task, "conversationId": conv, "phase": role, "text": a })),
+        Event::Activity(a) => {
+            emit(app, "task:agent-activity", json!({ "taskId": task, "conversationId": conv, "key": key, "text": a }));
+            if stream {
+                emit(app, "task:activity", json!({ "taskId": task, "conversationId": conv, "phase": role, "text": a }));
+            }
+        }
         _ => {}
     })
     .await;
+    let done = o.ok && !o.text.trim().is_empty();
+    emit(app, "task:agent", json!({ "taskId": task, "conversationId": conv, "key": key, "engine": spec.engine, "label": spec.engine.label(), "role": role, "state": if done { "ok" } else { "fail" }, "ms": o.latency_ms, "error": o.error, "chars": o.text.chars().count() }));
     if !stream {
         emit(app, "task:debate", json!({ "taskId": task, "conversationId": conv, "engine": spec.engine, "role": role, "state": if o.ok && !o.text.trim().is_empty() { "ok" } else { "fail" }, "ms": o.latency_ms }));
     }
@@ -648,48 +853,98 @@ async fn run_engine_as(app: &AppHandle, st: &AppState, conv: &str, task: &str, m
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: &str, choice: Option<EngineId>, work_req: bool, cancel: CancellationToken) {
+async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: &str, choice: Option<EngineId>, work_req: bool, build: bool, cancel: CancellationToken) {
     let mid = new_id();
     let s = st.settings();
     let workspace = store::get_workspace(&st.db, conv).ok().flatten().map(PathBuf::from).unwrap_or_else(|| s.workspace());
     let ws = workspace.to_string_lossy().to_string();
     let catalog = st.catalog();
-    // JEV 판단(켜져 있고 키가 있을 때만). 실패하면 규칙으로 정한다.
+    // 세션 메모리 원본: 이 세션의 모든 AI가 같은 요약·최근 대화를 받는다(이번 요청은 뺀다).
+    let msgs = store::list_messages(&st.db, conv).unwrap_or_default();
+    let history = memory::turns(&msgs[..msgs.len().saturating_sub(1)]);
+    let (summary, upto) = store::get_memory(&st.db, conv).unwrap_or((None, None));
+    // JEV(켜져 있고 키가 있을 때만): 요청 판단과 기억 거르기를 동시에 한 번씩 묻는다. 실패하면 규칙·전체 기억으로 돌아간다.
     let mut judgment: Option<Judgment> = None;
     let mut jev_error: Option<String> = None;
-    if s.jev_enabled && !(choice.is_some() && s.review != ReviewMode::Auto) {
-        match secrets::get(SecretName::TypeSafe) {
-            Some(key) => {
-                emit(app, "task:activity", json!({ "taskId": task, "conversationId": conv, "phase": "plan", "text": "JEV가 요청을 판단하는 중" }));
-                match judge(&st.http, &key, text).await {
-                    Ok(j) => {
-                        let _ = store::record_usage(&st.db, &store::Usage { engine: "jev", role: "judge", ok: true, latency_ms: j.ms, input_tokens: None, output_tokens: None, cost_usd: Some(j.cost_usd) });
-                        judgment = Some(j);
-                    }
-                    Err(e) => jev_error = Some(e),
+    let mut selection: Option<memory::Selection> = None;
+    let mut memory_note: Option<String> = None;
+    let want_judge = s.jev_enabled && !(choice.is_some() && s.review != ReviewMode::Auto);
+    let jev_key = if s.jev_enabled { secrets::get(SecretName::TypeSafe) } else { None };
+    if want_judge && jev_key.is_none() {
+        jev_error = Some("TypeSafe API 키가 없습니다".into());
+    }
+    if let Some(key) = &jev_key {
+        let want_filter = memory::candidates(summary.as_deref(), &history).is_some();
+        if want_judge || want_filter {
+            let what = match (want_judge, want_filter) {
+                (true, true) => "JEV가 요청을 판단하고 필요한 기억을 고르는 중",
+                (true, false) => "JEV가 요청을 판단하는 중",
+                _ => "JEV가 필요한 기억을 고르는 중",
+            };
+            emit(app, "task:activity", json!({ "taskId": task, "conversationId": conv, "phase": "plan", "text": what }));
+        }
+        let (jr, fr) = tokio::join!(
+            async {
+                if want_judge {
+                    Some(judge(&st.http, key, text).await)
+                } else {
+                    None
                 }
+            },
+            async {
+                if want_filter {
+                    filter_memory(&st.http, key, text, summary.as_deref(), &history).await
+                } else {
+                    Ok(None)
+                }
+            },
+        );
+        match jr {
+            Some(Ok(j)) => {
+                let _ = store::record_usage(&st.db, &store::Usage { engine: "jev", role: "judge", ok: true, latency_ms: j.ms, input_tokens: None, output_tokens: None, cost_usd: Some(j.cost_usd) });
+                judgment = Some(j);
             }
-            None => jev_error = Some("TypeSafe API 키가 없습니다".into()),
+            Some(Err(e)) => jev_error = Some(e),
+            None => {}
+        }
+        match fr {
+            Ok(Some(f)) => {
+                let _ = store::record_usage(&st.db, &store::Usage { engine: "jev", role: "memory", ok: true, latency_ms: f.ms, input_tokens: None, output_tokens: None, cost_usd: Some(f.cost_usd) });
+                memory_note = Some(f.selection.reason());
+                selection = Some(f.selection);
+            }
+            Ok(None) => {}
+            Err(e) => memory_note = Some(format!("JEV로 기억을 거르지 못해 기억을 그대로 보냅니다: {e}")),
         }
     }
     let finish = |content: String, data: Value| {
         let _ = store::insert_message_as(&st.db, &mid, conv, "assistant", &content, Some(&data));
         emit(app, "message:created", json!({ "conversationId": conv, "messageId": mid, "taskId": task }));
     };
-    let mut p = match plan(text, choice, work_req, &st.installed(), &catalog, s.review, judgment.as_ref()) {
+    let mut p = match plan_with(text, choice, work_req, &st.installed(), &catalog, s.review, judgment.as_ref(), s.agents) {
         Ok(p) => p,
         Err(e) => return finish(format!("⚠ {e}"), json!({ "error": e })),
     };
     if let Some(e) = &jev_error {
         p.reasons.insert(0, format!("JEV를 쓰지 못해 규칙으로 정했습니다: {e}"));
     }
+    if let Some(n) = memory_note {
+        p.reasons.push(n);
+    }
+    if build {
+        // 끝까지 완성해야 하므로 가장 깊은 노력 단계로 돈다(요청 글에서 고른 모델은 그대로 따른다).
+        p.budget = budget_for("deep");
+        p.reasons.push("만들기: 승인 없이 이 폴더 안에서 끝까지 완성하도록 노력 단계를 '깊게'로 정했습니다".into());
+    }
     emit(app, "task:started", json!({
         "taskId": task, "conversationId": conv, "messageId": mid,
-        "primary": p.primary, "reviewer": p.reviewer, "work": p.work, "skill": p.skill.as_ref().map(|s| &s.0), "reasons": p.reasons, "jev": judgment, "budget": p.budget, "debate": p.debate,
+        "primary": p.primary, "reviewer": p.reviewer, "work": p.work, "skill": p.skill.as_ref().map(|s| &s.0), "reasons": p.reasons, "jev": judgment, "budget": p.budget, "debate": p.debate, "team": p.team, "model": model_for(&p, p.primary, &s),
     }));
 
-    // 작업 모드: 파일을 고치기 전에 사용자의 허락을 받는다.
-    if p.work {
+    // 작업 모드: 파일을 고치기 전에 사용자의 허락을 받는다. '만들기'는 버튼을 누른 것이 허락이다.
+    if p.work && build {
+        audit::record(&st.db, "user", "build.started", "ok", json!({ "engine": p.primary, "workspace": ws }));
+    } else if p.work {
         let preview: String = p.prompt.chars().take(160).collect();
         let a = match store::create_approval(&st.db, conv, task, p.primary.as_str(), &preview, &ws) {
             Ok(a) => a,
@@ -712,11 +967,8 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
 
     // 스킬 참고 파일을 CLI가 읽을 수 있게 그 폴더를 넘긴다.
     let skill_dirs: Vec<String> = p.skill.as_ref().and_then(|s| s.0.dir.clone()).into_iter().collect();
-    // 세션 메모리: 이 세션의 모든 AI가 같은 요약·최근 대화를 받는다(이번 요청은 뺀다).
-    let msgs = store::list_messages(&st.db, conv).unwrap_or_default();
-    let history = memory::turns(&msgs[..msgs.len().saturating_sub(1)]);
-    let (summary, upto) = store::get_memory(&st.db, conv).unwrap_or((None, None));
-    let ctx = |seen: Option<&str>, prompt: &str| memory::context(summary.as_deref(), upto.as_deref(), &history, seen, prompt);
+    // 세션 메모리: JEV가 걸렀으면 남긴 것만, 아니면 요약 + 최근 대화를 붙인다.
+    let ctx = |seen: Option<&str>, prompt: &str| memory::context(summary.as_deref(), upto.as_deref(), &history, seen, prompt, selection.as_ref());
     let spec_for = |engine: EngineId, prompt: String, system: String, work: bool| RunSpec {
         engine,
         prompt,
@@ -725,15 +977,66 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
         work,
         resume: None,
         plugin_dirs: vec![],
-        model: if engine == EngineId::Claude { p.budget.as_ref().and_then(|b| b.claude_model).map(str::to_string) } else { s.models.get(engine.as_str()).cloned() },
+        model: model_for(&p, engine, &s),
         effort: p.budget.as_ref().map(|b| b.effort.to_string()),
         max_tokens: p.budget.as_ref().map(|b| b.max_tokens),
         extra_dirs: skill_dirs.clone(),
+        steer: None,
     };
-    let system = system_prompt(p.work, &ws, p.skill.as_ref());
+    let system = if build { format!("{}{BUILD_SYSTEM}", system_prompt(true, &ws, p.skill.as_ref())) } else { system_prompt(p.work, &ws, p.skill.as_ref()) };
     let plugin_dirs = catalog.enabled_plugin_dirs();
-    let timeout = Duration::from_secs(if p.work { 1200 } else { 600 });
+    let timeout = Duration::from_secs(if build { 1800 } else if p.work { 1200 } else { 600 });
     let mut steps: Vec<Step> = vec![];
+
+    // 동시 에이전트: 여러 AI가 동시에 따로 답하고 → 종합 AI가 하나로 정리한다.
+    if let Some(team) = p.team.clone() {
+        let n = team.agents.len();
+        let tsys = format!("{}{}", system_prompt(false, &ws, p.skill.as_ref()), team_system(n));
+        emit(app, "task:activity", json!({ "taskId": task, "conversationId": conv, "phase": "agents", "text": format!("{n}개의 에이전트가 동시에 답변을 생성하는 중") }));
+        let q = ctx(None, &p.prompt);
+        let runs = team.agents.iter().enumerate().map(|(i, a)| {
+            let mut spec = spec_for(a.engine, q.clone(), tsys.clone(), false);
+            if a.model.is_some() {
+                spec.model = a.model.clone();
+            }
+            let (key, mid, cancel) = (format!("agent:{i}"), &mid, &cancel);
+            async move { run_engine_as(app, st, conv, task, mid, "agent", spec, timeout, cancel, false, &key).await }
+        });
+        let outs: Vec<Outcome> = futures_util::future::join_all(runs).await;
+        let good = |o: &Outcome| o.ok && !o.text.trim().is_empty();
+        let who = |a: &TeamAgent| match &a.model {
+            Some(m) => format!("{} · {m}", a.engine.label()),
+            None => a.engine.label().to_string(),
+        };
+        for (a, o) in team.agents.iter().zip(&outs) {
+            steps.push(step(a.engine, "agent", o, &spec_effort(&p), a.model.clone().or_else(|| spec_model(&p, a.engine, &s))));
+        }
+        let agents_json: Vec<Value> = team.agents.iter().zip(&outs).map(|(a, o)| json!({ "engine": a.engine, "model": a.model, "ok": good(o), "text": o.text })).collect();
+        let ok: Vec<(&TeamAgent, &Outcome)> = team.agents.iter().zip(&outs).filter(|(_, o)| good(o)).collect();
+        if ok.is_empty() {
+            let why = if cancel.is_cancelled() { "중지했습니다.".to_string() } else { outs.iter().find_map(|o| o.error.clone()).unwrap_or_else(|| "답을 받지 못했습니다".into()) };
+            return finish(format!("⚠ {why}"), message_data(&steps, &p, json!({ "error": why, "team": { "agents": agents_json, "synth": null } })));
+        }
+        if ok.len() == 1 || cancel.is_cancelled() {
+            let (a, o) = ok[0];
+            let label = who(a);
+            let mut p2 = p.clone();
+            p2.reasons.push(format!("단일 답변만 완료되어 종합 과정 없이 {label}의 결과를 그대로 표시합니다."));
+            return finish(o.text.clone(), message_data(&steps, &p2, json!({ "draftedBy": a.engine, "team": { "agents": agents_json, "synth": null } })));
+        }
+        let answers: Vec<(String, &str)> = ok.iter().map(|(a, o)| (who(a), o.text.as_str())).collect();
+        let sp = team_prompt(&p.prompt, &answers);
+        let j = run_engine(app, st, conv, task, &mid, "synth", spec_for(team.synth, ctx(None, &sp), system_prompt(false, &ws, p.skill.as_ref()), false), timeout, &cancel).await;
+        steps.push(step(team.synth, "synth", &j, &spec_effort(&p), spec_model(&p, team.synth, &s)));
+        let team_json = json!({ "agents": agents_json, "synth": team.synth });
+        if good(&j) {
+            return finish(j.text.clone(), message_data(&steps, &p, json!({ "synthBy": team.synth, "draftedBy": ok[0].0.engine, "team": team_json })));
+        }
+        let (synth_label, first) = (team.synth.label(), who(ok[0].0));
+        let mut p2 = p.clone();
+        p2.reasons.push(format!("{synth_label}의 답변 종합에 실패하여 {first}의 결과를 대신 표시합니다."));
+        return finish(ok[0].1.text.clone(), message_data(&steps, &p2, json!({ "draftedBy": ok[0].0.engine, "team": team_json })));
+    }
 
     // 토론: 두 AI가 동시에 따로 답하고 → (보통·깊게면) 서로 반론하고 → 판정 AI가 하나로 정리한다.
     if let Some(dbt) = p.debate.clone() {
@@ -741,8 +1044,8 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
         emit(app, "task:activity", json!({ "taskId": task, "conversationId": conv, "phase": "debate", "text": format!("{}와 {}가 따로 답하는 중", dbt.a.label(), dbt.b.label()) }));
         let q = ctx(None, &p.prompt);
         let (ra, rb) = tokio::join!(
-            run_engine_as(app, st, conv, task, &mid, "debate", spec_for(dbt.a, q.clone(), dsys.clone(), false), DEBATE_ROUND1, &cancel, false),
-            run_engine_as(app, st, conv, task, &mid, "debate", spec_for(dbt.b, q.clone(), dsys.clone(), false), DEBATE_ROUND1, &cancel, false),
+            run_engine_as(app, st, conv, task, &mid, "debate", spec_for(dbt.a, q.clone(), dsys.clone(), false), DEBATE_ROUND1, &cancel, false, "debate:a"),
+            run_engine_as(app, st, conv, task, &mid, "debate", spec_for(dbt.b, q.clone(), dsys.clone(), false), DEBATE_ROUND1, &cancel, false, "debate:b"),
         );
         steps.push(step(dbt.a, "debate", &ra, &spec_effort(&p), spec_model(&p, dbt.a, &s)));
         steps.push(step(dbt.b, "debate", &rb, &spec_effort(&p), spec_model(&p, dbt.b, &s)));
@@ -768,8 +1071,8 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
         if dbt.rebuttal && !cancel.is_cancelled() {
             emit(app, "task:activity", json!({ "taskId": task, "conversationId": conv, "phase": "rebuttal", "text": "서로의 답을 읽고 반론하는 중" }));
             let (xa, xb) = tokio::join!(
-                run_engine_as(app, st, conv, task, &mid, "rebuttal", spec_for(dbt.a, ctx(None, &rebuttal_prompt(&p.prompt, &ra.text, dbt.b.label(), &rb.text)), dsys.clone(), false), DEBATE_REBUTTAL, &cancel, false),
-                run_engine_as(app, st, conv, task, &mid, "rebuttal", spec_for(dbt.b, ctx(None, &rebuttal_prompt(&p.prompt, &rb.text, dbt.a.label(), &ra.text)), dsys.clone(), false), DEBATE_REBUTTAL, &cancel, false),
+                run_engine_as(app, st, conv, task, &mid, "rebuttal", spec_for(dbt.a, ctx(None, &rebuttal_prompt(&p.prompt, &ra.text, dbt.b.label(), &rb.text)), dsys.clone(), false), DEBATE_REBUTTAL, &cancel, false, "rebuttal:a"),
+                run_engine_as(app, st, conv, task, &mid, "rebuttal", spec_for(dbt.b, ctx(None, &rebuttal_prompt(&p.prompt, &rb.text, dbt.a.label(), &ra.text)), dsys.clone(), false), DEBATE_REBUTTAL, &cancel, false, "rebuttal:b"),
             );
             steps.push(step(dbt.a, "rebuttal", &xa, &spec_effort(&p), spec_model(&p, dbt.a, &s)));
             steps.push(step(dbt.b, "rebuttal", &xb, &spec_effort(&p), spec_model(&p, dbt.b, &s)));
@@ -797,17 +1100,20 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
         return finish(fa, message_data(&steps, &p2, json!({ "draftedBy": dbt.a, "debate": debate })));
     }
 
+    let steer: Steer = st.steers.lock().unwrap_or_else(|p| p.into_inner()).get(task).cloned().unwrap_or_default();
     let mut draft: Option<(EngineId, Outcome)> = None;
     for engine in std::iter::once(p.primary).chain(p.fallbacks.iter().copied()) {
         if cancel.is_cancelled() {
             break;
         }
-        // Claude Code는 같은 대화의 세션을 이어 쓰고, 나머지는 최근 대화를 요청에 붙인다.
-        let resume = if engine == EngineId::Claude { store::get_session(&st.db, conv, engine.as_str()).ok().flatten() } else { None };
-        let model = if engine == EngineId::Claude { p.budget.as_ref().and_then(|b| b.claude_model).map(str::to_string) } else { s.models.get(engine.as_str()).cloned() };
+        // Claude Code·Antigravity는 같은 대화의 세션을 이어 쓰고, 나머지는 최근 대화를 요청에 붙인다.
+        let resume = if engine.resumable() { store::get_session(&st.db, conv, engine.as_str()).ok().flatten() } else { None };
+        let model = model_for(&p, engine, &s);
         // 자기 세션을 이어 쓰면 못 본 차례만, 아니면 세션 요약 + 최근 대화를 붙인다.
         let seen = if resume.is_some() { store::get_seen(&st.db, conv, engine.as_str()).ok().flatten() } else { None };
         let prompt = ctx(seen.as_deref(), &p.prompt);
+        // 작업 중 메시지는 API 작업 모드에서만 받는다(CLI는 중간에 끼어들 수 없다).
+        *steer.lock().unwrap_or_else(|p| p.into_inner()) = (engine.is_api() && p.work).then(Vec::new);
         let spec = RunSpec {
             engine,
             prompt,
@@ -820,11 +1126,16 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
             effort: p.budget.as_ref().map(|b| b.effort.to_string()),
             max_tokens: p.budget.as_ref().map(|b| b.max_tokens),
             extra_dirs: skill_dirs.clone(),
+            steer: Some(steer.clone()),
         };
         let o = run_engine(app, st, conv, task, &mid, "draft", spec, timeout, &cancel).await;
+        let left = steer.lock().unwrap_or_else(|p| p.into_inner()).take().unwrap_or_default();
+        if !left.is_empty() {
+            emit(app, "task:activity", json!({ "taskId": task, "conversationId": conv, "phase": "draft", "text": format!("작업이 끝나 전달하지 못한 메시지 {}개가 있습니다. 다시 보내 주세요", left.len()) }));
+        }
         steps.push(step(engine, "draft", &o, &spec_effort(&p), spec_model(&p, engine, &s)));
         if let Some(sid) = &o.session_id {
-            if o.ok && engine == EngineId::Claude {
+            if o.ok && engine.resumable() {
                 let _ = store::set_session(&st.db, conv, engine.as_str(), sid);
             }
         }
@@ -858,10 +1169,11 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
             work: false,
             resume: None,
             plugin_dirs: vec![],
-            model: if rev == EngineId::Claude { p.budget.as_ref().and_then(|b| b.claude_model).map(str::to_string) } else { s.models.get(rev.as_str()).cloned() },
+            model: model_for(&p, rev, &s),
             effort: p.budget.as_ref().map(|b| b.effort.to_string()),
             max_tokens: p.budget.as_ref().map(|b| b.max_tokens),
             extra_dirs: skill_dirs.clone(),
+            steer: None,
         };
         let r = run_engine(app, st, conv, task, &mid, "review", spec, timeout, &cancel).await;
         steps.push(step(rev, "review", &r, &spec_effort(&p), spec_model(&p, rev, &s)));
@@ -881,9 +1193,9 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
     mark_seen(st, conv, drafted_by);
 }
 
-/// 자기 세션을 이어 쓰는 엔진(Claude Code)이 지금까지를 봤다고 적는다.
+/// 자기 세션을 이어 쓰는 엔진(Claude Code·Antigravity)이 지금까지를 봤다고 적는다.
 fn mark_seen(st: &AppState, conv: &str, engine: EngineId) {
-    if engine == EngineId::Claude {
+    if engine.resumable() {
         let _ = store::set_seen(&st.db, conv, engine.as_str(), &crate::db::now());
     }
 }
@@ -905,7 +1217,7 @@ pub async fn refresh_memory(app: &AppHandle, st: &AppState, conv: &str) {
     let new_upto = fold.last().map(|t| t.at.clone());
     let installed = st.installed();
     // 가장 싼 쪽부터: 빠른 API → Claude Code(haiku·low) → 다른 CLI
-    let order = [EngineId::GeminiApi, EngineId::Nvidia, EngineId::ClaudeApi, EngineId::OpenAi, EngineId::Claude, EngineId::Gemini, EngineId::Codex];
+    let order = [EngineId::GeminiApi, EngineId::Nvidia, EngineId::ClaudeApi, EngineId::OpenAi, EngineId::Claude, EngineId::Antigravity, EngineId::Codex];
     let s = st.settings();
     for engine in order.into_iter().filter(|e| installed.contains(e)) {
         let spec = RunSpec {
@@ -920,6 +1232,7 @@ pub async fn refresh_memory(app: &AppHandle, st: &AppState, conv: &str) {
             effort: Some("low".into()),
             max_tokens: Some(1200),
             extra_dirs: vec![],
+            steer: None,
         };
         let o = engines::run(&st.http, &spec, Duration::from_secs(120), &CancellationToken::new(), |_| {}).await;
         let _ = store::record_usage(&st.db, &store::Usage { engine: engine.as_str(), role: "memory", ok: o.ok, latency_ms: o.latency_ms, input_tokens: o.input_tokens, output_tokens: o.output_tokens, cost_usd: o.cost_usd });
@@ -950,18 +1263,18 @@ mod tests {
     #[test]
     fn picks_engines_by_request_and_installed_set() {
         let (_t, c) = catalog();
-        let all = [EngineId::Claude, EngineId::Codex, EngineId::Gemini];
+        let all = [EngineId::Claude, EngineId::Codex, EngineId::Antigravity];
         let p = plan("오늘 날씨 어때", None, false, &all, &c, ReviewMode::Auto, None).unwrap();
         assert_eq!(p.primary, EngineId::Claude);
-        assert_eq!(p.fallbacks, vec![EngineId::Gemini, EngineId::Codex]);
+        assert_eq!(p.fallbacks, vec![EngineId::Antigravity, EngineId::Codex]);
         assert!(p.reviewer.is_none(), "짧은 요청은 검토 안 함");
         // 코드 요청 + Claude 없음 → Codex
-        let p = plan("이 함수 버그 찾아줘", None, false, &[EngineId::Codex, EngineId::Gemini], &c, ReviewMode::Auto, None).unwrap();
+        let p = plan("이 함수 버그 찾아줘", None, false, &[EngineId::Codex, EngineId::Antigravity], &c, ReviewMode::Auto, None).unwrap();
         assert_eq!(p.primary, EngineId::Codex);
-        assert!(plan("Python으로 리스트 뒤집기", None, false, &[EngineId::Codex, EngineId::Gemini], &c, ReviewMode::Auto, None).unwrap().primary == EngineId::Codex, "대소문자 무시");
+        assert!(plan("Python으로 리스트 뒤집기", None, false, &[EngineId::Codex, EngineId::Antigravity], &c, ReviewMode::Auto, None).unwrap().primary == EngineId::Codex, "대소문자 무시");
         // 직접 고르면 그대로, 없으면 오류
-        assert_eq!(plan("hi", Some(EngineId::Gemini), false, &all, &c, ReviewMode::Auto, None).unwrap().primary, EngineId::Gemini);
-        assert!(plan("hi", Some(EngineId::Gemini), false, &[EngineId::Claude], &c, ReviewMode::Auto, None).is_err());
+        assert_eq!(plan("hi", Some(EngineId::Antigravity), false, &all, &c, ReviewMode::Auto, None).unwrap().primary, EngineId::Antigravity);
+        assert!(plan("hi", Some(EngineId::Antigravity), false, &[EngineId::Claude], &c, ReviewMode::Auto, None).is_err());
         assert!(plan("hi", None, false, &[], &c, ReviewMode::Auto, None).is_err());
     }
 
@@ -1005,10 +1318,11 @@ mod tests {
         // CLI 없이 API만 있어도 대화는 된다
         let p = plan("안녕", None, false, &[Nvidia], &c, ReviewMode::Auto, None).unwrap();
         assert_eq!(p.primary, Nvidia);
-        // API만 있으면 작업 모드는 안 된다, 직접 고른 API도 마찬가지
-        assert!(plan("파일 고쳐", None, true, &[Nvidia, OpenAi], &c, ReviewMode::Auto, None).is_err());
-        assert!(plan("파일 고쳐", Some(OpenAi), true, &[Claude, OpenAi], &c, ReviewMode::Auto, None).is_err());
+        // 작업 모드도 API로 된다(엘리시움 도구). 직접 고르면 그 API, 자동이면 CLI가 먼저
+        assert!(plan("파일 고쳐", None, true, &[Nvidia, OpenAi], &c, ReviewMode::Auto, None).unwrap().primary.is_api());
+        assert_eq!(plan("파일 고쳐", Some(OpenAi), true, &[Claude, OpenAi], &c, ReviewMode::Auto, None).unwrap().primary, OpenAi);
         assert_eq!(plan("파일 고쳐", None, true, &[Claude, OpenAi], &c, ReviewMode::Auto, None).unwrap().primary, Claude);
+        assert_eq!(plan("파일 고쳐", None, true, &[GeminiApi, Codex], &c, ReviewMode::Auto, None).unwrap().primary, Codex);
         // 검토는 다른 회사 AI 우선: Claude CLI 초안 → Claude API(같은 회사)보다 Gemini API
         let deep = "새 서비스 출시 전략을 자세히 세워줘";
         let p = plan(deep, None, false, &[Claude, ClaudeApi, GeminiApi], &c, ReviewMode::Auto, None).unwrap();
@@ -1095,7 +1409,7 @@ mod tests {
         let d = p.debate.unwrap();
         assert_eq!((d.a, d.b, d.judge), (EngineId::Nvidia, EngineId::Claude, EngineId::Claude));
         // 세 번째 회사가 참가자만큼 강하면 그쪽이 판정
-        let p = plan("법적으로 정확히", None, false, &[EngineId::GeminiApi, EngineId::Nvidia, EngineId::Gemini, EngineId::OpenAi], &c, ReviewMode::Auto, Some(&jj("chat", 1.5, 2.5))).unwrap();
+        let p = plan("법적으로 정확히", None, false, &[EngineId::GeminiApi, EngineId::Nvidia, EngineId::Antigravity, EngineId::OpenAi], &c, ReviewMode::Auto, Some(&jj("chat", 1.5, 2.5))).unwrap();
         assert_eq!(p.debate.unwrap().judge, EngineId::OpenAi);
         // 가벼운 단계면 반론 라운드 생략, 정확도 낮으면 토론 안 함, 작업 모드도 안 함
         let p = plan("서울 인구?", None, false, &both, &c, ReviewMode::Auto, Some(&jj("chat", 0.5, 2.2))).unwrap();
@@ -1131,5 +1445,43 @@ mod tests {
         assert!(body.contains("[이 스킬의 참고 파일]") && body.contains("accessibility.md") && body.contains("필요한 파일만"));
         let p = plan("/summarize 이 글", None, false, &[EngineId::Claude], &c, ReviewMode::Auto, None).unwrap();
         assert!(p.skill.unwrap().0.dir.is_none(), "참고 파일 없는 스킬은 폴더를 넘기지 않음");
+    }
+
+    #[test]
+    fn requested_model_and_parallel_agents_shape_the_plan() {
+        use EngineId::*;
+        let (_t, c) = catalog();
+        let all = [Claude, Antigravity, GeminiApi, Nvidia];
+        // 요청 글의 모델 → 그 엔진과 모델, 같은 모델을 쓸 수 있는 다른 AI가 대신할 수 있다
+        let p = plan("opus로 이 함수 설명해 줘", None, false, &all, &c, ReviewMode::Auto, None).unwrap();
+        assert_eq!(p.primary, Claude);
+        assert_eq!(p.prompt, "이 함수 설명해 줘", "모델 지시는 AI에게 넘기지 않음");
+        assert_eq!(p.models, vec![(Claude, "opus".to_string()), (Antigravity, "claude-opus-5-5".to_string())]);
+        assert_eq!(p.fallbacks, vec![Antigravity]);
+        assert!(p.team.is_none());
+        // 입력창에서 고른 AI가 그 모델을 쓸 수 있으면 그 AI로
+        let p = plan("opus로 답해", Some(Antigravity), false, &all, &c, ReviewMode::Auto, None).unwrap();
+        assert_eq!(p.primary, Antigravity);
+        assert!(p.models.contains(&(Antigravity, "claude-opus-5-5".to_string())));
+        // 에이전트 수를 요청하면 팀: 다른 회사 AI부터, 검토·토론 대신 종합
+        let p = plan("에이전트 3개로 출시 전략을 자세히 세워 줘", None, false, &all, &c, ReviewMode::Auto, None).unwrap();
+        let t = p.team.clone().expect("팀");
+        assert_eq!(t.agents.iter().map(|a| a.engine).collect::<Vec<_>>(), vec![Claude, Antigravity, Nvidia]);
+        assert_eq!(t.synth, Claude, "가장 강한 AI가 종합");
+        assert!(p.reviewer.is_none() && p.debate.is_none());
+        // 설정의 기본 수, 엔진이 하나뿐이면 같은 엔진을 여러 개
+        assert_eq!(plan_with("안녕", None, false, &all, &c, ReviewMode::Auto, None, 2).unwrap().team.unwrap().agents.len(), 2);
+        let t = plan_with("안녕", None, false, &[Claude], &c, ReviewMode::Auto, None, 3).unwrap().team.unwrap();
+        assert!(t.agents.len() == 3 && t.agents.iter().all(|a| a.engine == Claude));
+        assert!(plan_with("안녕", None, false, &all, &c, ReviewMode::Auto, None, 1).unwrap().team.is_none(), "기본 1이면 끔");
+        // 모델을 여럿 적으면 그 모델들로 팀
+        let t = plan("opus랑 gemini로 동시에 답해 줘", None, false, &all, &c, ReviewMode::Auto, None).unwrap().team.unwrap();
+        assert_eq!(t.agents, vec![TeamAgent { engine: Claude, model: Some("opus".into()) }, TeamAgent { engine: Antigravity, model: None }]);
+        // 작업 모드는 파일 충돌을 막으려고 한 AI만, 정확도 요청이어도 팀이면 토론 대신 팀
+        assert!(plan_with("파일 고쳐", None, true, &all, &c, ReviewMode::Auto, None, 3).unwrap().team.is_none());
+        let p = plan("에이전트 2개로 정확히 계산해 줘", None, false, &all, &c, ReviewMode::Auto, None).unwrap();
+        assert!(p.team.is_some() && p.debate.is_none());
+        let pr = team_prompt("질문", &[("Claude Code · opus".into(), "답1"), ("Antigravity".into(), "답2")]);
+        assert!(pr.contains("[에이전트 1: Claude Code · opus]\n답1") && pr.contains("[에이전트 2: Antigravity]\n답2"));
     }
 }

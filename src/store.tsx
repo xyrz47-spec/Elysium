@@ -1,11 +1,27 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
-import { api, errorText, type Approval, type Conversation, type EngineChoice, type EngineId, type EngineInfo, type Budget, type DebatePlan, type Judgment, type Message, type Settings, type SkillRef, type SkillsView } from "./lib/api";
+import { api, errorText, type Approval, type Conversation, type EngineChoice, type EngineId, type EngineInfo, type Budget, type DebatePlan, type Judgment, type Message, type Settings, type SkillRef, type SkillsView, type TeamPlan } from "./lib/api";
 import { useTauriEvent } from "./lib/events";
 
 export interface Toast {
   id: number;
   text: string;
   kind: "info" | "error";
+}
+
+/** AI 실행 하나(초안·검토·토론·동시 에이전트·종합). 오른쪽 "에이전트" 탭이 보여 준다. */
+export interface AgentRun {
+  key: string;
+  engine: EngineId;
+  label: string;
+  role: string;
+  model: string | null;
+  effort: string | null;
+  state: "run" | "ok" | "fail";
+  startedAt: number;
+  ms: number | null;
+  error: string | null;
+  chars: number | null;
+  activities: string[];
 }
 
 /** 진행 중인 요청 하나(스트리밍 중인 답) */
@@ -27,6 +43,11 @@ export interface Live {
   /** 토론일 때 참가 AI와 판정 AI, 각 AI의 진행 상태(엔진:역할 → run/ok/fail) */
   debate: DebatePlan | null;
   debateState: Record<string, "run" | "ok" | "fail">;
+  /** 동시 에이전트일 때 참가 AI와 종합 AI */
+  team: TeamPlan | null;
+  /** 실행 key → 상태(시작한 순서대로) */
+  agents: Record<string, AgentRun>;
+  startedAt: number;
   label: string | null;
   text: string;
   draft: string;
@@ -55,7 +76,8 @@ interface AppCtx {
   live: Live[];
   approvals: Approval[];
   decide: (id: string, approve: boolean) => Promise<void>;
-  send: (text: string, engine: EngineChoice, work: boolean) => Promise<void>;
+  /** work: 작업 모드(허락을 받은 뒤 파일 수정) · build: '만들기' — 폴더 안에서 승인 없이 끝까지 완성 */
+  send: (text: string, engine: EngineChoice, work: boolean, build: boolean) => Promise<void>;
   cancel: (taskId: string) => void;
   skills: SkillsView | null;
   refreshSkills: () => Promise<void>;
@@ -86,6 +108,9 @@ const blank = (taskId: string, conversationId: string, work: boolean): Live => (
   budget: null,
   debate: null,
   debateState: {},
+  team: null,
+  agents: {},
+  startedAt: Date.now(),
   effort: null,
   model: null,
   phase: null,
@@ -162,11 +187,28 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const patch = (taskId: string, f: (l: Live) => Live) => setLive((m) => (m[taskId] ? { ...m, [taskId]: f(m[taskId]) } : m));
 
-  useTauriEvent<{ taskId: string; conversationId: string; messageId: string; primary: EngineId; reviewer: EngineId | null; work: boolean; skill: SkillRef | null; reasons: string[]; jev: Judgment | null; budget: Budget | null; debate: DebatePlan | null }>("task:started", (p) =>
+  useTauriEvent<{ taskId: string; conversationId: string; messageId: string; primary: EngineId; reviewer: EngineId | null; work: boolean; skill: SkillRef | null; reasons: string[]; jev: Judgment | null; budget: Budget | null; debate: DebatePlan | null; team: TeamPlan | null; model: string | null }>("task:started", (p) =>
     setLive((m) => ({
       ...m,
-      [p.taskId]: { ...(m[p.taskId] ?? blank(p.taskId, p.conversationId, p.work)), messageId: p.messageId, primary: p.primary, reviewer: p.reviewer, work: p.work, skill: p.skill, reasons: p.reasons, jev: p.jev, budget: p.budget, debate: p.debate ?? null },
+      [p.taskId]: { ...(m[p.taskId] ?? blank(p.taskId, p.conversationId, p.work)), messageId: p.messageId, primary: p.primary, reviewer: p.reviewer, work: p.work, skill: p.skill, reasons: p.reasons, jev: p.jev, budget: p.budget, debate: p.debate ?? null, team: p.team ?? null, model: p.model ?? null },
     })),
+  );
+  useTauriEvent<{ taskId: string; conversationId: string; key: string; engine: EngineId; label: string; role: string; state: AgentRun["state"]; model?: string | null; effort?: string | null; ms?: number; error?: string | null; chars?: number }>("task:agent", (p) =>
+    setLive((m) => {
+      const l = m[p.taskId] ?? blank(p.taskId, p.conversationId, false);
+      const prev = l.agents[p.key];
+      const run: AgentRun =
+        p.state === "run"
+          ? { key: p.key, engine: p.engine, label: p.label, role: p.role, model: p.model ?? null, effort: p.effort ?? null, state: "run", startedAt: Date.now(), ms: null, error: null, chars: null, activities: [] }
+          : { ...(prev ?? { key: p.key, engine: p.engine, label: p.label, role: p.role, model: null, effort: null, startedAt: Date.now(), activities: [] }), state: p.state, ms: p.ms ?? null, error: p.error ?? null, chars: p.chars ?? null };
+      return { ...m, [p.taskId]: { ...l, agents: { ...l.agents, [p.key]: run } } };
+    }),
+  );
+  useTauriEvent<{ taskId: string; key: string; text: string }>("task:agent-activity", (p) =>
+    patch(p.taskId, (l) => {
+      const a = l.agents[p.key];
+      return a ? { ...l, agents: { ...l.agents, [p.key]: { ...a, activities: [...a.activities, p.text].slice(-6) } } } : l;
+    }),
   );
   useTauriEvent<{ taskId: string; engine: EngineId; role: string; state: "run" | "ok" | "fail" }>("task:debate", (p) =>
     patch(p.taskId, (l) => ({ ...l, debateState: { ...l.debateState, [`${p.engine}:${p.role}`]: p.state } })),
@@ -200,11 +242,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
   });
 
   const send = useCallback(
-    async (text: string, engine: EngineChoice, work: boolean) => {
+    async (text: string, engine: EngineChoice, work: boolean, build: boolean) => {
       try {
-        const r = await api.chatSend(conversationId, text, engine, work, conversationId ? null : newFolder);
+        const r = await api.chatSend(conversationId, text, engine, work, build, conversationId ? null : newFolder);
         if (!conversationId) setNewFolder(null);
-        setLive((m) => ({ ...m, [r.taskId]: m[r.taskId] ?? blank(r.taskId, r.conversationId, work) }));
+        setLive((m) => ({ ...m, [r.taskId]: m[r.taskId] ?? blank(r.taskId, r.conversationId, work || build) }));
         if (r.conversationId !== conversationId) setConversationId(r.conversationId);
         else loadMessages(r.conversationId);
         refreshConversations();

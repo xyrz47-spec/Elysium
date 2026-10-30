@@ -92,6 +92,16 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE conversations ADD COLUMN memory_upto TEXT;
     ALTER TABLE engine_sessions ADD COLUMN seen_at TEXT;
     "#,
+    // v5: 과거 usage_events 중 cost_usd가 비어 있는 CLI/API 기록에 추정 비용 채우기
+    r#"
+    UPDATE usage_events SET cost_usd = (COALESCE(input_tokens, 0) * 2.5 + COALESCE(output_tokens, 0) * 10.0) / 1000000.0 WHERE engine = 'codex' AND cost_usd IS NULL;
+    UPDATE usage_events SET cost_usd = (COALESCE(input_tokens, 0) * 0.10 + COALESCE(output_tokens, 0) * 0.40) / 1000000.0 WHERE (engine = 'antigravity' OR engine = 'gemini') AND cost_usd IS NULL;
+    UPDATE usage_events SET cost_usd = (COALESCE(input_tokens, 0) * 3.0 + COALESCE(output_tokens, 0) * 15.0) / 1000000.0 WHERE engine = 'claude-api' AND cost_usd IS NULL;
+    UPDATE usage_events SET cost_usd = (COALESCE(input_tokens, 0) * 2.5 + COALESCE(output_tokens, 0) * 10.0) / 1000000.0 WHERE engine = 'openai' AND cost_usd IS NULL;
+    UPDATE usage_events SET cost_usd = (COALESCE(input_tokens, 0) * 0.10 + COALESCE(output_tokens, 0) * 0.40) / 1000000.0 WHERE engine = 'gemini-api' AND cost_usd IS NULL;
+    UPDATE usage_events SET cost_usd = 0.0 WHERE engine = 'nvidia' AND cost_usd IS NULL;
+    UPDATE usage_events SET cost_usd = (COALESCE(input_tokens, 0) * 3.0 + COALESCE(output_tokens, 0) * 15.0) / 1000000.0 WHERE engine = 'claude' AND cost_usd IS NULL;
+    "#,
 ];
 
 pub struct Db {

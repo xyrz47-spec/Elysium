@@ -246,7 +246,6 @@ export default function App() {
       </>
     );
 
-  const isApi = engines.find((e) => e.id === engine)?.kind === "api";
   const current = convs.find((c) => c.id === cid);
   const orb: OrbMode = !online ? "off" : approvals.length ? "approval" : Object.keys(live).length ? "thinking" : "idle";
 
@@ -255,7 +254,7 @@ export default function App() {
     if (!t || sending) return;
     setSending(true);
     try {
-      const r = await remote.send(cid, t, engine, work && !isApi);
+      const r = await remote.send(cid, t, engine, work);
       setText("");
       setLive((m) => ({ ...m, [r.taskId]: m[r.taskId] ?? { taskId: r.taskId, conversationId: r.conversationId, work, phase: null, label: null, text: "", activity: null } }));
       if (r.conversationId !== cid) setCid(r.conversationId);
@@ -335,7 +334,7 @@ export default function App() {
         ))}
       </main>
 
-      <footer className={`composer ${work && !isApi ? "work" : ""}`}>
+      <footer className={`composer ${work ? "work" : ""}`}>
         <textarea value={text} onChange={(e) => setText(e.target.value)} placeholder={online ? "PC의 엘리시움에게 물어보세요" : "PC와 다시 연결하는 중"} rows={1} disabled={!online} />
         <div className="bar">
           <select value={engine} onChange={(e) => setEngine(e.target.value)} aria-label="AI 고르기">
@@ -348,16 +347,13 @@ export default function App() {
           </select>
           <Segmented
             label="모드"
-            className={`mode ${work && !isApi ? "is-work" : ""}`}
-            value={work && !isApi ? "work" : "chat"}
+            className={`mode ${work ? "is-work" : ""}`}
+            value={work ? "work" : "chat"}
             options={[
               { value: "chat", label: "대화" },
               { value: "work", label: "작업" },
             ]}
-            onChange={(v) => {
-              if (v === "work" && isApi) return toast("API로는 파일을 고칠 수 없습니다. 자동이나 CLI를 고르세요");
-              setWork(v === "work");
-            }}
+            onChange={(v) => setWork(v === "work")}
           />
           <button className="send" aria-label="보내기" disabled={!text.trim() || sending || !online} onClick={send}>
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden>

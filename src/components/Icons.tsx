@@ -113,6 +113,16 @@ export const ChartIcon = () => (
     <path d="M4 20h16M7 16v-4M12 16V7M17 16v-6" />
   </Svg>
 );
+/** 에이전트: 가운데 노드에 이어진 세 노드 */
+export const AgentsIcon = () => (
+  <Svg>
+    <circle cx="12" cy="12" r="2.6" />
+    <circle cx="5.5" cy="6" r="2" />
+    <circle cx="18.5" cy="6" r="2" />
+    <circle cx="12" cy="19.5" r="2" />
+    <path d="M7 7.4l3 2.6M17 7.4l-3 2.6M12 14.6v2.9" />
+  </Svg>
+);
 export const InfoIcon = () => (
   <Svg>
     <circle cx="12" cy="12" r="8.5" />

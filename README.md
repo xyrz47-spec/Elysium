@@ -1,6 +1,6 @@
 # Elysium
 
-여러 AI(CLI: Claude Code·Codex·Gemini CLI, API: Claude·OpenAI·Gemini·NVIDIA)를 엮어 완성도 높은 답과 결과를 내는 데스크톱 AI 클라이언트입니다(Tauri 2 + Rust + React/TS, Windows 11).
+여러 AI(CLI: Claude Code·Codex·Antigravity, API: Claude·OpenAI·Gemini·NVIDIA)를 엮어 완성도 높은 답과 결과를 내는 데스크톱 AI 클라이언트입니다(Tauri 2 + Rust + React/TS, Windows 11).
 2026-10-17에 JARVIS에서 방향을 바꿨습니다. 음성·로컬 LLM 기능과 예전 코드·모델은 정리했습니다(2026-10-17 휴지통으로 이동).
 
 ## 실행
@@ -27,7 +27,7 @@ AI CLI를 설치해 로그인하거나, 설정 → API 키에 키를 넣으세�
 | --- | --- | --- |
 | Claude Code | https://claude.com/claude-code | 이 PC에서 실제 출력으로 확인(2.1.299) |
 | Codex | `npm i -g @openai/codex` | 공개 형식 기준으로 연결, 미검증 |
-| Gemini CLI | `npm i -g @google/gemini-cli` | 공개 형식 기준으로 연결, 미검증 |
+| Antigravity | Antigravity 설치 후 `agy` 로 로그인 | 이 PC에서 실제 출력으로 확인(agy 1.4.10) |
 
 | Claude API · OpenAI API · Gemini API · NVIDIA API | 설정 → API 키 | 키가 없어 실제 호출 미검증(스트림 해석은 단위 테스트) |
 
@@ -39,7 +39,7 @@ AI CLI를 설치해 로그인하거나, 설정 → API 키에 키를 넣으세�
 
 1. **스킬**: `/이름`으로 부르거나, 스킬에 적힌 낱말이 요청에 있으면 자동으로 지시문을 붙입니다.
 2. **JEV 판단**(설정에서 켰을 때): TypeSafe Jev가 요청의 종류(코드·글쓰기·조사·분석·대화·번역), 난이도(0~3), 정확도 중요도(0~3: 틀리면 얼마나 곤란한지)를 판단합니다. 확신도 50% 미만이거나 실패하면 규칙으로 정합니다. 요청 글이 TypeSafe로 전송됩니다(실측 약 0.2초, 요청당 약 $0.00002).
-3. **AI 고르기**: 입력창에서 "자동"이면 쓸 수 있는 AI 중에서 종류별 순서로 고릅니다(코드: Claude Code → Codex → Gemini CLI → API들, 대화·번역: Gemini API → NVIDIA → … 처럼 빠른 API 먼저, 조사: Gemini 먼저). 첫 AI가 실패하면 다음 AI로 넘어갑니다. 직접 고를 수도 있습니다.
+3. **AI 고르기**: 입력창에서 "자동"이면 쓸 수 있는 AI 중에서 종류별 순서로 고릅니다(코드: Claude Code → Codex → Antigravity → API들, 대화·번역: Gemini API → NVIDIA → … 처럼 빠른 API 먼저, 조사: Gemini 먼저). 첫 AI가 실패하면 다음 AI로 넘어갑니다. 직접 고를 수도 있습니다.
 4. **작업 모드면 허락 받기**: 파일을 고치는 요청은 대화창에 허락 카드를 띄우고, 허락한 뒤에만 편집 도구를 켭니다(10분 안에 답이 없으면 취소).
 5. **초안**: 고른 CLI가 답을 쓰고, 화면에 글자·도구 사용이 실시간으로 나옵니다.
 6. **노력치**(JEV를 켰을 때): JEV 난이도로 단계를 정해 토큰을 아낍니다. 확신이 낮으면 각 엔진의 기본값을 씁니다.
@@ -61,7 +61,8 @@ AI CLI를 설치해 로그인하거나, 설정 → API 키에 키를 넣으세�
    - 실측: "17²³ mod 1000"(Claude Code·NVIDIA, 판정 Claude Code) → 713(정답), 약 5만 토큰·$0.22. 가장 정확하지만 호출이 4~5배입니다.
 
 **세션 메모리**(`src-tauri/src/memory.rs`): 같은 세션(대화)에서는 모든 AI(초안·검토·토론·판정, CLI·API)가 같은 기억을 씁니다.
-- 매 실행마다 [세션 요약] + [최근 대화 12개(누가 답했는지 포함)]를 요청 앞에 붙입니다.
+- 매 실행마다 [세션 요약] + [최근 대화 6개(누가 답했는지 포함, AI 답은 700자·코드 블록은 줄 수만)]를 요청 앞에 붙입니다.
+- **JEV 기억 거르기**(설정에서 JEV를 켰을 때): 요약 항목과 최근 대화 하나하나를 "지금 요청에 필요한가"로 JEV에 한 번에 묻고, 필요하다고 본 것만 붙입니다(필요 확률 50% 이상, 바로 앞 차례는 25% 이상). 하나도 필요 없으면 요청만 보냅니다. 요청 판단과 동시에 돌아가고, 기억이 600자 미만이면 부르지 않으며, 실패하면 기억을 그대로 보냅니다. 결과는 답의 "과정"에 `JEV: 이전 기억 중 … 최근 대화 2/6개, 요약 3/8줄` 처럼 표시됩니다. 세션 기억이 TypeSafe로 전송됩니다.
 - Claude Code처럼 자기 세션을 이어 쓰는(`--resume`) 엔진에는 그 엔진이 아직 못 본 차례(다른 AI가 답한 부분)만 붙입니다.
 - 오래된 대화가 쌓이면 작업이 끝난 뒤 가장 싼 AI(빠른 API → Claude Code haiku·low)가 요약에 접어 넣습니다(1,400자 이내, 결정·선호·사실·남은 일).
 - 세션 머리의 **기억** 버튼에서 요약을 보고 지울 수 있습니다.
@@ -81,7 +82,7 @@ AI CLI를 설치해 로그인하거나, 설정 → API 키에 키를 넣으세�
 
 - **스킬**: `skills/<이름>/SKILL.md`. 머리말 `name`, `description`에 더해 Elysium이 쓰는 `engine`(claude·codex·gemini), `review`(true/false), `debate`(true면 토론), `tier`(light·standard·deep: 노력 단계 고정), `mode`(chat·work), `triggers`(자동 적용 낱말, 쉼표 구분)를 넣을 수 있습니다. 예시로 summarize·code-review·report·translate가 들어 있습니다.
 - **기본 스킬**(`src-tauri/seed-skills/`, 앱에 넣어 두고 스킬 폴더에 만듦). 여러 공개 스킬에서 필요한 부분만 골라 한국어로 다시 썼습니다(원문을 옮기지 않음, 출처는 각 SKILL.md 끝).
-  - 짧은 핵심 절차는 `SKILL.md`에, 자세한 점검표는 `references/*.md`에 둡니다. 스킬을 쓰면 참고 파일 목록이 지시문에 붙고, CLI(Claude Code `--add-dir`, Gemini CLI `--include-directories`)는 **필요한 파일만** 열어 읽습니다. API 엔진은 본문만 씁니다.
+  - 짧은 핵심 절차는 `SKILL.md`에, 자세한 점검표는 `references/*.md`에 둡니다. 스킬을 쓰면 참고 파일 목록이 지시문에 붙고, CLI(Claude Code `--add-dir`, Antigravity `--add-dir`)는 **필요한 파일만** 열어 읽습니다. API 엔진은 본문만 씁니다.
   - 판이 올라가면(현재 2판) 사용자가 고치지 않은 이전 판만 새 판으로 바꾸고, 고친 것은 그대로, 지운 것은 다시 만들지 않습니다(`skills/.seeded`).
   - `ui-craft`(참고 8개: 방향·토큰, 접근성 WCAG 2.2, 상호작용·모션, 글·상태·폼, 컴포넌트·라이브러리(shadcn·daisyUI·Magic UI·채팅·표), 숫자·차트, 반응형·성능, 리뷰·화면 확인): Anthropic frontend-design·theme-factory·webapp-testing·web-artifacts-builder, Vercel Web Interface Guidelines·React Best Practices, UI/UX Pro Max, Interface Design, shadcn·Magic UI·daisyUI 스킬, web-quality-skills, dataviz 원칙.
   - `perf-tune`(깊게, 참고 5개: 재는 방법, 웹, 서버·DB, 언어별, 보고 틀): 숫자로 정하기 → 기준선 → 병목(비중) → 하나씩 고치고 같은 방법으로 다시 재기.
@@ -170,7 +171,7 @@ CLI(확인·다시 찾기), API 키(저장·지우기·모델·확인), JEV(켜�
 
 ## 남은 일
 
-- Codex·Gemini CLI는 설치되지 않아 실제 실행을 확인하지 못했습니다(출력 형식은 단위 테스트만).
+- Codex는 설치되지 않아 실제 실행을 확인하지 못했습니다(출력 형식은 단위 테스트만).
 - 작업 모드에서 명령 실행(Bash) 허용은 넣지 않았습니다.
 - API: Claude·OpenAI·Gemini는 키가 없어 실제 호출을 확인하지 못했습니다. NVIDIA는 사용자 키로 `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning`(기본, 실제 대화 확인·첫 호출 2~23초·가끔 503 과부하)과 `deepseek-ai/deepseek-v4.1-flash` 호출을 확인했습니다. 처음 저장된 키는 403이었고 다시 넣은 키는 정상, Gemma 4·Nemotron 3.5는 30초 안에 응답이 없었고 Nemotron 3 Ultra(`Function id … not found` 404, 같은 키·주소로 다른 모델은 정상이라 NVIDIA 쪽 문제로 보임)·Kimi K2.6은 이 계정에서 404였습니다. 거절된(401·403) API는 키를 다시 넣을 때까지 자동 선택에서 빠집니다.
 - 예전 JARVIS의 `%USERPROFILE%\.jarvis-models`(17GB), `com.hoya.jarvis` 앱 데이터, `_archive`는 2026-10-17 휴지통으로 옮겼습니다.

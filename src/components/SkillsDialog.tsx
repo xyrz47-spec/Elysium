@@ -5,7 +5,7 @@ import { useApp } from "../store";
 import { CloseIcon, FolderIcon, PlusIcon, PuzzleIcon, RefreshIcon, SparkIcon } from "./Icons";
 import Segmented from "./Segmented";
 
-const LABEL: Record<string, string> = { claude: "Claude Code", codex: "Codex", gemini: "Gemini CLI" };
+const LABEL: Record<string, string> = { claude: "Claude Code", codex: "Codex", antigravity: "Antigravity", gemini: "Antigravity" };
 
 function Toggle({ on, onChange, label }: { on: boolean; onChange: (v: boolean) => void; label: string }) {
   return <input type="checkbox" className="switch" role="switch" checked={on} onChange={(e) => onChange(e.target.checked)} aria-label={label} />;

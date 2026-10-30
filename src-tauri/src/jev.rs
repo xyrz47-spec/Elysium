@@ -84,6 +84,18 @@ pub fn choice(answers: &HashMap<String, Answer>, key: &str) -> Option<(String, f
     }
 }
 
+/// choice 답에서 특정 선택지의 확률. 확률표에 없으면 고른 선택지와 확신도로 어림한다(두 갈래 질문용).
+pub fn prob(answers: &HashMap<String, Answer>, key: &str, label: &str) -> Option<f64> {
+    match answers.get(key)? {
+        Answer::Choice { choice, probabilities, confidence } => Some(match probabilities.get(label) {
+            Some(p) => *p,
+            None if choice == label => *confidence,
+            None => 1.0 - *confidence,
+        }),
+        _ => None,
+    }
+}
+
 pub fn score(answers: &HashMap<String, Answer>, key: &str) -> Option<(f64, f64)> {
     match answers.get(key)? {
         Answer::Score { score, confidence, .. } => Some((*score, *confidence)),
@@ -166,6 +178,17 @@ mod tests {
         assert_eq!(score(&r.answers, "difficulty"), Some((0.18, 0.84)));
         assert!(matches!(r.answers["sensitive"], Answer::Noul { noul } if (noul - 0.18).abs() < 1e-9));
         assert_eq!(r.usage.input_tokens, 540);
+    }
+
+    #[test]
+    fn prob_reads_probabilities_or_falls_back_to_confidence() {
+        let raw = r#"{"model":"jev","answers":{"a":{"type":"choice","choice":"skip","confidence":0.8,"probabilities":{"needed":0.2,"skip":0.8}},"b":{"type":"choice","choice":"needed","confidence":0.7,"probabilities":{}},"c":{"type":"score","score":1.0,"confidence":0.9}}}"#;
+        let r: Response = serde_json::from_str(raw).unwrap();
+        assert_eq!(prob(&r.answers, "a", "needed"), Some(0.2));
+        assert_eq!(prob(&r.answers, "b", "needed"), Some(0.7));
+        assert!((prob(&r.answers, "b", "skip").unwrap() - 0.3).abs() < 1e-9);
+        assert_eq!(prob(&r.answers, "c", "needed"), None, "choice가 아니면 없음");
+        assert_eq!(prob(&r.answers, "zz", "needed"), None);
     }
 
     #[test]

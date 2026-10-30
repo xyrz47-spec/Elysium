@@ -2,14 +2,152 @@ import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNod
 import { api, baseName, ENGINE_LABEL, errorText, type EngineId, type MemoryView, type Message } from "../lib/api";
 import { ask } from "../lib/confirm";
 import { useTauriEvent } from "../lib/events";
-import { useApp } from "../store";
-import { ArrowDownIcon, ArrowUpIcon, BookmarkIcon, CloseIcon, DownloadIcon, FolderIcon, InfoIcon, KeyboardIcon, ListIcon, PlusIcon, SearchIcon, TrashIcon } from "./Icons";
-import { pair } from "./Thread";
+import { useApp, type AgentRun } from "../store";
+import Segmented from "./Segmented";
+import { AgentsIcon, ArrowDownIcon, ArrowUpIcon, BookmarkIcon, CloseIcon, DownloadIcon, FolderIcon, InfoIcon, KeyboardIcon, ListIcon, PlusIcon, SearchIcon, TrashIcon } from "./Icons";
+import { pair, ROLE_LABEL } from "./Thread";
 
-export type ToolTab = "info" | "outline" | "find" | "snippets" | "export" | "keys";
+export type ToolTab = "info" | "agents" | "outline" | "find" | "snippets" | "export" | "keys";
+
+/** 에이전트 탭 문구(설정 창도 같이 쓴다) */
+export const A = {
+  title: "에이전트",
+  tip: "에이전트: 실행 중인 AI 현황 및 진행 상황",
+  running: "실행 현황",
+  idle: "현재 실행 중인 에이전트가 없습니다. 요청을 보내면 초안, 검토, 토론 등 작업 중인 AI의 상태가 여기에 표시됩니다.",
+  roster: "사용 가능한 엔진",
+  preset: "동시 실행 수",
+  presetHelp: "2개 이상 설정하면 여러 AI가 동시에 답변을 생성해 종합하며, 토큰 사용량이 증가합니다(1은 꺼짐). 메시지에 '에이전트 3개로' 요청하거나 'opus랑 gpt-5로'처럼 모델을 지정할 수도 있습니다. 파일 충돌을 방지하기 위해 만들기에서는 항상 단일 AI만 실행합니다.",
+  off: "꺼짐",
+  open: "이동",
+  stop: "중지",
+  preparing: "AI 선택하는 중",
+  approval: "승인 대기 중",
+  busy: "{n}개 실행 중",
+  ready: "대기 중",
+  none: "설정에서 AI CLI 또는 API 키를 연결해 주십시오.",
+  newSession: "새 대화",
+};
+
+const STATE_LABEL: Record<AgentRun["state"], string> = {
+  run: "실행 중",
+  ok: "완료",
+  fail: "중단",
+};
+
+function since(ms: number) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  return s >= 60 ? `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}` : `${s}s`;
+}
+
+function AgentsTab({ onClose }: { onClose: () => void }) {
+  const { live, engines, conversations, conversationId, openConversation, cancel, approvals, settings, saveSettings } = useApp();
+  const [, tick] = useState(0);
+  // 실행 중이면 경과 시간을 1초마다 다시 그린다.
+  useEffect(() => {
+    if (!live.length) return;
+    const t = setInterval(() => tick((x) => x + 1), 1000);
+    return () => clearInterval(t);
+  }, [live.length]);
+  const tasks = [...live].sort((a, b) => a.startedAt - b.startedAt);
+  const busy = new Map<string, number>();
+  for (const l of live) for (const a of Object.values(l.agents)) if (a.state === "run") busy.set(a.engine, (busy.get(a.engine) ?? 0) + 1);
+  const installed = engines.filter((e) => e.installed);
+  const now = Date.now();
+  return (
+    <div className="tool-body">
+      <section className="tool-sec">
+        <h4>
+          {A.running}
+          {tasks.length > 0 && <span className="agent-count">{tasks.length}</span>}
+        </h4>
+        {tasks.length === 0 && <Empty>{A.idle}</Empty>}
+        {tasks.map((l) => {
+          const c = conversations.find((x) => x.id === l.conversationId);
+          const runs = Object.values(l.agents).sort((a, b) => a.startedAt - b.startedAt);
+          const waiting = approvals.some((a) => a.taskId === l.taskId);
+          return (
+            <div key={l.taskId} className={`agent-task ${l.conversationId === conversationId ? "here" : ""}`}>
+              <div className="agent-task-head">
+                <b title={c?.title}>{c?.title ?? A.newSession}</b>
+                <span className="agent-time">{since(now - l.startedAt)}</span>
+              </div>
+              <ul className="agent-runs">
+                {runs.length === 0 && <li className="agent-run wait">{waiting ? A.approval : A.preparing}</li>}
+                {runs.map((a) => (
+                  <li key={a.key} className={`agent-run ${a.state}`}>
+                    <i className="agent-dot" aria-hidden />
+                    <div className="agent-main">
+                      <div className="agent-line">
+                        <b>{a.label}</b>
+                        <span className="agent-role">{ROLE_LABEL[a.role as keyof typeof ROLE_LABEL] ?? a.role}</span>
+                        <span className="agent-state">{STATE_LABEL[a.state]}</span>
+                        <span className="agent-time">{a.state === "run" ? since(now - a.startedAt) : a.ms != null ? since(a.ms) : ""}</span>
+                      </div>
+                      {(a.model || a.effort) && <div className="agent-sub">{[a.model, a.effort].filter(Boolean).join(" · ")}</div>}
+                      {a.state === "run" && a.activities.length > 0 && <div className="agent-act">{a.activities[a.activities.length - 1]}</div>}
+                      {a.state === "fail" && a.error && <div className="agent-err">{a.error}</div>}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+              <div className="row">
+                {l.conversationId !== conversationId && (
+                  <button
+                    className="btn sm ghost"
+                    onClick={() => {
+                      openConversation(l.conversationId);
+                      if (window.innerWidth < 1560) onClose();
+                    }}
+                  >
+                    {A.open}
+                  </button>
+                )}
+                <button className="btn sm danger" onClick={() => cancel(l.taskId)}>
+                  {A.stop}
+                </button>
+              </div>
+            </div>
+          );
+        })}
+      </section>
+      <section className="tool-sec">
+        <h4>{A.roster}</h4>
+        {installed.length === 0 ? (
+          <Empty>{A.none}</Empty>
+        ) : (
+          <ul className="tool-engines">
+            {installed.map((e) => (
+              <li key={e.id} className={busy.get(e.id) ? "busy" : ""}>
+                <b>
+                  <i className="agent-dot" aria-hidden /> {e.label}
+                </b>
+                <span title={e.version ?? undefined}>{busy.get(e.id) ? A.busy.replace("{n}", String(busy.get(e.id))) : `${A.ready}${e.version ? ` · ${e.version}` : ""}`}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+      {settings && (
+        <section className="tool-sec">
+          <h4>{A.preset}</h4>
+          <Segmented
+            label={A.preset}
+            className="wide"
+            value={String(settings.agents ?? 1)}
+            options={["1", "2", "3", "4", "5"].map((v) => ({ value: v, label: v === "1" ? A.off : v }))}
+            onChange={(v) => saveSettings({ ...settings, agents: Number(v) })}
+          />
+          <p className="tool-help">{A.presetHelp}</p>
+        </section>
+      )}
+    </div>
+  );
+}
 
 const TABS: { id: ToolTab; label: string; icon: ReactNode; tip: string }[] = [
   { id: "info", label: "세션 정보", icon: <InfoIcon />, tip: "세션 정보: 폴더·AI·토큰·비용·기억" },
+  { id: "agents", label: A.title, icon: <AgentsIcon />, tip: A.tip },
   { id: "outline", label: "목차", icon: <ListIcon />, tip: "목차: 질문으로 바로 이동" },
   { id: "find", label: "찾기", icon: <SearchIcon />, tip: "세션에서 찾기 (Ctrl+F)" },
   { id: "snippets", label: "빠른 문구", icon: <BookmarkIcon />, tip: "빠른 문구: 자주 쓰는 요청 넣기" },
@@ -80,7 +218,6 @@ function InfoTab() {
 
   if (!c) return <Empty>세션을 열면 폴더, 쓰인 AI, 토큰과 비용, 세션 기억이 여기에 보입니다.</Empty>;
   const asks = messages.filter((m) => m.role === "user").length;
-  const ROLE: Record<string, string> = { draft: "초안", review: "검토", debate: "토론", rebuttal: "반론", judge: "판정" };
   return (
     <div className="tool-body">
       <section className="tool-sec">
@@ -123,7 +260,7 @@ function InfoTab() {
               <li key={e.label}>
                 <b>{e.label}</b>
                 <span>
-                  {e.calls}회 · {[...e.roles].map((r) => ROLE[r] ?? r).join("/")}
+                  {e.calls}회 · {[...e.roles].map((r) => ROLE_LABEL[r as keyof typeof ROLE_LABEL] ?? r).join("/")}
                   {e.tokens > 0 && ` · ${tokens(e.tokens)}`}
                 </span>
               </li>
@@ -351,7 +488,9 @@ const KEYS: [string, string][] = [
   ["Ctrl + F", "세션에서 찾기"],
   ["Ctrl + /", "단축키 보기"],
   ["Ctrl + ,", "설정"],
-  ["Enter", "보내기"],
+  ["Enter", "보내기(대화 모드: 질문 · 작업 모드: 허락 후 파일 수정)"],
+  ["← / →", "대화·작업 모드 바꾸기(모드 스위치에서)"],
+  ["Ctrl + Enter", "만들기(폴더 안에서 끝까지 완성)"],
   ["Shift + Enter", "줄 바꿈"],
   ["/", "스킬 고르기(입력창 맨 앞)"],
   ["Esc", "창·패널 닫기"],
@@ -383,11 +522,15 @@ function KeysTab() {
 
 /** 오른쪽 도구 도크(왼쪽 도크와 대칭) */
 export function ToolDock({ tab, onTab }: { tab: ToolTab | null; onTab: (t: ToolTab | null) => void }) {
+  const { live } = useApp();
+  // 지금 돌고 있는 AI 수(에이전트 탭 배지)
+  const running = live.reduce((n, l) => n + Object.values(l.agents).filter((a) => a.state === "run").length, 0);
   return (
     <nav className="dock tools-dock" aria-label="도구">
       {TABS.map((t) => (
         <button key={t.id} className={`dock-btn ${tab === t.id ? "on" : ""}`} onClick={() => onTab(tab === t.id ? null : t.id)} aria-label={t.label} aria-pressed={tab === t.id} data-tip={t.tip}>
           {t.icon}
+          {t.id === "agents" && running > 0 && <span className="dock-count">{running}</span>}
         </button>
       ))}
     </nav>
@@ -413,6 +556,7 @@ export function ToolPanel({ tab, onTab, onPick, focusKey }: { tab: ToolTab | nul
           </button>
         </div>
         {shown === "info" && <InfoTab />}
+        {shown === "agents" && <AgentsTab onClose={() => onTab(null)} />}
         {shown === "outline" && <OutlineTab />}
         {shown === "find" && <FindTab focusKey={focusKey} />}
         {shown === "snippets" && <SnippetsTab onPick={onPick} />}

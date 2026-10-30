@@ -4,6 +4,7 @@ import { useApp } from "../store";
 import { CloseIcon, FolderIcon, RefreshIcon } from "./Icons";
 import Segmented from "./Segmented";
 import RemoteSection from "./RemoteSection";
+import { A as AGENT_TEXT } from "./Tools";
 
 const REVIEW: { id: ReviewMode; label: string; help: string }[] = [
   { id: "auto", label: "자동", help: "어려운 요청은 다른 AI가 검토하고, 정확도가 중요한 요청은 두 AI가 토론한 뒤 판정 AI가 정리합니다(JEV를 켜면 JEV가 판단)" },
@@ -13,6 +14,29 @@ const REVIEW: { id: ReviewMode; label: string; help: string }[] = [
 ];
 
 const TASK_LABEL: Record<string, string> = { code: "코드", writing: "글쓰기", research: "조사", analysis: "분석", chat: "대화", translate: "번역" };
+
+function modelPriceHint(engine: string, model: string): string {
+  const m = model.toLowerCase();
+  if (engine === "claude-api" || engine === "claude") {
+    if (m.includes("haiku")) return "입력 $0.80 / 출력 $4.00 (1M 토큰)";
+    if (m.includes("opus")) return "입력 $15.00 / 출력 $75.00 (1M 토큰)";
+    return "입력 $3.00 / 출력 $15.00 (1M 토큰)";
+  }
+  if (engine === "openai" || engine === "codex") {
+    if (m.includes("mini") || m.includes("oss")) return "입력 $0.15 / 출력 $0.60 (1M 토큰)";
+    if (m.includes("o1")) return "입력 $15.00 / 출력 $60.00 (1M 토큰)";
+    if (m.includes("o3")) return "입력 $1.10 / 출력 $4.40 (1M 토큰)";
+    return "입력 $2.50 / 출력 $10.00 (1M 토큰)";
+  }
+  if (engine === "gemini-api" || engine === "antigravity") {
+    if (m.includes("pro") || m.includes("argon")) return "입력 $1.25 / 출력 $5.00 (1M 토큰)";
+    return "입력 $0.10 / 출력 $0.40 (1M 토큰)";
+  }
+  if (engine === "nvidia") {
+    return "NVIDIA Build 체험 무료 ($0.00)";
+  }
+  return "";
+}
 
 function Section({ title, i, children, extra }: { title: string; i: number; children: React.ReactNode; extra?: React.ReactNode }) {
   return (
@@ -66,6 +90,8 @@ function ApiRow({ e, status, onEngines }: { e: EngineInfo; status?: SecretStatus
     saveSettings({ ...settings, models: { ...settings.models, [e.id]: model.trim() } });
   }
 
+  const priceHint = modelPriceHint(e.id, model);
+
   return (
     <div className={`api-row ${e.installed ? "on" : ""}`}>
       <div className="api-top">
@@ -91,6 +117,7 @@ function ApiRow({ e, status, onEngines }: { e: EngineInfo; status?: SecretStatus
           확인
         </button>
       </div>
+      {priceHint && <div className="api-price-hint">단가: {priceHint}</div>}
       {check && <div className={`check ${check.ok ? "ok" : "err"}`}>{check.text}</div>}
     </div>
   );
@@ -165,9 +192,14 @@ export default function SettingsDialog() {
       <div className="modal wide" role="dialog" aria-label="설정">
         <div className="modal-head">
           <h2>설정</h2>
-          <button className="icon" onClick={() => setDialog(null)} aria-label="닫기">
-            <CloseIcon />
-          </button>
+          <div className="row" style={{ gap: 8 }}>
+            <button className="btn sm ghost" onClick={() => setDialog("usage")}>
+              토큰 단가표 & 사용량 보기
+            </button>
+            <button className="icon" onClick={() => setDialog(null)} aria-label="닫기">
+              <CloseIcon />
+            </button>
+          </div>
         </div>
 
         <Section
@@ -187,27 +219,32 @@ export default function SettingsDialog() {
                   <b>{e.label}</b>
                   {e.installed && !e.verified && <em className="tag">미검증</em>}
                   <span>{e.installed ? `${e.version ?? "설치됨"} · ${e.path}` : e.installHint}</span>
+                  <small className="engine-price-sub">
+                    {e.id === "claude" && "Sonnet $3/$15 · Haiku $0.80/$4 · Opus $15/$75 (1M 토큰)"}
+                    {e.id === "codex" && "GPT-5/4o $2.50/$10 · Mini $0.15/$0.60 · o1 $15/$60 (1M 토큰)"}
+                    {e.id === "antigravity" && "Flash $0.10/$0.40 · Argon/Pro $1.25/$5.00 · Claude $3/$15 (1M 토큰)"}
+                  </small>
                 </div>
               </div>
             ))}
           </div>
-          <p className="help">CLI는 파일을 읽고(작업 모드에서는 고치고) 세션을 이어 씁니다. 로그인은 각 CLI에서 합니다.</p>
+          <p className="help">CLI는 파일을 읽고(만들기에서는 만들고 고치고) 세션을 이어 씁니다. 로그인은 각 CLI에서 합니다.</p>
         </Section>
 
-        <Section title="API 키" i={1}>
+        <Section title="API 키 & 모델 단가" i={1}>
           <div className="api-grid">
             {apis.map((e) => (
               <ApiRow key={e.id} e={e} status={secrets.find((s) => s.name === API_SECRET[e.id as ApiId])} onEngines={(l) => (setEngines(l), loadSecrets())} />
             ))}
           </div>
-          <p className="help">키는 Windows 자격 증명 관리자에만 저장하고 화면에 다시 보여 주지 않습니다. API는 대화 모드에서만 쓰고, 빠른 답·검토에 활용합니다. 키가 없어 이 PC에서 실제 호출은 확인하지 못했습니다.</p>
+          <p className="help">키는 Windows 자격 증명 관리자에만 안전하게 저장됩니다. 공식 API 단가에 따라 토큰 비용이 투명하게 계산됩니다.</p>
         </Section>
 
         <Section title="JEV" i={2}>
           <label className="toggle-row">
             <span>
               JEV로 판단하기
-              <small>요청의 종류(코드·글쓰기·조사·분석·대화·번역)와 난이도를 판단해 어느 AI가 답하고 검토할지 정합니다. 요청 글이 TypeSafe로 전송됩니다.</small>
+              <small>요청의 종류(코드·글쓰기·조사·분석·대화·번역)와 난이도를 판단해 어느 AI가 답하고 검토할지 정하고, 세션 기억(요약·최근 대화) 중 지금 요청에 필요한 부분만 골라 AI에 전달해 토큰을 아낍니다. (1M 입력 토큰당 $0.042)</small>
             </span>
             <input type="checkbox" className="switch" role="switch" checked={settings.jevEnabled} onChange={(e) => saveSettings({ ...settings, jevEnabled: e.target.checked })} />
           </label>
@@ -246,6 +283,17 @@ export default function SettingsDialog() {
           <p className="help">{REVIEW.find((r) => r.id === settings.review)?.help}</p>
         </Section>
 
+        <Section title={AGENT_TEXT.preset} i={4}>
+          <Segmented
+            label={AGENT_TEXT.preset}
+            className="wide"
+            value={String(settings.agents ?? 1)}
+            options={["1", "2", "3", "4", "5"].map((v) => ({ value: v, label: v === "1" ? AGENT_TEXT.off : v }))}
+            onChange={(v) => saveSettings({ ...settings, agents: Number(v) })}
+          />
+          <p className="help">{AGENT_TEXT.presetHelp}</p>
+        </Section>
+
         <Section title="데이터" i={5}>
           <div className="row">
             <input type="text" value={confirmText} onChange={(e) => setConfirmText(e.target.value)} placeholder="DELETE 입력" style={{ maxWidth: 160 }} />
@@ -256,13 +304,16 @@ export default function SettingsDialog() {
         </Section>
 
         <div className="modal-foot">
-          Elysium v{info?.version}
+          <span>Elysium v{info?.version}</span>
           {usage && (
             <span title="CLI·API가 알려 준 추정 비용입니다. 구독 요금제에서는 실제 청구액이 아닙니다.">
               {" "}
               · 오늘 {usage.calls}회 호출 · 추정 ${usage.costUsd.toFixed(2)}
             </span>
           )}
+          <button className="btn sm ghost" style={{ marginLeft: "auto" }} onClick={() => setDialog("usage")}>
+            전체 토큰 비용 확인하기 →
+          </button>
         </div>
       </div>
     </div>

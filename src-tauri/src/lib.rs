@@ -1,14 +1,17 @@
 //! Elysium 데스크톱 앱 코어: 여러 AI CLI를 엮어 완성된 답을 낸다.
 
+mod api_agent;
 mod apis;
 mod audit;
 mod commands;
 mod db;
 mod engines;
 mod error;
+mod intent;
 mod jev;
 mod memory;
 mod orchestrator;
+mod pricing;
 mod remote;
 mod secrets;
 mod settings;
@@ -48,6 +51,7 @@ pub fn run() {
                 settings: RwLock::new(s),
                 engines: RwLock::new(vec![]),
                 tasks: Mutex::new(HashMap::new()),
+                steers: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),
             });
             app.manage(state.clone());
@@ -87,6 +91,7 @@ pub fn run() {
             commands::pick_folder,
             commands::chat_send,
             commands::task_cancel,
+            commands::task_steer,
             commands::cancel_all,
             commands::approval_list,
             commands::approval_decide,
@@ -98,6 +103,7 @@ pub fn run() {
             commands::open_url,
             commands::usage_today,
             commands::usage_summary,
+            commands::pricing_list,
             commands::conversation_markdown,
             commands::conversation_export,
             commands::memory_get,

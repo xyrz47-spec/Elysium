@@ -343,6 +343,7 @@ pub struct UsageSummary {
     pub range: String,
     pub engines: Vec<EngineUsage>,
     pub days: Vec<DayUsage>,
+    pub pricing: Vec<crate::pricing::ModelPrice>,
 }
 
 fn engine_kind(engine: &str) -> &'static str {
@@ -394,14 +395,15 @@ pub fn usage_summary(db: &Db, range: &str) -> AppResult<UsageSummary> {
         u.reviews += u64::from(role == "review");
         u.input_tokens += inp.unwrap_or(0).max(0) as u64;
         u.output_tokens += out.unwrap_or(0).max(0) as u64;
-        u.cost_usd += cost.unwrap_or(0.0);
+        let cost_val = cost.or_else(|| crate::pricing::estimate_cost_by_str(&engine, None, inp.map(|x| x as u64), out.map(|x| x as u64))).unwrap_or(0.0);
+        u.cost_usd += cost_val;
         *ms_sum += ms.max(0) as u64;
         u.last_at = Some(at.clone());
         let day = chrono::DateTime::parse_from_rfc3339(&at).map(|d| d.with_timezone(&Local).format("%Y-%m-%d").to_string()).unwrap_or_else(|_| at.chars().take(10).collect());
         let d = days.entry(day.clone()).or_insert_with(|| DayUsage { date: day, ..Default::default() });
         d.calls += 1;
         d.tokens += tokens;
-        d.cost_usd += cost.unwrap_or(0.0);
+        d.cost_usd += cost_val;
     }
     let mut engines: Vec<EngineUsage> = by
         .into_values()
@@ -411,7 +413,7 @@ pub fn usage_summary(db: &Db, range: &str) -> AppResult<UsageSummary> {
         })
         .collect();
     engines.sort_by(|a, b| b.calls.cmp(&a.calls).then(a.engine.cmp(&b.engine)));
-    Ok(UsageSummary { range: range.into(), engines, days: days.into_values().collect() })
+    Ok(UsageSummary { range: range.into(), engines, days: days.into_values().collect(), pricing: crate::pricing::all_prices() })
 }
 
 // ---------------------------------------------------------------------------

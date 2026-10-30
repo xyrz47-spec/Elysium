@@ -2,7 +2,7 @@
 //! - 스킬: `<데이터>/skills/<이름>/SKILL.md` (머리말 name·description + 본문 지시문)
 //! - 플러그인: `<데이터>/plugins/<이름>/.claude-plugin/plugin.json` + `skills/<이름>/SKILL.md` (+ commands·agents 등)
 //!
-//! Elysium이 쓰는 추가 머리말(선택): `engine`(claude·codex·gemini), `review`(true/false),
+//! Elysium이 쓰는 추가 머리말(선택): `engine`(claude·codex·antigravity), `review`(true/false),
 //! `mode`(chat·work), `triggers`(이 낱말이 들어간 요청에 자동 적용, 쉼표 구분).
 
 use serde::Serialize;
@@ -119,7 +119,7 @@ fn read_skill(dir: &Path, id: String, source: &str, toggles: &HashMap<String, bo
     let text = std::fs::read_to_string(&path).ok()?;
     let (meta, body) = parse_skill_md(&text);
     let folder = dir.file_name()?.to_string_lossy().to_string();
-    let engine = meta.get("engine").map(|e| e.to_lowercase()).filter(|e| matches!(e.as_str(), "claude" | "codex" | "gemini"));
+    let engine = meta.get("engine").map(|e| e.to_lowercase()).filter(|e| matches!(e.as_str(), "claude" | "codex" | "antigravity" | "agy" | "gemini"));
     Some(Skill {
         enabled: toggles.get(&format!("skill:{id}")).copied().unwrap_or(true),
         name: meta.get("name").cloned().filter(|n| !n.is_empty()).unwrap_or(folder),

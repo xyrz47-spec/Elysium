@@ -130,12 +130,14 @@ pub fn conversation_delete(st: S, conversation_id: String) -> AppResult<()> {
     Ok(())
 }
 
-/// engine: "auto"(또는 없음) | "claude" | "codex" | "gemini". work: 파일 수정 허용(승인 후).
+/// engine: "auto"(또는 없음) | "claude" | "codex" | "antigravity". work: 파일 수정 허용(승인 후).
+/// build: '만들기' 버튼. 누른 것이 곧 허락이라 승인 없이 폴더 안에서 끝까지 완성한다.
 #[tauri::command]
-pub fn chat_send(app: AppHandle, st: S, conversation_id: Option<String>, text: String, engine: Option<String>, work: Option<bool>, workspace: Option<String>) -> AppResult<SendResult> {
+#[allow(clippy::too_many_arguments)]
+pub fn chat_send(app: AppHandle, st: S, conversation_id: Option<String>, text: String, engine: Option<String>, work: Option<bool>, build: Option<bool>, workspace: Option<String>) -> AppResult<SendResult> {
     let choice = engine.as_deref().filter(|e| *e != "auto").map(|e| EngineId::parse(e).ok_or_else(|| AppError::msg(format!("알 수 없는 엔진: {e}")))).transpose()?;
     let workspace = workspace.filter(|w| !w.trim().is_empty()).map(|w| checked_dir(&w)).transpose()?;
-    orchestrator::send(&app, st.inner(), conversation_id, text, choice, work.unwrap_or(false), workspace).map_err(AppError::msg)
+    orchestrator::send(&app, st.inner(), conversation_id, text, choice, work.unwrap_or(false), build.unwrap_or(false), workspace).map_err(AppError::msg)
 }
 
 /// 있는 폴더만 작업 폴더로 쓸 수 있다.
@@ -173,6 +175,24 @@ pub fn task_cancel(st: S, task_id: String) -> bool {
         }
         None => false,
     }
+}
+
+/// 작업 중에 보내는 메시지. API 작업 모드가 다음 차례에 읽는다. 받지 않는 AI면 오류를 돌려준다.
+#[tauri::command]
+pub fn task_steer(app: AppHandle, st: S, task_id: String, text: String) -> AppResult<()> {
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err(AppError::msg("보낼 내용이 없습니다"));
+    }
+    let steer = st.steers.lock().unwrap_or_else(|p| p.into_inner()).get(&task_id).cloned().ok_or_else(|| AppError::msg("이미 끝난 작업입니다"))?;
+    let mut slot = steer.lock().unwrap_or_else(|p| p.into_inner());
+    match slot.as_mut() {
+        Some(v) => v.push(text.clone()),
+        None => return Err(AppError::msg("지금 AI는 작업 중 메시지를 받지 않습니다(API 작업 모드만 받습니다)")),
+    }
+    drop(slot);
+    orchestrator::emit(&app, "task:activity", json!({ "taskId": task_id, "text": format!("메시지 전달: {}", text.chars().take(60).collect::<String>()) }));
+    Ok(())
 }
 
 #[tauri::command]
@@ -397,10 +417,21 @@ pub fn usage_summary(st: S, range: String) -> AppResult<store::UsageSummary> {
 #[tauri::command]
 pub fn usage_today(st: S) -> AppResult<UsageToday> {
     store::usage_today(&st.db)
+
+}
+
+/// 모델별 토큰 단가표(1M 토큰당 USD)
+#[tauri::command]
+pub fn pricing_list() -> Vec<crate::pricing::ModelPrice> { crate::pricing::all_prices() } /*
+    crate::pricing::all_prices()
+}
+
+
+
 }
 
 #[tauri::command]
-pub fn data_delete_all(app: AppHandle, st: S, confirm: String) -> AppResult<()> {
+*/ #[tauri::command] pub fn data_delete_all(app: AppHandle, st: S, confirm: String) -> AppResult<()> {
     if confirm != "DELETE" {
         return Err(AppError::Policy("확인 문구가 맞지 않습니다".into()));
     }

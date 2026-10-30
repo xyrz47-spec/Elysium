@@ -1,5 +1,5 @@
 //! API 키로 쓰는 AI(Claude API·OpenAI·Gemini API·NVIDIA). 스트리밍으로 받아 CLI 엔진과 같은 이벤트로 넘긴다.
-//! API는 파일을 읽거나 고치지 못하므로 대화 모드에서만 쓴다.
+//! 작업 모드에서는 api_agent가 도구 호출(파일·PowerShell)을 이 PC에서 실행해 준다.
 
 use crate::engines::{EngineId, Event, Outcome, RunSpec};
 use crate::secrets::{self, SecretName};
@@ -26,7 +26,7 @@ pub struct Api {
     pub reasoning: bool,
 }
 
-/// 기본 모델은 설정에서 바꿀 수 있다. Gemini·OpenAI 모델 이름은 키가 없어 이 PC에서 확인하지 못했다.
+/// 기본 모델은 설정에서 바꿀 수 있다.
 pub fn api(e: EngineId) -> Option<Api> {
     Some(match e {
         EngineId::ClaudeApi => Api {
@@ -35,7 +35,7 @@ pub fn api(e: EngineId) -> Option<Api> {
             default_model: "claude-sonnet-5-5",
             secret: SecretName::Anthropic,
             key_hint: "console.anthropic.com에서 발급(sk-ant-…)",
-            price: None,
+            price: Some((3.0, 15.0)),
             reasoning: false,
         },
         EngineId::OpenAi => Api {
@@ -44,7 +44,7 @@ pub fn api(e: EngineId) -> Option<Api> {
             default_model: "gpt-5",
             secret: SecretName::OpenAi,
             key_hint: "platform.openai.com에서 발급(sk-…)",
-            price: None,
+            price: Some((2.5, 10.0)),
             reasoning: true,
         },
         EngineId::GeminiApi => Api {
@@ -53,7 +53,7 @@ pub fn api(e: EngineId) -> Option<Api> {
             default_model: "gemini-2.5-flash",
             secret: SecretName::Gemini,
             key_hint: "aistudio.google.com에서 발급",
-            price: None,
+            price: Some((0.10, 0.40)),
             reasoning: true,
         },
         EngineId::Nvidia => Api {
@@ -68,6 +68,15 @@ pub fn api(e: EngineId) -> Option<Api> {
         },
         _ => return None,
     })
+}
+
+/// 토큰 사용량. input은 캐시에서 읽지 않은 입력 토큰이고, 캐시 읽기·쓰기는 따로 센다.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct Usage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
 }
 
 /// SSE 바이트 스트림을 이벤트 단위로 자른다. 빈 줄까지 바이트로 모은 뒤 디코딩하므로 청크 경계에서 한글이 깨지지 않는다.
@@ -96,8 +105,12 @@ impl SseBuffer {
 
 #[derive(Default, Debug, PartialEq)]
 struct Acc {
+    /// 캐시에서 읽지 않은 입력 토큰
     input: Option<u64>,
     output: Option<u64>,
+    /// 캐시 읽기·쓰기 토큰(따로 싸게·비싸게 계산한다)
+    cache_read: u64,
+    cache_write: u64,
     stop: Option<String>,
     /// 생각 단계(reasoning_content)로만 온 글자 수: 본문이 비었을 때 원인 진단용
     reasoning: usize,
@@ -107,7 +120,9 @@ struct Acc {
 
 fn parse_openai(v: &Value, acc: &mut Acc) -> Option<String> {
     if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
-        acc.input = u["prompt_tokens"].as_u64().or(acc.input);
+        // prompt_tokens에는 캐시에서 읽은 입력도 들어 있다(prompt_tokens_details.cached_tokens)
+        acc.cache_read = u["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(acc.cache_read);
+        acc.input = u["prompt_tokens"].as_u64().map(|p| p.saturating_sub(acc.cache_read)).or(acc.input);
         acc.output = u["completion_tokens"].as_u64().or(acc.output);
     }
     if acc.first.is_none() {
@@ -127,6 +142,8 @@ fn parse_anthropic(v: &Value, acc: &mut Acc) -> Result<Option<String>, String> {
     match v["type"].as_str() {
         Some("message_start") => {
             acc.input = v["message"]["usage"]["input_tokens"].as_u64();
+            acc.cache_read = v["message"]["usage"]["cache_read_input_tokens"].as_u64().unwrap_or(0);
+            acc.cache_write = v["message"]["usage"]["cache_creation_input_tokens"].as_u64().unwrap_or(0);
             Ok(None)
         }
         Some("content_block_delta") if v["delta"]["type"] == "text_delta" => Ok(v["delta"]["text"].as_str().map(str::to_string)),
@@ -140,7 +157,7 @@ fn parse_anthropic(v: &Value, acc: &mut Acc) -> Result<Option<String>, String> {
     }
 }
 
-fn status_message(code: u16, body: &str) -> String {
+pub(crate) fn status_message(code: u16, body: &str) -> String {
     let what = match code {
         401 | 403 => "키가 맞지 않거나 권한이 없습니다",
         404 => "모델 또는 주소를 찾을 수 없습니다(설정의 모델 이름 확인)",
@@ -154,12 +171,12 @@ fn status_message(code: u16, body: &str) -> String {
 }
 
 /// 다시 시도하면 될 만한 오류(과부하·요청 한도·일시적인 서버 오류)
-fn transient(e: &str) -> bool {
+pub(crate) fn transient(e: &str) -> bool {
     ["과부하", "바쁩니다", "(429)", "(500)", "(502)", "(503)", "(504)"].iter().any(|w| e.contains(w))
 }
 
 /// 스트림 안에 온 오류를 사람이 읽을 말로
-fn stream_error(e: &Value) -> String {
+pub(crate) fn stream_error(e: &Value) -> String {
     let msg = e["message"].as_str().map(str::to_string).unwrap_or_else(|| e.to_string());
     let code = e["code"].as_u64().map(|c| format!(" ({c})")).unwrap_or_default();
     let busy = ["ResourceExhausted", "rate limit", "overloaded", "capacity", "Too Many"].iter().any(|w| msg.to_lowercase().contains(&w.to_lowercase()));
@@ -168,7 +185,7 @@ fn stream_error(e: &Value) -> String {
 }
 
 /// 요청 본문. effort: OpenAI 호환은 `reasoning_effort`(OpenAI·Gemini가 지원, NVIDIA는 보내지 않음), Anthropic은 `output_config.effort`.
-fn body(a: &Api, model: &str, system: &str, prompt: &str, max_tokens: u32, stream: bool, effort: Option<&str>) -> Value {
+pub(crate) fn body(a: &Api, model: &str, system: &str, prompt: &str, max_tokens: u32, stream: bool, effort: Option<&str>) -> Value {
     match a.wire {
         Wire::OpenAiCompat => {
             let mut b = json!({
@@ -190,7 +207,11 @@ fn body(a: &Api, model: &str, system: &str, prompt: &str, max_tokens: u32, strea
             b
         }
         Wire::Anthropic => {
-            let mut b = json!({ "model": model, "max_tokens": max_tokens, "system": system, "messages": [{"role": "user", "content": prompt}], "stream": stream });
+            let mut b = json!({ "model": model, "max_tokens": max_tokens, "messages": [{"role": "user", "content": prompt}], "stream": stream });
+            // 시스템 지시는 캐시한다: 같은 세션의 다음 요청에서 다시 읽는 값이 기본 입력의 약 1/10이다.
+            if !system.is_empty() {
+                b["system"] = json!([{ "type": "text", "text": system, "cache_control": { "type": "ephemeral" } }]);
+            }
             if let Some(e) = effort {
                 b["output_config"] = json!({ "effort": e });
             }
@@ -218,10 +239,22 @@ pub async fn run(http: &reqwest::Client, spec: &RunSpec, model: &str, timeout: D
         o
     };
     let Some(a) = api(spec.engine) else { return done(out, Some("API 엔진이 아닙니다".into())) };
-    if spec.work {
-        return done(out, Some("API로는 파일을 고칠 수 없습니다. 작업 모드는 CLI(Claude Code·Codex·Gemini CLI)가 필요합니다".into()));
-    }
     let Some(key) = secrets::get(a.secret) else { return done(out, Some(format!("{} 키가 없습니다. 설정 → API 키에서 넣으세요", spec.engine.label()))) };
+    // 작업 모드: 모델이 부른 도구(파일·PowerShell)를 이 PC에서 실행하며 끝날 때까지 주고받는다.
+    if spec.work {
+        let mut usage = Usage::default();
+        let r = tokio::select! {
+            r = tokio::time::timeout(timeout, crate::api_agent::run(http, spec, &a, &key, model, &mut out, &mut usage, on_event)) => r.unwrap_or_else(|_| Err(format!("{}초 안에 끝나지 않았습니다", timeout.as_secs()))),
+            _ = cancel.cancelled() => Err("사용자가 중지했습니다".into()),
+        };
+        if let Ok(t) = &r {
+            out.text = t.clone();
+        }
+        out.input_tokens = Some(usage.input);
+        out.output_tokens = Some(usage.output);
+        out.cost_usd = Some(crate::pricing::estimate_cost_cached(spec.engine, Some(model), usage));
+        return done(out, r.err());
+    }
     let mut acc = Acc::default();
     let send = async {
         let mut attempt = 0;
@@ -278,7 +311,10 @@ pub async fn run(http: &reqwest::Client, spec: &RunSpec, model: &str, timeout: D
     };
     out.input_tokens = acc.input;
     out.output_tokens = acc.output;
-    out.cost_usd = a.price.and_then(|(i, o)| Some(acc.input? as f64 * i / 1e6 + acc.output.unwrap_or(0) as f64 * o / 1e6));
+    out.cost_usd = acc.input.map(|input| {
+        let usage = Usage { input, output: acc.output.unwrap_or(0), cache_read: acc.cache_read, cache_write: acc.cache_write };
+        crate::pricing::estimate_cost_cached(spec.engine, Some(model), usage)
+    });
     let err = r.err().or_else(|| {
         out.text.trim().is_empty().then(|| {
             let why = match (acc.stop.as_deref(), acc.reasoning) {
@@ -361,6 +397,22 @@ mod tests {
         let c = body(&api(EngineId::ClaudeApi).unwrap(), "m", "s", "p", 10, true, Some("high"));
         assert_eq!(c["output_config"]["effort"], "high");
         assert!(body(&o, "m", "s", "p", 10, false, None).get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn cache_tokens_are_counted_apart_from_input() {
+        // Anthropic: 캐시 읽기는 input_tokens와 따로 온다
+        let mut acc = Acc::default();
+        parse_anthropic(&json!({"type":"message_start","message":{"usage":{"input_tokens":5,"cache_read_input_tokens":900,"cache_creation_input_tokens":0}}}), &mut acc).unwrap();
+        assert_eq!((acc.input, acc.cache_read), (Some(5), 900));
+        // OpenAI 호환: prompt_tokens에 캐시 적중분이 포함된다 → 뺀 나머지를 입력으로
+        let mut acc = Acc::default();
+        parse_openai(&json!({"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":80}}}), &mut acc);
+        assert_eq!((acc.input, acc.cache_read), (Some(20), 80));
+        // 시스템 지시는 캐시 표시를 붙여 보낸다(비어 있으면 아예 안 보냄)
+        let b = body(&api(EngineId::ClaudeApi).unwrap(), "m", "지시", "p", 10, true, None);
+        assert_eq!(b["system"][0]["cache_control"]["type"], "ephemeral");
+        assert!(body(&api(EngineId::ClaudeApi).unwrap(), "m", "", "p", 10, true, None).get("system").is_none());
     }
 
     #[test]

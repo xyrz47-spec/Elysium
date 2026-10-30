@@ -1,4 +1,4 @@
-//! AI 엔진: CLI(Claude Code·Codex·Gemini CLI)와 API(Claude API·OpenAI·Gemini API·NVIDIA, `apis.rs`).
+//! AI 엔진: CLI(Claude Code·Codex·Antigravity)와 API(Claude API·OpenAI·Gemini API·NVIDIA, `apis.rs`).
 //! CLI를 찾아 실행하고, 출력 스트림을 글자·활동·결과로 바꾼다.
 //!
 //! 안전 원칙
@@ -20,8 +20,8 @@ pub enum EngineId {
     Claude,
     #[serde(rename = "codex")]
     Codex,
-    #[serde(rename = "gemini")]
-    Gemini,
+    #[serde(rename = "antigravity")]
+    Antigravity,
     #[serde(rename = "claude-api")]
     ClaudeApi,
     #[serde(rename = "openai")]
@@ -32,14 +32,14 @@ pub enum EngineId {
     Nvidia,
 }
 
-pub const ALL: [EngineId; 7] = [EngineId::Claude, EngineId::Codex, EngineId::Gemini, EngineId::ClaudeApi, EngineId::OpenAi, EngineId::GeminiApi, EngineId::Nvidia];
+pub const ALL: [EngineId; 7] = [EngineId::Claude, EngineId::Codex, EngineId::Antigravity, EngineId::ClaudeApi, EngineId::OpenAi, EngineId::GeminiApi, EngineId::Nvidia];
 
 impl EngineId {
     pub fn as_str(self) -> &'static str {
         match self {
             EngineId::Claude => "claude",
             EngineId::Codex => "codex",
-            EngineId::Gemini => "gemini",
+            EngineId::Antigravity => "antigravity",
             EngineId::ClaudeApi => "claude-api",
             EngineId::OpenAi => "openai",
             EngineId::GeminiApi => "gemini-api",
@@ -50,7 +50,7 @@ impl EngineId {
         match self {
             EngineId::Claude => "Claude Code",
             EngineId::Codex => "Codex",
-            EngineId::Gemini => "Gemini CLI",
+            EngineId::Antigravity => "Antigravity",
             EngineId::ClaudeApi => "Claude API",
             EngineId::OpenAi => "OpenAI API",
             EngineId::GeminiApi => "Gemini API",
@@ -66,25 +66,36 @@ impl EngineId {
         match self {
             EngineId::Claude | EngineId::ClaudeApi => "anthropic",
             EngineId::Codex | EngineId::OpenAi => "openai",
-            EngineId::Gemini | EngineId::GeminiApi => "google",
+            EngineId::Antigravity | EngineId::GeminiApi => "google",
             EngineId::Nvidia => "nvidia",
         }
     }
+    /// 예전 기록의 "gemini"(Gemini CLI)는 Antigravity로 읽는다.
     pub fn parse(s: &str) -> Option<Self> {
-        ALL.into_iter().find(|e| e.as_str() == s)
+        match s {
+            "gemini" | "agy" => Some(EngineId::Antigravity),
+            _ => ALL.into_iter().find(|e| e.as_str() == s),
+        }
     }
-    /// 이 PC에서 실제 출력으로 확인한 어댑터인지(2026-10-17 기준 Claude Code만).
+    /// 이 PC에서 실제 출력으로 확인한 어댑터인지(Claude Code 2026-10-17, Antigravity agy 1.4.10 2026-10-30).
     pub fn verified(self) -> bool {
-        self == EngineId::Claude
+        matches!(self, EngineId::Claude | EngineId::Antigravity)
+    }
+    /// 자기 대화 세션을 이어 쓰는 CLI(Claude Code `--resume`, Antigravity `--conversation`).
+    pub fn resumable(self) -> bool {
+        matches!(self, EngineId::Claude | EngineId::Antigravity)
     }
     fn exe_name(self) -> &'static str {
-        self.as_str()
+        match self {
+            EngineId::Antigravity => "agy",
+            e => e.as_str(),
+        }
     }
     fn install_hint(self) -> &'static str {
         match self {
             EngineId::Claude => "https://claude.com/claude-code 에서 설치 후 터미널에서 claude 로 로그인",
             EngineId::Codex => "npm i -g @openai/codex 설치 후 codex 로 로그인",
-            EngineId::Gemini => "npm i -g @google/gemini-cli 설치 후 gemini 로 로그인",
+            EngineId::Antigravity => "Antigravity 설치 후 터미널에서 agy 로 로그인",
             e => crate::apis::api(e).map(|a| a.key_hint).unwrap_or(""),
         }
     }
@@ -107,7 +118,7 @@ pub struct EngineInfo {
 
 const NO_WINDOW: u32 = 0x0800_0000;
 
-fn command(program: &Path) -> tokio::process::Command {
+pub(crate) fn command(program: &Path) -> tokio::process::Command {
     // npm으로 설치한 CLI는 .cmd 래퍼라 cmd를 거쳐야 한다. 인자는 고정된 플래그뿐이고 요청 본문은 표준 입력으로 보낸다.
     let is_cmd = program.extension().is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
     let mut c = if is_cmd {
@@ -187,6 +198,9 @@ pub async fn detect(models: &std::collections::BTreeMap<String, String>) -> Vec<
 // ---------------------------------------------------------------------------
 // 실행
 
+/// 작업 중에 사용자가 보낸 메시지를 모아 두는 칸. None이면 지금 AI는 메시지를 받지 않는다(API 작업 모드만 받는다).
+pub type Steer = std::sync::Arc<std::sync::Mutex<Option<Vec<String>>>>;
+
 #[derive(Debug, Clone)]
 pub struct RunSpec {
     pub engine: EngineId,
@@ -204,8 +218,10 @@ pub struct RunSpec {
     pub effort: Option<String>,
     /// API 엔진의 최대 출력 토큰. None이면 8192.
     pub max_tokens: Option<u32>,
-    /// 작업 폴더 밖에서 읽기를 허용할 폴더(스킬의 참고 파일 등). Claude Code `--add-dir`, Gemini CLI `--include-directories`.
+    /// 작업 폴더 밖에서 읽기를 허용할 폴더(스킬의 참고 파일 등). Claude Code·Antigravity `--add-dir`.
     pub extra_dirs: Vec<String>,
+    /// 작업 중 메시지 칸(API 작업 모드만 읽는다)
+    pub steer: Option<Steer>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -244,7 +260,8 @@ pub struct Outcome {
 }
 
 const CHAT_TOOLS: &str = "Read,Grep,Glob,WebFetch,WebSearch";
-const WORK_TOOLS: &str = "Read,Grep,Glob,Edit,Write,WebFetch,WebSearch";
+/// 작업 모드는 PowerShell 명령까지 허용한다(Bash는 쓰지 않는다). Windows에서는 샌드박스가 없어 사용자 권한으로 돈다.
+const WORK_TOOLS: &str = "Read,Grep,Glob,Edit,Write,PowerShell,WebFetch,WebSearch";
 
 /// CLI 인자. 요청 본문은 들어가지 않는다(표준 입력으로 보냄).
 pub fn args(spec: &RunSpec) -> Vec<String> {
@@ -292,6 +309,10 @@ pub fn args(spec: &RunSpec) -> Vec<String> {
         }
         EngineId::Codex => {
             let mut a = vec![s("exec"), s("--json"), s("--skip-git-repo-check"), s("-s"), s(if spec.work { "workspace-write" } else { "read-only" })];
+            if let Some(m) = &spec.model {
+                a.push(s("-m"));
+                a.push(m.clone());
+            }
             if let Some(e) = &spec.effort {
                 a.push(s("-c"));
                 a.push(format!("model_reasoning_effort=\"{e}\""));
@@ -299,15 +320,30 @@ pub fn args(spec: &RunSpec) -> Vec<String> {
             a.push(s("-"));
             a
         }
-        EngineId::Gemini => {
-            let mut a = vec![s("--output-format"), s("stream-json")];
-            if !spec.extra_dirs.is_empty() {
-                a.push(s("--include-directories"));
-                a.push(spec.extra_dirs.join(","));
-            }
+        EngineId::Antigravity => {
+            // 요청은 표준 입력의 stream-json 한 줄로 보낸다(-p는 인자로만 받음). 2026-10-30 agy 1.4.10으로 확인.
+            // 머리 없는 실행에서 기본 모드는 작업 폴더 쓰기를 허용하므로, 대화 모드는 쓰기를 규칙으로 막는다. 명령 실행은 언제나 막는다.
+            let deny = if spec.work { r#"{"permissions":{"deny":["command(*)"]}}"# } else { r#"{"permissions":{"deny":["write_file(*)","command(*)"]}}"# };
+            let mut a = vec![s("--input-format"), s("stream-json"), s("--output-format"), s("stream-json"), s("--disable-slash-commands"), s("--settings"), s(deny)];
             if spec.work {
-                a.push(s("--approval-mode"));
-                a.push(s("auto_edit"));
+                a.push(s("--mode"));
+                a.push(s("accept-edits"));
+            }
+            if let Some(m) = &spec.model {
+                a.push(s("--model"));
+                a.push(m.clone());
+            }
+            if let Some(e) = &spec.effort {
+                a.push(s("--effort"));
+                a.push(e.clone());
+            }
+            if let Some(r) = &spec.resume {
+                a.push(s("--conversation"));
+                a.push(r.clone());
+            }
+            for d in &spec.extra_dirs {
+                a.push(s("--add-dir"));
+                a.push(d.clone());
             }
             a
         }
@@ -318,10 +354,15 @@ pub fn args(spec: &RunSpec) -> Vec<String> {
 
 /// 표준 입력으로 보낼 본문. Claude는 지시문을 따로 받으므로 요청만, 나머지는 지시문을 앞에 붙인다.
 pub fn stdin_text(spec: &RunSpec) -> String {
-    match spec.engine {
-        EngineId::Claude => spec.prompt.clone(),
+    let body = match spec.engine {
+        EngineId::Claude => return spec.prompt.clone(),
         _ if spec.system.is_empty() => spec.prompt.clone(),
         _ => format!("{}\n\n---\n\n{}", spec.system, spec.prompt),
+    };
+    match spec.engine {
+        // agy --input-format stream-json: 한 줄에 메시지 하나
+        EngineId::Antigravity => format!("{}\n", serde_json::json!({ "event": "user", "message": { "content": body } })),
+        _ => body,
     }
 }
 
@@ -332,7 +373,9 @@ fn short(v: &Value) -> String {
 }
 
 fn tool_activity(name: &str, input: &Value) -> String {
-    let target = ["file_path", "path", "pattern", "url", "query", "command"].iter().find_map(|k| input.get(*k)).map(short);
+    // Antigravity는 매개변수 이름이 대문자로 시작한다(Path, CommandLine …).
+    const KEYS: &[&str] = &["file_path", "path", "pattern", "url", "query", "command", "AbsolutePath", "Path", "DirectoryPath", "SearchPath", "Pattern", "Url", "Query", "CommandLine"];
+    let target = KEYS.iter().find_map(|k| input.get(*k)).map(short);
     match target {
         Some(t) => format!("{name} · {t}"),
         None => name.to_string(),
@@ -396,7 +439,7 @@ impl ClaudeParser {
     }
 }
 
-/// Codex `exec --json`·Gemini CLI `stream-json` 해석기(공개 형식 기준, 이 PC에서는 미검증).
+/// Codex `exec --json`(과 예전 Gemini CLI `stream-json`) 해석기(공개 형식 기준, 이 PC에서는 미검증).
 /// JSON이 아닌 줄은 그대로 본문으로 쓴다.
 #[derive(Default)]
 pub struct GenericParser {
@@ -477,8 +520,66 @@ impl GenericParser {
     }
 }
 
+/// Antigravity `agy --output-format stream-json` 해석기(2026-10-30 agy 1.4.10 실제 출력으로 확인).
+/// `{"event":"init"}` → `{"event":"step_update"}`(글 조각·도구) … → `{"event":"result"}`.
+#[derive(Default)]
+pub struct AgyParser {
+    /// 마지막으로 글을 낸 단계 번호(단계가 바뀌면 빈 줄로 나눈다)
+    text_step: Option<u64>,
+}
+
+impl AgyParser {
+    pub fn feed(&mut self, line: &str) -> Vec<Event> {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { return vec![] };
+        let mut out = vec![];
+        match v["event"].as_str() {
+            Some("init") => {
+                if let Some(id) = v["conversation_id"].as_str() {
+                    out.push(Event::Session(id.to_string()));
+                }
+            }
+            Some("step_update") => {
+                let s = &v["step_update"];
+                match s["step_type"].as_str() {
+                    Some("agent_response") => {
+                        if let Some(t) = s["text_delta"].as_str().filter(|t| !t.is_empty()) {
+                            let idx = s["step_index"].as_u64();
+                            if self.text_step.is_some() && self.text_step != idx {
+                                out.push(Event::Text("\n\n".into()));
+                            }
+                            self.text_step = idx;
+                            out.push(Event::Text(t.to_string()));
+                        }
+                    }
+                    Some("tool") if s["state"] == "ACTIVE" => {
+                        let name = s["tool_name"].as_str().unwrap_or("도구");
+                        out.push(Event::Activity(tool_activity(name, &s["tool_info"]["parameters"])));
+                    }
+                    _ => {}
+                }
+            }
+            Some("result") => {
+                let r = &v["result"];
+                let ok = r["status"] == "SUCCESS";
+                let u = &r["usage"];
+                out.push(Event::Done(Finish {
+                    result: r["response"].as_str().map(str::to_string),
+                    ok,
+                    error: if ok { None } else { Some(r["error"].as_str().or(r["status"].as_str()).unwrap_or("실패").to_string()) },
+                    cost_usd: None,
+                    input_tokens: u["input_tokens"].as_u64(),
+                    output_tokens: u["output_tokens"].as_u64(),
+                }));
+            }
+            _ => {}
+        }
+        out
+    }
+}
+
 enum Parser {
     Claude(ClaudeParser),
+    Agy(AgyParser),
     Generic(GenericParser),
 }
 
@@ -486,6 +587,7 @@ impl Parser {
     fn feed(&mut self, line: &str) -> Vec<Event> {
         match self {
             Parser::Claude(p) => p.feed(line),
+            Parser::Agy(p) => p.feed(line),
             Parser::Generic(p) => p.feed(line),
         }
     }
@@ -513,6 +615,10 @@ pub async fn run(http: &reqwest::Client, spec: &RunSpec, timeout: Duration, canc
     }
     let mut cmd = command(&program);
     cmd.args(args(spec)).current_dir(&spec.cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if spec.engine == EngineId::Claude && spec.work {
+        // Claude Code의 PowerShell 도구는 이 환경 변수로 켠다(Windows는 단계적 배포라 꺼져 있을 수 있음).
+        cmd.env("CLAUDE_CODE_USE_POWERSHELL_TOOL", "1");
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return fail(out, format!("{} 실행 실패: {e}", spec.engine.label())),
@@ -538,6 +644,7 @@ pub async fn run(http: &reqwest::Client, spec: &RunSpec, timeout: Duration, canc
     let mut lines = BufReader::new(child.stdout.take().expect("stdout")).lines();
     let mut parser = match spec.engine {
         EngineId::Claude => Parser::Claude(ClaudeParser::default()),
+        EngineId::Antigravity => Parser::Agy(AgyParser::default()),
         _ => Parser::Generic(GenericParser::default()),
     };
     let mut finish: Option<Finish> = None;
@@ -575,12 +682,12 @@ pub async fn run(http: &reqwest::Client, spec: &RunSpec, timeout: Duration, canc
     }
     let f = finish.unwrap_or_else(|| match &parser {
         Parser::Generic(p) => p.finish(),
-        Parser::Claude(_) => Finish { ok: false, error: Some("결과 없이 끝났습니다".into()), ..Default::default() },
+        Parser::Claude(_) | Parser::Agy(_) => Finish { ok: false, error: Some("결과 없이 끝났습니다".into()), ..Default::default() },
     });
     if let Some(r) = f.result.as_ref().filter(|r| !r.trim().is_empty()) {
         out.text = r.clone();
     }
-    out.cost_usd = f.cost_usd;
+    out.cost_usd = f.cost_usd.or_else(|| crate::pricing::estimate_cost(spec.engine, spec.model.as_deref(), f.input_tokens, f.output_tokens));
     out.input_tokens = f.input_tokens;
     out.output_tokens = f.output_tokens;
     let exit_ok = status.is_some_and(|s| s.success());
@@ -615,6 +722,7 @@ mod tests {
             effort: None,
             max_tokens: None,
             extra_dirs: vec!["C:\\s".into()],
+            steer: None,
         }
     }
 
@@ -638,6 +746,7 @@ mod tests {
         assert!(chat.windows(2).any(|w| w[0] == "--permission-mode" && w[1] == "default"));
         let work = args(&spec(EngineId::Claude, true));
         assert!(work.iter().any(|x| x.contains("Edit")) && !work.iter().any(|x| x.contains("Bash")));
+        assert!(work.iter().any(|x| x.contains("PowerShell")) && !chat.iter().any(|x| x.contains("PowerShell")), "명령은 작업 모드에서 PowerShell로만");
         assert!(work.windows(2).any(|w| w[0] == "--permission-mode" && w[1] == "acceptEdits"));
         assert!(work.windows(2).any(|w| w[0] == "--resume" && w[1] == "abc"));
         assert!(work.windows(2).any(|w| w[0] == "--plugin-dir" && w[1] == "C:\\p"));
@@ -726,5 +835,52 @@ mod tests {
         .collect();
         assert_eq!(evs[1], Event::Text("안녕".into()));
         assert!(matches!(&evs[2], Event::Done(f) if f.ok && f.output_tokens == Some(2)));
+    }
+
+    // 2026-10-30 agy 1.4.10 실제 출력에서 줄인 표본
+    const AGY_SAMPLE: &[&str] = &[
+        r#"{"event":"init","conversation_id":"c-1","init":{"model":"gemini-3.8-flash-low","permission_mode":"request-review"}}"#,
+        r#"{"event":"step_update","step_update":{"conversation_id":"c-1","step_index":0,"state":"DONE","step_type":"user_input"}}"#,
+        r#"{"event":"step_update","step_update":{"conversation_id":"c-1","step_index":1,"state":"DONE","step_type":"agent_response","usage":{"input_tokens":13598,"output_tokens":87}}}"#,
+        r#"{"event":"step_update","step_update":{"conversation_id":"c-1","step_index":2,"state":"ACTIVE","step_type":"tool","tool_name":"read_file","tool_info":{"name":"read_file","parameters":{"Path":"C:/w/note.txt"}}}}"#,
+        r#"{"event":"step_update","step_update":{"conversation_id":"c-1","step_index":2,"state":"DONE","step_type":"tool","tool_name":"read_file","tool_info":{"name":"read_file","parameters":{"Path":"C:/w/note.txt"}}}}"#,
+        r#"{"event":"step_update","step_update":{"conversation_id":"c-1","step_index":3,"state":"ACTIVE","step_type":"agent_response","text_delta":"zebra-"}}"#,
+        r#"{"event":"step_update","step_update":{"conversation_id":"c-1","step_index":3,"state":"ACTIVE","step_type":"agent_response","text_delta":"42"}}"#,
+        r#"{"event":"step_update","step_update":{"conversation_id":"c-1","step_index":5,"state":"ACTIVE","step_type":"agent_response","text_delta":"끝"}}"#,
+        r#"{"event":"result","result":{"conversation_id":"c-1","status":"SUCCESS","response":"zebra-42\n","num_turns":1,"usage":{"input_tokens":27375,"output_tokens":91}}}"#,
+    ];
+
+    #[test]
+    fn parses_antigravity_stream_and_keeps_chat_read_only() {
+        let mut p = AgyParser::default();
+        let evs: Vec<Event> = AGY_SAMPLE.iter().flat_map(|l| p.feed(l)).collect();
+        assert_eq!(evs[0], Event::Session("c-1".into()));
+        assert_eq!(evs[1], Event::Activity("read_file · C:/w/note.txt".into()), "도구는 시작할 때 한 번");
+        let text: String = evs.iter().filter_map(|e| if let Event::Text(t) = e { Some(t.as_str()) } else { None }).collect();
+        assert_eq!(text, "zebra-42\n\n끝", "단계가 바뀌면 빈 줄");
+        let Some(Event::Done(f)) = evs.last() else { panic!() };
+        assert!(f.ok && f.result.as_deref() == Some("zebra-42\n") && f.input_tokens == Some(27375) && f.output_tokens == Some(91));
+        let e = AgyParser::default().feed(r#"{"event":"result","result":{"status":"ERROR","response":"","error":"Individual quota reached."}}"#);
+        assert!(matches!(&e[0], Event::Done(f) if !f.ok && f.error.as_deref() == Some("Individual quota reached.")));
+        // 인자: 대화 모드는 쓰기·명령 차단, 작업 모드는 명령만 차단하고 편집 허용
+        let chat = args(&spec(EngineId::Antigravity, false));
+        let i = chat.iter().position(|x| x == "--settings").unwrap();
+        assert!(chat[i + 1].contains("write_file(*)") && chat[i + 1].contains("command(*)"));
+        assert!(!chat.iter().any(|x| x == "--mode" || x == "--dangerously-skip-permissions"));
+        assert!(chat.windows(2).any(|w| w[0] == "--conversation" && w[1] == "abc"));
+        assert!(chat.windows(2).any(|w| w[0] == "--add-dir" && w[1] == "C:\\s"));
+        let work = args(&spec(EngineId::Antigravity, true));
+        let i = work.iter().position(|x| x == "--settings").unwrap();
+        assert!(!work[i + 1].contains("write_file") && work[i + 1].contains("command(*)"));
+        assert!(work.windows(2).any(|w| w[0] == "--mode" && w[1] == "accept-edits"));
+        // 표준 입력은 stream-json 한 줄(지시문 + 요청)
+        let line = stdin_text(&spec(EngineId::Antigravity, false));
+        let v: Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(v["event"], "user");
+        assert!(v["message"]["content"].as_str().unwrap().starts_with("지시") && line.ends_with('\n') && line.lines().count() == 1);
+        assert_eq!(EngineId::parse("gemini"), Some(EngineId::Antigravity), "예전 기록");
+        let mut cx = spec(EngineId::Codex, false);
+        cx.model = Some("gpt-5".into());
+        assert!(args(&cx).windows(2).any(|w| w[0] == "-m" && w[1] == "gpt-5"));
     }
 }
