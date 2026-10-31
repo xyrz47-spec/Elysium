@@ -178,7 +178,55 @@ pub(crate) fn stream_error(e: &Value) -> String {
     secrets::redact(&if busy { format!("공급자 서버가 바쁩니다(과부하){code} {short}") } else { format!("공급자 오류{code} {short}") })
 }
 
+/// 세션 메모리(memory::context)와 지금 요청을 가르는 표시. 이 앞은 같은 세션의 다음 요청에서도 그대로 다시 온다.
+const REQUEST_MARK: &str = "\n\n[지금 요청]\n";
+
+/// 프롬프트를 캐시하기 좋은 조각으로 자른다: 메모리는 대화 차례마다 한 조각, 마지막은 지금 요청.
+/// 조각을 이으면 원문과 글자 하나 다르지 않다. 메모리가 없으면 None.
+pub(crate) fn split_prompt(prompt: &str) -> Option<(Vec<&str>, &str)> {
+    let cut = prompt.rfind(REQUEST_MARK)? + 2; // "\n\n"은 메모리 쪽 끝에 남긴다
+    let (memory, request) = prompt.split_at(cut);
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut from = 0;
+    // 차례가 바뀌는 자리("\n\n사용자: ", "\n\nAI(", "\n\n[머리]")에서만 자른다: 한 차례가 끝나면 조각 2개(질문·답)만 늘어 20칸 되돌아보기 안에 든다.
+    while let Some(i) = memory[from..].find("\n\n") {
+        let at = from + i + 2;
+        let rest = &memory[at..];
+        if at < memory.len() && (rest.starts_with("사용자: ") || rest.starts_with("AI(") || rest.starts_with('[')) {
+            parts.push(&memory[start..at]);
+            start = at;
+        }
+        from = at;
+    }
+    parts.push(&memory[start..]);
+    Some((parts, request))
+}
+
+/// 사용자 메시지 내용. Anthropic은 메모리 조각을 블록으로 나누고 마지막 메모리 블록에 캐시 표시를 단다:
+/// 같은 세션의 다음 차례·같은 작업의 검토·토론·판정 요청이 앞부분을 캐시에서 읽는다(기본 입력값의 0.05~0.1배).
+pub(crate) fn user_content(wire: Wire, prompt: &str) -> Value {
+    match (wire, split_prompt(prompt)) {
+        (Wire::Anthropic, Some((parts, request))) => {
+            let mut blocks: Vec<Value> = parts.iter().map(|t| json!({ "type": "text", "text": t })).collect();
+            if let Some(last) = blocks.last_mut() {
+                last["cache_control"] = json!({ "type": "ephemeral" });
+            }
+            blocks.push(json!({ "type": "text", "text": request }));
+            Value::Array(blocks)
+        }
+        _ => json!(prompt),
+    }
+}
+
+/// 문자열의 안정적인 해시(FNV-1a). 실행·빌드가 바뀌어도 같은 글자면 같은 값.
+fn fnv(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3))
+}
+
 /// 요청 본문. effort: OpenAI 호환은 `reasoning_effort`(OpenAI·Gemini가 지원, NVIDIA는 보내지 않음), Anthropic은 `output_config.effort`.
+/// 캐시: Anthropic은 시스템·메모리에 표시, OpenAI는 자동 접두 캐시 + `prompt_cache_key`(같은 접두는 같은 서버로),
+/// Gemini는 2.5부터 자동(공통 내용이 앞에 오도록 메모리를 요청 앞에 둔다), NVIDIA는 조절할 수 있는 캐시가 없다.
 pub(crate) fn body(a: &Api, model: &str, system: &str, prompt: &str, max_tokens: u32, stream: bool, effort: Option<&str>) -> Value {
     match a.wire {
         Wire::OpenAiCompat => {
@@ -194,6 +242,10 @@ pub(crate) fn body(a: &Api, model: &str, system: &str, prompt: &str, max_tokens:
             if let (Some(e), true) = (effort, a.reasoning) {
                 b["reasoning_effort"] = json!(e);
             }
+            // OpenAI 전용 필드(Gemini·NVIDIA 호환 주소에는 보내지 않는다): 같은 시스템 지시로 시작하는 요청을 같은 캐시로 보낸다.
+            if a.secret == SecretName::OpenAi {
+                b["prompt_cache_key"] = json!(format!("elysium-{:016x}", fnv(&format!("{model}\u{0}{system}"))));
+            }
             // NVIDIA Nemotron 추론 모델은 생각 단계를 켜고 끌 수 있다. 가벼운 요청은 꺼서 토큰을 아낀다.
             if let (Some(e), true) = (effort, a.secret == SecretName::Nvidia && model.contains("nemotron")) {
                 b["chat_template_kwargs"] = json!({ "enable_thinking": e != "low" });
@@ -201,7 +253,7 @@ pub(crate) fn body(a: &Api, model: &str, system: &str, prompt: &str, max_tokens:
             b
         }
         Wire::Anthropic => {
-            let mut b = json!({ "model": model, "max_tokens": max_tokens, "messages": [{"role": "user", "content": prompt}], "stream": stream });
+            let mut b = json!({ "model": model, "max_tokens": max_tokens, "messages": [{"role": "user", "content": user_content(Wire::Anthropic, prompt)}], "stream": stream });
             // 시스템 지시는 캐시한다: 같은 세션의 다음 요청에서 다시 읽는 값이 기본 입력의 약 1/10이다.
             if !system.is_empty() {
                 b["system"] = json!([{ "type": "text", "text": system, "cache_control": { "type": "ephemeral" } }]);
@@ -407,6 +459,38 @@ mod tests {
         let b = body(&api(EngineId::ClaudeApi).unwrap(), "m", "지시", "p", 10, true, None);
         assert_eq!(b["system"][0]["cache_control"]["type"], "ephemeral");
         assert!(body(&api(EngineId::ClaudeApi).unwrap(), "m", "", "p", 10, true, None).get("system").is_none());
+    }
+
+    #[test]
+    fn memory_is_split_per_turn_and_cached_before_the_request() {
+        let prompt = "[세션 메모리: 머리]\n\n[세션 요약]\n- 결정 A\n\n[최근 대화]\n사용자: 질문 1\n\n둘째 문단\n\nAI(Claude): 답 1\n\n[지금 요청]\n새 질문";
+        let (parts, request) = split_prompt(prompt).unwrap();
+        assert_eq!(format!("{}{request}", parts.concat()), prompt, "조각을 이으면 원문 그대로");
+        assert_eq!(request, "[지금 요청]\n새 질문");
+        assert_eq!(parts.len(), 4, "{parts:?}");
+        assert!(parts[2].ends_with("둘째 문단\n\n"), "한 차례 안의 문단은 자르지 않는다: {parts:?}");
+        // 다음 차례: 앞 조각들이 바이트까지 같아야 캐시에 맞는다
+        let next = prompt.replace("\n\n[지금 요청]\n새 질문", "\n\n사용자: 새 질문\n\nAI(Claude): 답 2\n\n[지금 요청]\n또 질문");
+        let (next_parts, _) = split_prompt(&next).unwrap();
+        assert_eq!(&next_parts[..parts.len()], &parts[..]);
+
+        let c = user_content(Wire::Anthropic, prompt);
+        let blocks = c.as_array().unwrap();
+        assert_eq!(blocks.len(), 5);
+        assert_eq!(blocks[3]["cache_control"]["type"], "ephemeral", "마지막 메모리 블록에 표시");
+        assert!(blocks[4].get("cache_control").is_none(), "바뀌는 요청에는 표시하지 않는다");
+        assert_eq!(user_content(Wire::Anthropic, "메모리 없는 요청"), json!("메모리 없는 요청"));
+        assert_eq!(user_content(Wire::OpenAiCompat, prompt), json!(prompt), "OpenAI 호환은 자동 접두 캐시라 글 그대로");
+    }
+
+    #[test]
+    fn prompt_cache_key_only_for_openai_and_stable() {
+        let b = |e| body(&api(e).unwrap(), "m", "지시", "p", 10, true, None);
+        let k = b(EngineId::OpenAi)["prompt_cache_key"].clone();
+        assert!(k.as_str().unwrap().starts_with("elysium-"));
+        assert_eq!(k, b(EngineId::OpenAi)["prompt_cache_key"]);
+        assert!(b(EngineId::GeminiApi).get("prompt_cache_key").is_none());
+        assert!(b(EngineId::Nvidia).get("prompt_cache_key").is_none());
     }
 
     #[test]

@@ -338,6 +338,7 @@ export default function UsageDialog() {
   return (
     <div className="modal-back" onMouseDown={(e) => e.target === e.currentTarget && setDialog(null)}>
       <div className="modal wide usage" role="dialog" aria-label="사용량 및 토큰 비용">
+        <div className="modal-scroll">
         <div className="modal-head">
           <div className="row" style={{ gap: 14 }}>
             <h2>사용량 & 비용</h2>
@@ -443,6 +444,7 @@ export default function UsageDialog() {
         ) : (
           <PricingView pricingList={prices} />
         )}
+        </div>
       </div>
     </div>
   );

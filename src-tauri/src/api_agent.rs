@@ -354,7 +354,7 @@ fn push_steer(wire: Wire, msgs: &mut Vec<Value>, extra: &[String]) {
 }
 
 /// Anthropic: 요청마다 대화 끝에 캐시 표시를 하나 붙인다. 앞부분(시스템·도구·이전 차례)은 다음 차례에서 싸게 읽힌다.
-/// 표시는 요청마다 새로 붙이므로 쌓이지 않는다(시스템·도구 표시와 합쳐 최대 3개).
+/// 표시는 요청마다 새로 붙이므로 쌓이지 않는다(도구·시스템·첫 메시지의 메모리 표시와 합쳐 최대 4개 = API 한도).
 fn cache_last(wire: Wire, msgs: &[Value]) -> Vec<Value> {
     let mut out = msgs.to_vec();
     if wire == Wire::Anthropic {
@@ -412,7 +412,8 @@ pub async fn run(http: &reqwest::Client, spec: &RunSpec, a: &Api, key: &str, mod
     let mut base = apis::body(a, model, &system, &spec.prompt, max_tokens, false, spec.effort.as_deref());
     base["tools"] = tools_for(a.wire);
     let mut msgs: Vec<Value> = match a.wire {
-        Wire::Anthropic => vec![json!({"role": "user", "content": spec.prompt})],
+        // 첫 메시지는 대화 모드와 같은 조각으로: 같은 세션의 대화·작업 요청이 메모리 캐시를 함께 쓴다.
+        Wire::Anthropic => vec![json!({"role": "user", "content": apis::user_content(Wire::Anthropic, &spec.prompt)})],
         Wire::OpenAiCompat => vec![json!({"role": "system", "content": system}), json!({"role": "user", "content": spec.prompt})],
     };
     for _ in 0..MAX_TURNS {

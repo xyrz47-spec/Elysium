@@ -111,6 +111,7 @@ export default function SkillsDialog() {
   return (
     <div className="modal-back" onMouseDown={(e) => e.target === e.currentTarget && setDialog(null)}>
       <div className="modal wide" role="dialog" aria-label="스킬과 플러그인">
+        <div className="modal-scroll">
         <div className="modal-head">
           <Segmented
             as="tab"
@@ -179,6 +180,7 @@ export default function SkillsDialog() {
             </div>
           </>
         )}
+        </div>
       </div>
     </div>
   );

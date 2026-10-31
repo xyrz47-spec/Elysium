@@ -6,16 +6,16 @@
 // 3) 반사광: 포인터 위치(--mx, --my)를 따라 움직이고, 누르면 판 안에서 빛난다(CSS).
 import { useEffect } from "react";
 
-/** 굴절을 거는 판: 늘 떠 있는 크롬만(애플 규칙: 유리는 내비게이션·컨트롤 층에만, 내용 층에는 쓰지 않는다). */
-const LIQUID = ".dock, .composer, .head-folder, .welcome-cards button";
+/** 굴절을 거는 판: 떠 있는 크롬(도크·입력창·칩·첫 화면 카드·양쪽 사이드바)과 떠서 뜨는 창(설정·사용량·스킬 창, 메뉴, 기억 창). */
+const LIQUID = ".dock, .composer, .head-folder, .welcome-cards button, .panel-inner, .tools-inner, .modal, .menu, .slash-menu, .mem-pop";
 /** 포인터 반사광이 따라오는 판 */
 const LIGHT = LIQUID;
 const IOR = 1.5;
 const LUT = 128;
 
-/** 볼록 스퀴클 렌즈 단면: 가장자리(0)에서 안쪽(1)으로 갈 때 밀림의 세기(0~1). 스넬 법칙으로 미리 계산해 둔다. */
+/** 볼록 렌즈 단면(원호): 가장자리(0)에서 안쪽(1)으로 갈 때 밀림의 세기(0~1). 스퀴클보다 휘는 띠가 넓어 눈에 보인다. 스넬 법칙으로 미리 계산해 둔다. */
 const PROFILE = (() => {
-  const f = (x: number) => Math.pow(1 - Math.pow(1 - Math.min(Math.max(x, 0), 1), 4), 0.25);
+  const f = (x: number) => Math.sqrt(1 - Math.pow(1 - Math.min(Math.max(x, 0), 1), 2));
   const out = new Float32Array(LUT);
   const dx = 1e-3;
   let max = 0;
@@ -179,7 +179,7 @@ let seq = 0;
 function buildFilter(w: number, h: number, r: number) {
   const short = Math.min(w, h);
   // 렌즈 폭: 판이 작을수록 판 전체가 물방울처럼 휜다(애플 툴바 버튼). 큰 판은 가장자리만.
-  const bezel = Math.max(6, Math.min(Math.round(short * 0.36), 24, Math.floor(short / 2)));
+  const bezel = Math.max(6, Math.min(Math.round(short * 0.36), 26, Math.floor(short / 2)));
   const rr = Math.min(r, Math.floor(short / 2));
   const t = tiles(rr, bezel);
   const m = t.m;
@@ -207,7 +207,7 @@ function buildFilter(w: number, h: number, r: number) {
   for (const p of parts) merge.appendChild(node("feMergeNode", { in: p }));
   f.appendChild(merge);
   // 밀림의 최대(px): 렌즈 폭에 비례
-  f.appendChild(node("feDisplacementMap", { in: "SourceGraphic", in2: "map", scale: Math.round(bezel * 1.7), xChannelSelector: "R", yChannelSelector: "G" }));
+  f.appendChild(node("feDisplacementMap", { in: "SourceGraphic", in2: "map", scale: Math.round(bezel * 1.8), xChannelSelector: "R", yChannelSelector: "G" }));
   return f;
 }
 

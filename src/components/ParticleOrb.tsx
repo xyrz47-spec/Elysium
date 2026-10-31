@@ -28,12 +28,14 @@ const LOOK: Record<OrbMode, Look> = {
 const SPHERE = 5200;
 const HALO = 2600;
 const FIELD = 4200;
+// 떠오르는 빛 입자: 작고 또렷한 것 + 크고 흐린 것(초점이 나간 빛). 구와 상관없이 늘 보인다.
+const MOTES = 90;
 
 const VS = `#version 300 es
 in vec3 aPos;
 in float aSeed;
 in float aKind;
-uniform float uTime, uRot, uSwirl, uEnergy, uSpread, uAssemble, uGlitch, uPx, uRadius, uDim;
+uniform float uTime, uRot, uSwirl, uEnergy, uSpread, uAssemble, uGlitch, uPx, uRadius, uDim, uField, uDpr, uMote, uReduce;
 uniform vec2 uCenter, uRes;
 uniform vec3 uA, uB;
 out vec3 vColor;
@@ -43,6 +45,20 @@ mat3 rotY(float a) { float c = cos(a), s = sin(a); return mat3(c, 0., -s, 0., 1.
 mat3 rotX(float a) { float c = cos(a), s = sin(a); return mat3(1., 0., 0., 0., c, s, 0., -s, c); }
 
 void main() {
+  if (aKind > 2.5) {
+    // 빛 입자: aPos = (x, y, 속도). 화면 좌표에서 위로 천천히 떠오르고 좌우로 살랑인다.
+    float big = step(0.8, aSeed);
+    float speed = aPos.z * mix(1.0, 0.55, big) * (1.0 - uReduce * 0.85);
+    float y = fract(aPos.y + uTime * speed);
+    float x = aPos.x + 0.014 * sin(uTime * (0.15 + aSeed * 0.25) + aSeed * 40.0);
+    gl_Position = vec4(x * 2.0 - 1.0, y * 2.0 - 1.0, 0.0, 1.0);
+    gl_PointSize = uDpr * mix(1.6 + aSeed * 2.4, 12.0 + fract(aSeed * 7.1) * 16.0, big);
+    float edge = smoothstep(0.0, 0.12, y) * (1.0 - smoothstep(0.82, 1.0, y));
+    float tw = 0.5 + 0.5 * sin(uTime * (0.5 + aSeed * 1.2) + aSeed * 60.0);
+    vColor = mix(uB, uA, fract(aSeed * 13.7));
+    vAlpha = uMote * edge * mix(0.7, 0.22, big) * (0.35 + 0.65 * tw) * clamp(uAssemble * 1.5, 0.0, 1.0);
+    return;
+  }
   vec3 p = aPos;
   float n = 0.0;
   float r0 = length(aPos);
@@ -81,8 +97,8 @@ void main() {
   vColor = aKind < 0.5 ? mix(uB, uA, clamp(aPos.y * 0.5 + 0.5 + n * 0.25, 0.0, 1.0)) : mix(uB, uA, aSeed);
   float a;
   if (aKind < 0.5) a = uDim;
-  else if (aKind < 1.5) a = 0.45 * (1.0 - smoothstep(1.05, 1.72, r0)) * mix(1.0, uDim, 0.5);
-  else a = (0.16 + 0.22 * (1.0 - smoothstep(1.6, 7.5, r0))) * (0.55 + 0.45 * sin(uTime * 0.7 + aSeed * 40.0));
+  else if (aKind < 1.5) a = 0.45 * (1.0 - smoothstep(1.05, 1.72, r0)) * mix(1.0, uDim, 0.5) * uField;
+  else a = uField * (0.16 + 0.22 * (1.0 - smoothstep(1.6, 7.5, r0))) * (0.55 + 0.45 * sin(uTime * 0.7 + aSeed * 40.0));
   vAlpha = (0.3 + 0.7 * front) * e * a;
 }`;
 
@@ -107,7 +123,7 @@ function compile(gl: WebGL2RenderingContext, type: number, src: string) {
 }
 
 function buildGeometry() {
-  const n = SPHERE + HALO + FIELD;
+  const n = SPHERE + HALO + FIELD + MOTES;
   const pos = new Float32Array(n * 3);
   const seed = new Float32Array(n);
   const kind = new Float32Array(n);
@@ -133,15 +149,25 @@ function buildGeometry() {
   for (let k = 0; k < HALO; k++) shell(SPHERE + k, 1.08 + Math.pow(Math.random(), 1.8) * 0.62, 1);
   // 성운: 1.6~9, 화면 넓이에 고르게 보이도록 바깥에도 충분히
   for (let k = 0; k < FIELD; k++) shell(SPHERE + HALO + k, Math.sqrt(1.6 * 1.6 + Math.random() * (81 - 2.56)), 2);
+  for (let k = 0; k < MOTES; k++) {
+    const i = SPHERE + HALO + FIELD + k;
+    // (x, y, 초당 화면 높이 비율): 한 번 떠오르는 데 50~170초
+    pos.set([Math.random(), Math.random(), 0.006 + Math.random() * 0.014], i * 3);
+    seed[i] = Math.random();
+    kind[i] = 3;
+  }
   return { pos, seed, kind, n };
 }
 
-/** 구가 자리 잡을 곳: data-orb-anchor 요소가 있으면 그 가운데, 없으면 본문 가운데에 크고 옅게. */
+/** 구가 자리 잡을 곳: 첫 화면의 큰 자리(data-orb-anchor)가 먼저, 대화 중에는 머리의 작은 상태 구 자리(data-orb-anchor="mini").
+ *  둘 다 없으면 본문 가운데에 크고 옅게. */
 function target(dpr: number) {
-  const anchor = document.querySelector<HTMLElement>("[data-orb-anchor]");
+  const anchor =
+    document.querySelector<HTMLElement>('[data-orb-anchor]:not([data-orb-anchor="mini"])') ?? document.querySelector<HTMLElement>('[data-orb-anchor="mini"]');
   if (anchor) {
     const r = anchor.getBoundingClientRect();
-    if (r.width > 0) return { x: (r.left + r.width / 2) * dpr, y: (r.top + r.height / 2) * dpr, radius: (r.width / 2) * dpr, dim: 1 };
+    // 작은 상태 구는 입자가 겹쳐 하얗게 뭉치지 않도록 옅게
+    if (r.width > 0) return { x: (r.left + r.width / 2) * dpr, y: (r.top + r.height / 2) * dpr, radius: (r.width / 2) * dpr, dim: r.width < 80 ? 0.42 : 1 };
   }
   const main = document.querySelector<HTMLElement>(".main")?.getBoundingClientRect();
   const w = main?.width ?? innerWidth;
@@ -193,14 +219,14 @@ export default function ParticleOrb({ mode }: { mode: OrbMode }) {
     const U = (n: string) => gl.getUniformLocation(prog, n);
     const u = {
       time: U("uTime"), rot: U("uRot"), swirl: U("uSwirl"), energy: U("uEnergy"), spread: U("uSpread"), assemble: U("uAssemble"),
-      glitch: U("uGlitch"), px: U("uPx"), radius: U("uRadius"), dim: U("uDim"), center: U("uCenter"), res: U("uRes"), a: U("uA"), b: U("uB"),
+      glitch: U("uGlitch"), px: U("uPx"), radius: U("uRadius"), dim: U("uDim"), field: U("uField"), dprU: U("uDpr"), mote: U("uMote"), reduceU: U("uReduce"), center: U("uCenter"), res: U("uRes"), a: U("uA"), b: U("uB"),
     };
     gl.enable(gl.BLEND);
     gl.clearColor(0, 0, 0, 0);
 
     let dpr = 1;
     const fit = () => {
-      dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+      dpr = Math.min(window.devicePixelRatio || 1, 2);
       canvas.width = Math.round(canvas.clientWidth * dpr);
       canvas.height = Math.round(canvas.clientHeight * dpr);
       gl.viewport(0, 0, canvas.width, canvas.height);
@@ -229,7 +255,8 @@ export default function ParticleOrb({ mode }: { mode: OrbMode }) {
     const draw = (now: number) => {
       raf = requestAnimationFrame(draw);
       // 고주사율 화면에서도 60fps, 대화 화면(구가 옅을 때)에서는 30fps면 충분하다. 뒤가 덜 바뀌면 유리 판의 backdrop-filter도 덜 다시 계산된다.
-      const budget = at.dim < 0.5 && modeRef.current !== "thinking" ? 1000 / 30 : 1000 / 60;
+      // 작은 상태 구(대화 중)나 옅은 구는 30fps면 충분하다.
+      const budget = (at.dim < 0.5 || at.radius / dpr < 40) && modeRef.current !== "thinking" ? 1000 / 30 : 1000 / 60;
       acc += now - tick;
       tick = now;
       if (acc < budget - 1) return;
@@ -260,8 +287,9 @@ export default function ParticleOrb({ mode }: { mode: OrbMode }) {
       at.dim = ease(at.dim, to.dim, 0.05);
       const glow = glowRef.current;
       if (glow) {
-        const tf = `translate(${(at.x / dpr).toFixed(1)}px, ${(at.y / dpr).toFixed(1)}px) translate(-50%, -50%) scale(${Math.max(0.2, at.radius / dpr / 160).toFixed(3)})`;
-        const op = (0.35 + at.dim * 0.65).toFixed(2);
+        const tf = `translate(${(at.x / dpr).toFixed(1)}px, ${(at.y / dpr).toFixed(1)}px) translate(-50%, -50%) scale(${Math.max(0.08, at.radius / dpr / 160).toFixed(3)})`;
+        // 구 뒤 안개는 옅게: 진하면 배경 전체가 뿌옇게 보인다.
+        const op = ((0.35 + at.dim * 0.65) * 0.45).toFixed(2);
         // 자리 잡은 뒤에는 스타일을 다시 쓰지 않는다.
         if (tf + op !== glowKey) {
           glowKey = tf + op;
@@ -286,7 +314,13 @@ export default function ParticleOrb({ mode }: { mode: OrbMode }) {
       gl.uniform2f(u.res, canvas.width, canvas.height);
       gl.uniform1f(u.radius, at.radius);
       gl.uniform1f(u.dim, at.dim);
-      gl.uniform1f(u.px, dpr * Math.max(0.8, Math.min(1.6, at.radius / dpr / 170)));
+      gl.uniform1f(u.dprU, dpr);
+      gl.uniform1f(u.mote, light ? 0.85 : 1);
+      gl.uniform1f(u.reduceU, reduce.matches ? 1 : 0);
+      // 둘레 먼지·창 전체 성운은 큰 구(첫 화면)일 때만: 대화 중에는 글 뒤에 아무것도 깔리지 않는다.
+      gl.uniform1f(u.field, Math.min(1, Math.max(0, (at.radius / dpr - 24) / 60)));
+      // 입자 크기: 작은 상태 구에서는 가늘게(0.45배), 큰 구에서는 최대 1.6배
+      gl.uniform1f(u.px, dpr * (at.radius / dpr < 40 ? 0.45 : Math.max(0.8, Math.min(1.6, at.radius / dpr / 170))));
       // 화이트 모드에서는 밝은 입자가 바탕에 묻히므로 진한 회색 쪽으로 내린다.
       gl.uniform3fv(u.a, cur.a.map((v) => v * (light ? 0.34 : 1)));
       gl.uniform3fv(u.b, cur.b.map((v) => v * (light ? 0.62 : 1)));

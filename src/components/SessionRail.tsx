@@ -47,7 +47,7 @@ export function Dock({ panelOpen, onTogglePanel }: { panelOpen: boolean; onToggl
   return (
     <nav className="dock" aria-label="엘리시움">
       <div className={`dock-logo ${live.length ? "busy" : ""}`} title="Elysium" aria-hidden>
-        <i />
+        <img src="/logo.svg" alt="" draggable={false} />
       </div>
       <button className="dock-btn primary" onClick={() => openConversation(null)} aria-label="새 세션" data-tip="새 세션 (Ctrl+N)">
         <PlusIcon />
@@ -84,7 +84,10 @@ export default function SessionPanel({ open, onPicked }: { open: boolean; onPick
     <aside className={`panel ${open ? "open" : ""}`} aria-label="세션" aria-hidden={!open} inert={!open}>
       <div className="panel-inner">
         <div className="panel-head">
-          <span className="panel-word">Elysium</span>
+          <span className="panel-brand">
+            <img src="/logo.svg" alt="" aria-hidden draggable={false} />
+            <span className="panel-word">Elysium</span>
+          </span>
           <span className="panel-count">{conversations.length}개 세션</span>
         </div>
         <input type="text" className="rail-search" placeholder="세션·폴더 검색" value={q} onChange={(e) => setQ(e.target.value)} aria-label="세션 검색" />

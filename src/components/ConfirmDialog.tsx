@@ -25,6 +25,7 @@ export default function ConfirmDialog() {
   return (
     <div className="modal-back confirm-back" onMouseDown={(e) => e.target === e.currentTarget && answer(false)}>
       <div className={`modal confirm ${a.danger ? "danger" : ""}`} role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-body">
+        <div className="modal-scroll">
         <div className="confirm-icon" aria-hidden>
           {a.danger ? "!" : "?"}
         </div>
@@ -37,6 +38,7 @@ export default function ConfirmDialog() {
           <button ref={okRef} className={`btn ${a.danger ? "danger solid" : "primary"}`} onClick={() => answer(true)}>
             {a.confirmLabel}
           </button>
+        </div>
         </div>
       </div>
     </div>

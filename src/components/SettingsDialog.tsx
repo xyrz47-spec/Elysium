@@ -190,6 +190,7 @@ export default function SettingsDialog() {
   return (
     <div className="modal-back" onMouseDown={(e) => e.target === e.currentTarget && setDialog(null)}>
       <div className="modal wide" role="dialog" aria-label="설정">
+        <div className="modal-scroll">
         <div className="modal-head">
           <h2>설정</h2>
           <div className="row" style={{ gap: 8 }}>
@@ -314,6 +315,7 @@ export default function SettingsDialog() {
           <button className="btn sm ghost" style={{ marginLeft: "auto" }} onClick={() => setDialog("usage")}>
             전체 토큰 비용 확인하기 →
           </button>
+        </div>
         </div>
       </div>
     </div>

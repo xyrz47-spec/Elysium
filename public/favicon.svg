@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" fill="none">
+  <!-- Elysium Dark Squircle Background -->
+  <rect width="512" height="512" rx="115" fill="#0C1317" stroke="#26403D" stroke-width="8"/>
+  <g transform="translate(46, 46) scale(0.82)">
+
+  <defs>
+    <linearGradient id="auroraGrad" gradientUnits="userSpaceOnUse" x1="70.8" y1="223.3" x2="350" y2="93.2">
+      <stop offset="0" stop-color="#143330"/>
+      <stop offset="0.45" stop-color="#347366"/>
+      <stop offset="1" stop-color="#78CBB8"/>
+    </linearGradient>
+    <linearGradient id="auroraSheen" gradientUnits="userSpaceOnUse" x1="70.8" y1="223.3" x2="350" y2="93.2">
+      <stop offset="0" stop-color="#9EEAD9" stop-opacity="0"/>
+      <stop offset="0.6" stop-color="#9EEAD9" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#E6FFFA" stop-opacity="0.9"/>
+    </linearGradient>
+    <radialGradient id="haloGrad" cx="256" cy="256" r="95" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#68B8A6" stop-opacity="0.75"/>
+      <stop offset="0.45" stop-color="#3B7A6C" stop-opacity="0.6"/>
+      <stop offset="0.8" stop-color="#1F4E48" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#12262B" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="starGrad" cx="256" cy="256" r="85" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.18" stop-color="#E0FFF7"/>
+      <stop offset="0.55" stop-color="#9EEAD9"/>
+      <stop offset="1" stop-color="#64B6A4"/>
+    </radialGradient>
+    <radialGradient id="coreGlow" cx="256" cy="256" r="40" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#E6FFFA" stop-opacity="0.95"/>
+      <stop offset="1" stop-color="#9EEAD9" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="softGlow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="4" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="sparkGlow" x="-100%" y="-100%" width="300%" height="300%">
+      <feGaussianBlur stdDeviation="2" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <g id="ribbon">
+      <path d="M70.8 223.3 C93.5 94.8 237 28 350 93.2 C290 90 125 130 70.8 223.3 Z" fill="url(#auroraGrad)"/>
+      <path d="M92 196 C130 110 240 62 336 96" stroke="url(#auroraSheen)" stroke-width="2.2" stroke-linecap="round"/>
+    </g>
+  </defs>
+
+  <!-- Halo orb -->
+  <circle cx="256" cy="256" r="95" fill="url(#haloGrad)"/>
+
+  <!-- Aurora ribbons -->
+  <use href="#ribbon"/>
+  <use href="#ribbon" transform="rotate(120 256 256)"/>
+  <use href="#ribbon" transform="rotate(240 256 256)"/>
+
+  <!-- Central star -->
+  <g filter="url(#softGlow)">
+    <path d="M256 220 Q260 252 292 256 Q260 260 256 292 Q252 260 220 256 Q252 252 256 220 Z"
+          fill="#E0FFF7" opacity="0.45" transform="rotate(45 256 256)"/>
+    <path d="M256 171 Q264 248 341 256 Q264 264 256 341 Q248 264 171 256 Q248 248 256 171 Z"
+          fill="url(#starGrad)" stroke="#1F4E48" stroke-opacity="0.35" stroke-width="1"/>
+    <circle cx="256" cy="256" r="16" fill="url(#coreGlow)"/>
+  </g>
+
+  <!-- Stardust -->
+  <g filter="url(#sparkGlow)" stroke="#1F4E48" stroke-opacity="0.45" stroke-width="0.8">
+    <path d="M360 189 Q361.3 198.7 371 200 Q361.3 201.3 360 211 Q358.7 201.3 349 200 Q358.7 198.7 360 189 Z" fill="#E6FFFA"/>
+    <path d="M150 333 Q150.8 339.2 157 340 Q150.8 340.8 150 347 Q149.2 340.8 143 340 Q149.2 339.2 150 333 Z" fill="#9EEAD9"/>
+    <path d="M296 118 Q296.6 122.4 301 123 Q296.6 123.6 296 128 Q295.4 123.6 291 123 Q295.4 122.4 296 118 Z" fill="#9EEAD9"/>
+    <circle cx="318" cy="372" r="3" fill="#E6FFFA"/>
+    <circle cx="176" cy="168" r="2.4" fill="#9EEAD9"/>
+  </g>
+  </g>
+</svg>

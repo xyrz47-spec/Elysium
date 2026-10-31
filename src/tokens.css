@@ -15,10 +15,10 @@
 /* 다크(기본) */
 :root, :root[data-theme="dark"] {
   color-scheme: dark;
-  --bg: #131417;
+  --bg: #0c0f15;
   --ink: #ececee;
-  --muted: #a7a9b0;
-  --dim: #6f727a;
+  --muted: #b3b6bd;
+  --dim: #858993;
   --line: rgba(255, 255, 255, 0.07);
   --line-2: rgba(255, 255, 255, 0.13);
   --surface: rgba(30, 32, 37, 0.78);
@@ -55,7 +55,7 @@
 :root[data-theme="light"] {
   color-scheme: light;
   /* 바탕은 차가운 중간 회색, 그 위의 카드·패널·칩은 흰색이라 경계가 분명하다 */
-  --bg: #dfe2e6;
+  --bg: #d6dbe3;
   --ink: #15171a;
   --muted: #40444c;
   --dim: #5f636c;
@@ -94,7 +94,7 @@
 
 /* 리퀴드 글라스(2026-10-31): 판은 뒤가 비치는 유리, 테두리는 빛이 맺히는 가장자리, 위쪽은 반사광 */
 :root, :root[data-theme="dark"] {
-  --glass: rgba(22, 24, 29, 0.06);
+  --glass: rgba(22, 24, 29, 0.04);
   --glass-2: rgba(34, 37, 44, 0.24);
   --glass-ctl: rgba(255, 255, 255, 0.03);
   --glass-ctl-hi: rgba(255, 255, 255, 0.07);
@@ -109,19 +109,46 @@
   --glass-inner: inset 0 1px 0 rgba(255, 255, 255, 0.1), inset 0 -14px 28px rgba(255, 255, 255, 0.015);
   --glass-shadow: 0 20px 50px rgba(0, 0, 0, 0.4), 0 2px 8px rgba(0, 0, 0, 0.22);
   --glass-spec: rgba(255, 255, 255, 0.1);
-  --glass-blob-1: rgba(121, 184, 179, 0.26);
-  --glass-blob-2: rgba(169, 195, 208, 0.17);
-  --glass-blob-3: rgba(90, 120, 140, 0.16);
-  /* 애플 리퀴드 글라스: 아주 옅은 서리(blur) → 가장자리 렌즈 굴절(--lg-filter) → 채도·밝기 */
-  --lg-backdrop: blur(2px) var(--lg-filter, ) saturate(1.8) brightness(1.06);
-  --lg-edge: inset 0 0 0 0.5px rgba(255, 255, 255, 0.18), inset 1.5px 1.5px 1px -1px rgba(255, 255, 255, 0.6), inset -1.5px -1.5px 1px -1px rgba(255, 255, 255, 0.3), inset 0 -10px 22px -14px rgba(255, 255, 255, 0.14);
+  --glass-blob-1: rgba(70, 168, 158, 0.13);
+  --glass-blob-2: rgba(96, 112, 140, 0.1);
+  --glass-blob-3: rgba(80, 120, 150, 0.07);
+  --glass-blob-4: rgba(170, 150, 140, 0.06);
+  /* 엘리시움의 하늘(해 질 녘): 위는 깊은 먹빛 남색, 지평선 쪽은 보랏빛 */
+  --sky: linear-gradient(180deg, #090b10 0%, #0c0f15 45%, #10141b 78%, #13171e 100%);
+  /* 아래쪽에 걸린 엘리시움 지평선: 안은 조금 어둡고, 테두리는 빛나고, 위로 옅은 대기광이 번진다 */
+  --horizon: none;
+  --vignette: radial-gradient(130% 120% at 50% 42%, transparent 62%, rgba(2, 3, 8, 0.35) 100%);
+  --grain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 .07 0 0 0 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  /* 애플 리퀴드 글라스: 아주 옅은 서리(blur) → 가장자리 렌즈 굴절(--lg-filter, styles.css) → 채도·밝기 */
+  --lg-sat: 1.8;
+  --chrome-blur: 3px;
+  --side-blur: 12px;
+  --content-blur: 14px;
+  --glass-side: rgba(18, 20, 26, 0.3);
+  --mote: 1;
+  --lg-bright: 1.06;
+  --lg-edge: inset 0 1px 12px -6px rgba(255, 255, 255, 0.05), inset 0 -10px 22px -14px rgba(255, 255, 255, 0.1);
+  --lg-btn-edge: inset 0 1px 0 rgba(255, 255, 255, 0.3), inset 0 -1px 0 rgba(0, 0, 0, 0.16);
+  --glass-modal: rgba(18, 20, 26, 0.42);
+  --modal-blur: 18px;
+  --lg-pop-edge: inset 0 0 0 0.5px rgba(255, 255, 255, 0.14), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  --lg-pop-drop: 0 24px 60px rgba(0, 0, 0, 0.45);
+  --lg-rim: radial-gradient(150px 80px at 0 0, rgba(255, 255, 255, 0.36), rgba(255, 255, 255, 0) 72%), radial-gradient(150px 80px at 100% 100%, rgba(255, 255, 255, 0.2), rgba(255, 255, 255, 0) 72%), linear-gradient(rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.06));
+  --lg-rim-work: radial-gradient(150px 80px at 0 0, rgba(var(--hl-rgb), 0.9), rgba(var(--hl-rgb), 0) 72%), radial-gradient(150px 80px at 100% 100%, rgba(var(--hl-rgb), 0.55), rgba(var(--hl-rgb), 0) 72%), linear-gradient(rgba(var(--hl-rgb), 0.12), rgba(var(--hl-rgb), 0.12));
   --lg-drop: 0 10px 28px rgba(0, 0, 0, 0.26), 0 1px 3px rgba(0, 0, 0, 0.14);
+  --lg-ctl: rgba(255, 255, 255, 0.06);
+  --hover-veil: rgba(255, 255, 255, 0.13);
+  --card-hover: rgba(255, 255, 255, 0.09);
+  --selected-veil: rgba(255, 255, 255, 0.17);
+  --accent-hover: #8cc5c0;
+  --lg-ctl-hi: rgba(255, 255, 255, 0.17);
+  --lg-ctl-edge: inset 0 1px 0 rgba(255, 255, 255, 0.08), inset 0 -1px 0 rgba(0, 0, 0, 0.14);
   --glass-press: rgba(255, 255, 255, 0.22);
-  --content: rgba(27, 29, 34, 0.8);
+  --content: rgba(24, 27, 33, 0.56);
   --content-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 8px 24px rgba(0, 0, 0, 0.22);
 }
 :root[data-theme="light"] {
-  --glass: rgba(255, 255, 255, 0.07);
+  --glass: rgba(255, 255, 255, 0.2);
   --glass-2: rgba(255, 255, 255, 0.24);
   --glass-ctl: rgba(255, 255, 255, 0.12);
   --glass-ctl-hi: rgba(255, 255, 255, 0.28);
@@ -131,18 +158,44 @@
   --pop-surface: #f1f3f6;
   --pop-surface-2: #eaedf1;
   --pop-line: rgba(20, 24, 30, 0.1);
-  --glass-sheen: linear-gradient(180deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0) 30%);
+  --glass-sheen: linear-gradient(180deg, rgba(255, 255, 255, 0.38), rgba(255, 255, 255, 0) 48%);
   --glass-rim: linear-gradient(140deg, rgba(255, 255, 255, 1), rgba(255, 255, 255, 0.4) 28%, rgba(255, 255, 255, 0.12) 52%, rgba(255, 255, 255, 0.5) 80%, rgba(255, 255, 255, 0.95));
   --glass-inner: inset 0 1px 0 rgba(255, 255, 255, 0.95), inset 0 -12px 24px rgba(255, 255, 255, 0.06);
   --glass-shadow: 0 20px 46px rgba(28, 40, 58, 0.16), 0 2px 6px rgba(28, 40, 58, 0.08);
   --glass-spec: rgba(255, 255, 255, 0.5);
-  --glass-blob-1: rgba(63, 143, 138, 0.3);
-  --glass-blob-2: rgba(107, 143, 163, 0.28);
-  --glass-blob-3: rgba(140, 165, 190, 0.34);
-  --lg-backdrop: blur(2px) var(--lg-filter, ) saturate(1.7) brightness(1.04);
-  --lg-edge: inset 0 0 0 0.5px rgba(255, 255, 255, 0.75), inset 1.5px 1.5px 1px -1px rgba(255, 255, 255, 1), inset -1.5px -1.5px 1px -1px rgba(255, 255, 255, 0.8), inset 0 -10px 22px -14px rgba(255, 255, 255, 0.5);
-  --lg-drop: 0 10px 26px rgba(28, 40, 58, 0.14), 0 1px 3px rgba(28, 40, 58, 0.08);
+  --glass-blob-1: rgba(70, 160, 150, 0.18);
+  --glass-blob-2: rgba(120, 135, 165, 0.2);
+  --glass-blob-3: rgba(140, 165, 190, 0.22);
+  --glass-blob-4: rgba(215, 195, 180, 0.14);
+  /* 새벽 하늘: 위는 옅은 하늘색 회색, 아래는 복숭아빛 */
+  --sky: linear-gradient(180deg, #cdd4de 0%, #d5dae2 50%, #dcdfe5 100%);
+  --horizon: none;
+  --vignette: radial-gradient(130% 120% at 50% 42%, transparent 60%, rgba(40, 52, 70, 0.14) 100%);
+  --grain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 .05 0 0 0 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  --lg-sat: 1.6;
+  --chrome-blur: 3px;
+  --side-blur: 12px;
+  --content-blur: 14px;
+  --glass-side: rgba(255, 255, 255, 0.38);
+  --mote: 0.85;
+  --lg-bright: 1.08;
+  --lg-edge: inset 0 1px 12px -6px rgba(255, 255, 255, 0.45), inset 0 -10px 22px -14px rgba(255, 255, 255, 0.4);
+  --lg-btn-edge: inset 0 1px 0 rgba(255, 255, 255, 0.35), inset 0 -1px 0 rgba(20, 30, 45, 0.14);
+  --glass-modal: rgba(255, 255, 255, 0.5);
+  --modal-blur: 18px;
+  --lg-pop-edge: inset 0 0 0 0.5px rgba(255, 255, 255, 0.8), inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  --lg-pop-drop: 0 0 0 0.5px rgba(30, 42, 60, 0.06), 0 24px 56px rgba(28, 40, 58, 0.2);
+  --lg-rim: radial-gradient(150px 80px at 0 0, rgba(255, 255, 255, 0.75), rgba(255, 255, 255, 0) 72%), radial-gradient(150px 80px at 100% 100%, rgba(255, 255, 255, 0.55), rgba(255, 255, 255, 0) 72%), linear-gradient(rgba(255, 255, 255, 0.45), rgba(255, 255, 255, 0.45));
+  --lg-rim-work: radial-gradient(150px 80px at 0 0, rgba(var(--accent-rgb), 0.75), rgba(var(--accent-rgb), 0) 72%), radial-gradient(150px 80px at 100% 100%, rgba(var(--accent-rgb), 0.5), rgba(var(--accent-rgb), 0) 72%), linear-gradient(rgba(var(--accent-rgb), 0.18), rgba(var(--accent-rgb), 0.18));
+  --lg-drop: 0 0 0 0.5px rgba(30, 42, 60, 0.06), 0 12px 32px rgba(28, 40, 58, 0.14), 0 2px 6px rgba(28, 40, 58, 0.08);
+  --lg-ctl: rgba(255, 255, 255, 0.55);
+  --hover-veil: rgba(20, 32, 48, 0.08);
+  --card-hover: rgba(255, 255, 255, 0.5);
+  --selected-veil: rgba(20, 32, 48, 0.11);
+  --accent-hover: #46a099;
+  --lg-ctl-hi: rgba(255, 255, 255, 0.95);
+  --lg-ctl-edge: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 1px 2px rgba(28, 40, 58, 0.1);
   --glass-press: rgba(255, 255, 255, 0.6);
-  --content: rgba(255, 255, 255, 0.82);
+  --content: rgba(255, 255, 255, 0.55);
   --content-shadow: 0 1px 2px rgba(20, 22, 26, 0.06), 0 8px 22px rgba(28, 40, 58, 0.1);
 }
