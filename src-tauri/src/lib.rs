@@ -17,6 +17,7 @@ mod secrets;
 mod settings;
 mod skills;
 mod store;
+mod teamwork;
 
 use orchestrator::AppState;
 use std::collections::HashMap;
@@ -51,10 +52,16 @@ pub fn run() {
                 settings: RwLock::new(s),
                 engines: RwLock::new(vec![]),
                 tasks: Mutex::new(HashMap::new()),
+                agents: Mutex::new(HashMap::new()),
                 steers: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),
             });
             app.manage(state.clone());
+            // 지난 실행에서 끝내지 못한 병렬 작업 사본을 지운다(시작할 때는 도는 작업이 없다).
+            let leftovers = state.data_dir.join("teamwork");
+            std::thread::spawn(move || {
+                let _ = std::fs::remove_dir_all(leftovers);
+            });
             // 원격 제어를 켜 두었으면 시작할 때 서버를 띄운다.
             if remote::load_config(&state.db).map(|c| c.enabled).unwrap_or(false) {
                 let (h, s) = (app.handle().clone(), state.clone());
@@ -91,6 +98,7 @@ pub fn run() {
             commands::pick_folder,
             commands::chat_send,
             commands::task_cancel,
+            commands::agent_cancel,
             commands::task_steer,
             commands::cancel_all,
             commands::approval_list,

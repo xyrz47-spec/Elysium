@@ -166,3 +166,10 @@ export const ArrowDownIcon = () => (
     <path d="M12 5v14M6 13l6 6 6-6" />
   </Svg>
 );
+/** 회의: 말풍선 셋이 서로 이어진 모양 */
+export const CouncilIcon = ({ size = 18 }: { size?: number }) => (
+  <Svg size={size}>
+    <path d="M4 6.5A2.5 2.5 0 0 1 6.5 4h5A2.5 2.5 0 0 1 14 6.5v2A2.5 2.5 0 0 1 11.5 11H8l-2.5 2v-2.1A2.5 2.5 0 0 1 4 8.5z" />
+    <path d="M10 15.5a2.5 2.5 0 0 0 2.5 2.5H16l2.5 2v-2.1a2.5 2.5 0 0 0 1.5-2.3v-2.1a2.5 2.5 0 0 0-2.5-2.5H17" />
+  </Svg>
+);

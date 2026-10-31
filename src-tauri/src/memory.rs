@@ -38,7 +38,7 @@ const KEEP: f64 = 0.5;
 /// 바로 앞 차례(가장 최근 요청·답)는 이어지는 요청이 많아 더 너그럽게 남긴다.
 const KEEP_LATEST: f64 = 0.25;
 /// JEV에 보내는 지금 요청의 최대 글자 수
-const FILTER_REQUEST_CHARS: usize = 2000;
+pub const FILTER_REQUEST_CHARS: usize = 2000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Turn {

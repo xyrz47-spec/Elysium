@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { api, baseName, errorText, type EngineChoice } from "../lib/api";
 import { useApp } from "../store";
-import { ChatIcon, ChevronIcon, CloseIcon, FolderIcon, SendIcon, SparkIcon, StopIcon, WrenchIcon } from "./Icons";
+import { ChatIcon, ChevronIcon, CloseIcon, CouncilIcon, FolderIcon, SendIcon, SparkIcon, StopIcon, WrenchIcon } from "./Icons";
 import Segmented from "./Segmented";
 
 /** 대화창 아래 입력 상자: 대화/작업 모드 · 보내기 · 만들기(폴더 안에서 끝까지 완성) · 엔진 고르기 · /스킬 자동 완성 */
@@ -57,7 +57,10 @@ export default function Composer({ draft, onDraftUsed }: { draft?: string | null
     ? "먼저 설정에서 AI CLI나 API 키를 연결하세요"
     : `${folder ?? (conversationId ? "기본 작업 폴더" : "새 프로젝트 폴더")} 안에서 파일을 만들고 고쳐 끝까지 완성합니다 (Ctrl+Enter)`;
 
-  async function submit(build: boolean) {
+  // 회의는 AI가 둘 이상 있으면 가장 좋고, 하나뿐이면 같은 AI를 새 세션으로 여럿 띄운다.
+  const councilHint = installed.length >= 2 ? "여러 AI가 서로 의견을 주고받으며 최적의 해결책을 함께 논의합니다. (Ctrl+Shift+Enter)" : "연결된 AI가 하나일 때도 여러 세션이 서로 의견을 주고받으며 논의합니다. (Ctrl+Shift+Enter)";
+
+  async function submit(build: boolean, council = false) {
     const t = text.trim();
     if (!t || (build && !canBuild)) return;
     // 작업 중이면 보내기는 작업 중 메시지가 된다(API 작업 모드가 다음 차례에 읽는다). 만들기는 끝난 뒤에 한다.
@@ -71,13 +74,14 @@ export default function Composer({ draft, onDraftUsed }: { draft?: string | null
       return;
     }
     setText("");
-    await send(t, engine, work || build, build);
+    await send(t, engine, !council && (work || build), build && !council, council);
   }
 
   function onKey(e: KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.nativeEvent.isComposing) {
       e.preventDefault();
-      submit(true);
+      if (e.shiftKey) submit(false, true);
+      else submit(true);
       return;
     }
     if (matches.length > 0) {
@@ -213,6 +217,9 @@ export default function Composer({ draft, onDraftUsed }: { draft?: string | null
               >
                 <SendIcon />
               </button>
+              <button className="council-btn" onClick={() => submit(false, true)} disabled={!text.trim() || installed.length === 0} title={councilHint} aria-label="AI 회의 시작">
+                <CouncilIcon /> 회의
+              </button>
               <button className="build-btn" onClick={() => submit(true)} disabled={!text.trim() || !canBuild} title={buildHint}>
                 <WrenchIcon /> 만들기
               </button>
@@ -220,7 +227,7 @@ export default function Composer({ draft, onDraftUsed }: { draft?: string | null
           )}
         </div>
       </div>
-      <div className="composer-note">Enter {work ? "작업(허락 후 수정)" : "질문"} · Ctrl+Enter 만들기 · / 스킬 — AI는 실수할 수 있으니 결과를 확인하세요.</div>
+      <div className="composer-note">Enter {work ? "작업(허락 후 수정)" : "질문"} · Ctrl+Enter 만들기 · Ctrl+Shift+Enter 회의 · / 스킬 — AI는 실수할 수 있으니 결과를 확인하세요.</div>
     </div>
   );
 }

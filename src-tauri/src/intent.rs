@@ -212,6 +212,17 @@ pub fn requested_agents(text: &str) -> Option<usize> {
     MANY_WORDS.iter().any(|w| low.contains(w)).then_some(3)
 }
 
+/// 회의 지시: AI끼리 서로 대화하며 풀어 달라는 말. "회의록"처럼 주제로 쓰인 "회의"는 잡지 않게 행동을 뜻하는 말만 본다.
+const COUNCIL_WORDS: &[&str] = &[
+    "서로 대화", "서로 이야기", "서로 얘기", "서로 토론", "서로 논의", "서로 의논", "끼리 대화", "끼리 토론", "끼리 논의", "회의해서", "회의해 줘", "회의해줘", "회의로 풀", "회의를 열", "회의 열어", "토의해서", "토의해 줘", "의논해서", "의논해 줘",
+    "talk to each other", "discuss with each other", "debate each other", "hold a meeting",
+];
+
+pub fn requested_council(text: &str) -> bool {
+    let low = text.to_ascii_lowercase();
+    COUNCIL_WORDS.iter().any(|w| low.contains(w))
+}
+
 /// 에이전트 키워드에 바로 붙은 수와 그 지시의 범위(수, 시작, 끝). "3개·3명·세 개·3 agents·에이전트 3"
 fn agent_count(low: &str) -> Option<(usize, usize, usize)> {
     for kw in AGENT_WORDS {
@@ -418,5 +429,14 @@ mod tests {
         }
         // 지시만 있는 글은 지우지 않는다
         assert_eq!(strip_directives("opus를 사용해 줘"), "opus를 사용해 줘");
+    }
+
+    #[test]
+    fn council_words_need_an_action_not_a_topic() {
+        assert!(requested_council("세 AI가 서로 대화하며 이 버그 원인을 찾아 줘"));
+        assert!(requested_council("회의해서 결정해 줘"));
+        assert!(requested_council("let the agents talk to each other"));
+        assert!(!requested_council("회의록을 정리해 줘"));
+        assert!(!requested_council("회의실 예약 메일 써 줘"));
     }
 }

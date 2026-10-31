@@ -2,10 +2,10 @@ import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNod
 import { api, baseName, ENGINE_LABEL, errorText, type EngineId, type MemoryView, type Message } from "../lib/api";
 import { ask } from "../lib/confirm";
 import { useTauriEvent } from "../lib/events";
-import { useApp, type AgentRun } from "../store";
+import { useApp, type AgentRun, type Live } from "../store";
 import Segmented from "./Segmented";
-import { AgentsIcon, ArrowDownIcon, ArrowUpIcon, BookmarkIcon, CloseIcon, DownloadIcon, FolderIcon, InfoIcon, KeyboardIcon, ListIcon, PlusIcon, SearchIcon, TrashIcon } from "./Icons";
-import { pair, ROLE_LABEL } from "./Thread";
+import { AgentsIcon, ArrowDownIcon, ArrowUpIcon, BookmarkIcon, ChevronIcon, CloseIcon, DownloadIcon, FolderIcon, InfoIcon, KeyboardIcon, ListIcon, PlusIcon, SearchIcon, StopIcon, TrashIcon } from "./Icons";
+import { INTEGRATE, pair, ROLE_LABEL } from "./Thread";
 
 export type ToolTab = "info" | "agents" | "outline" | "find" | "snippets" | "export" | "keys";
 
@@ -17,10 +17,23 @@ export const A = {
   idle: "현재 실행 중인 에이전트가 없습니다. 요청을 보내면 초안, 검토, 토론 등 작업 중인 AI의 상태가 여기에 표시됩니다.",
   roster: "사용 가능한 엔진",
   preset: "동시 실행 수",
-  presetHelp: "2개 이상 설정하면 여러 AI가 동시에 답변을 생성해 종합하며, 토큰 사용량이 증가합니다(1은 꺼짐). 메시지에 '에이전트 3개로' 요청하거나 'opus랑 gpt-5로'처럼 모델을 지정할 수도 있습니다. 파일 충돌을 방지하기 위해 만들기에서는 항상 단일 AI만 실행합니다.",
+  presetHelp: "2개 이상 설정 시 질문 답변과 파일 작업이 여러 에이전트에 분할되어 병렬 진행 후 통합되며, 토큰 소모량이 증가합니다. 메시지에 '에이전트 3개로'나 'opus랑 gpt-5로'처럼 입력하여 바로 지정할 수도 있습니다.",
   off: "꺼짐",
   open: "이동",
   stop: "중지",
+  stopTask: "작업 중지",
+  stopAgent: "이 에이전트만 중지",
+  stopAll: "전체 중지",
+  stopped: "중지됨",
+  output: "생성 내용",
+  noOutput: "아직 생성된 내용이 없습니다.",
+  activity: "도구 활동",
+  files: "담당 파일",
+  progress: "{done}/{total} 완료",
+  modeWork: "병렬 작업",
+  modeTeam: "답변 병합",
+  modeCouncil: "회의",
+  modeDebate: "토론",
   preparing: "AI 선택하는 중",
   approval: "승인 대기 중",
   busy: "{n}개 실행 중",
@@ -40,8 +53,93 @@ function since(ms: number) {
   return s >= 60 ? `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}` : `${s}s`;
 }
 
+const progressText = (done: number, total: number) => A.progress.replace("{done}", String(done)).replace("{total}", String(total));
+
+/** 에이전트 한 줄: 누르면 맡은 파일·최근 활동·지금까지 쓴 글을 펼친다. 실행 중이면 이 에이전트만 멈출 수 있다. */
+function AgentRow({ l, a, now }: { l: Live; a: AgentRun; now: number }) {
+  const { cancelAgent } = useApp();
+  const [open, setOpen] = useState(false);
+  const part = l.parts[a.key];
+  // 동시에 쓰는 실행은 key별 글을, 한 줄로 흘리는 실행(초안·검토·종합)은 지금 단계의 글을 보여 준다.
+  const text = l.streams[a.key] ?? (a.role === l.phase ? l.text : "");
+  const outRef = useRef<HTMLPreElement>(null);
+  useEffect(() => {
+    const el = outRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [text, open]);
+  const name = part?.title ?? a.label;
+  return (
+    <li className={`agent-run ${a.state} ${open ? "open" : ""}`}>
+      <div className="agent-row">
+        <button className="agent-toggle" onClick={() => setOpen((o) => !o)} aria-expanded={open}>
+          <i className="agent-dot" aria-hidden />
+          <div className="agent-main">
+            <div className="agent-line">
+              <b>{name}</b>
+              <span className="agent-role">{part ? a.label : l.work && l.team && a.role === "synth" ? INTEGRATE : (ROLE_LABEL[a.role as keyof typeof ROLE_LABEL] ?? a.role)}</span>
+              <span className="agent-state">{a.stopped ? A.stopped : STATE_LABEL[a.state]}</span>
+              <span className="agent-time">{a.state === "run" ? since(now - a.startedAt) : a.ms != null ? since(a.ms) : ""}</span>
+            </div>
+            {!open && a.state === "run" && a.activities.length > 0 && <div className="agent-act">{a.activities[a.activities.length - 1]}</div>}
+            {!open && a.state === "fail" && a.error && !a.stopped && <div className="agent-err">{a.error}</div>}
+          </div>
+          <ChevronIcon open={open} />
+        </button>
+        {a.state === "run" && (
+          <button className="agent-stop" onClick={() => cancelAgent(l.taskId, a.key)} title={A.stopAgent} aria-label={`${A.stopAgent} · ${name}`}>
+            <StopIcon />
+          </button>
+        )}
+      </div>
+      {open && (
+        <div className="agent-detail">
+          {(a.model || a.effort) && <div className="agent-sub">{[a.model, a.effort].filter(Boolean).join(" · ")}</div>}
+          {part && part.files.length > 0 && (
+            <div className="agent-block">
+              <h5>{A.files}</h5>
+              <div className="agent-files">
+                {part.files.map((f) => (
+                  <code key={f}>{f}</code>
+                ))}
+              </div>
+            </div>
+          )}
+          {a.activities.length > 0 && (
+            <div className="agent-block">
+              <h5>{A.activity}</h5>
+              {a.activities.map((x, i) => (
+                <div key={i} className="agent-act full">
+                  {x}
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="agent-block">
+            <h5>{A.output}</h5>
+            {text ? (
+              <pre ref={outRef} className="agent-out">
+                {text.length > 4000 ? `…${text.slice(-4000)}` : text}
+              </pre>
+            ) : (
+              <div className="agent-sub">{A.noOutput}</div>
+            )}
+          </div>
+          {a.state === "fail" && a.error && !a.stopped && <div className="agent-err">{a.error}</div>}
+        </div>
+      )}
+    </li>
+  );
+}
+
+function modeOf(l: Live): string | null {
+  if (l.council) return A.modeCouncil;
+  if (l.team) return l.work ? A.modeWork : A.modeTeam;
+  if (l.debate) return A.modeDebate;
+  return null;
+}
+
 function AgentsTab({ onClose }: { onClose: () => void }) {
-  const { live, engines, conversations, conversationId, openConversation, cancel, approvals, settings, saveSettings } = useApp();
+  const { live, engines, conversations, conversationId, openConversation, cancel, cancelAll, approvals, settings, saveSettings } = useApp();
   const [, tick] = useState(0);
   // 실행 중이면 경과 시간을 1초마다 다시 그린다.
   useEffect(() => {
@@ -60,35 +158,36 @@ function AgentsTab({ onClose }: { onClose: () => void }) {
         <h4>
           {A.running}
           {tasks.length > 0 && <span className="agent-count">{tasks.length}</span>}
+          {tasks.length > 1 && (
+            <button className="btn sm danger agent-stop-all" onClick={cancelAll}>
+              {A.stopAll}
+            </button>
+          )}
         </h4>
         {tasks.length === 0 && <Empty>{A.idle}</Empty>}
         {tasks.map((l) => {
           const c = conversations.find((x) => x.id === l.conversationId);
           const runs = Object.values(l.agents).sort((a, b) => a.startedAt - b.startedAt);
           const waiting = approvals.some((a) => a.taskId === l.taskId);
+          const done = runs.filter((a) => a.state !== "run").length;
+          const mode = modeOf(l);
           return (
             <div key={l.taskId} className={`agent-task ${l.conversationId === conversationId ? "here" : ""}`}>
               <div className="agent-task-head">
                 <b title={c?.title}>{c?.title ?? A.newSession}</b>
+                {mode && <span className="tag">{mode}</span>}
                 <span className="agent-time">{since(now - l.startedAt)}</span>
               </div>
+              {runs.length > 1 && (
+                <div className="agent-progress">
+                  <i style={{ "--w": `${(done / runs.length) * 100}%` } as CSSProperties} />
+                  <span>{progressText(done, runs.length)}</span>
+                </div>
+              )}
               <ul className="agent-runs">
                 {runs.length === 0 && <li className="agent-run wait">{waiting ? A.approval : A.preparing}</li>}
                 {runs.map((a) => (
-                  <li key={a.key} className={`agent-run ${a.state}`}>
-                    <i className="agent-dot" aria-hidden />
-                    <div className="agent-main">
-                      <div className="agent-line">
-                        <b>{a.label}</b>
-                        <span className="agent-role">{ROLE_LABEL[a.role as keyof typeof ROLE_LABEL] ?? a.role}</span>
-                        <span className="agent-state">{STATE_LABEL[a.state]}</span>
-                        <span className="agent-time">{a.state === "run" ? since(now - a.startedAt) : a.ms != null ? since(a.ms) : ""}</span>
-                      </div>
-                      {(a.model || a.effort) && <div className="agent-sub">{[a.model, a.effort].filter(Boolean).join(" · ")}</div>}
-                      {a.state === "run" && a.activities.length > 0 && <div className="agent-act">{a.activities[a.activities.length - 1]}</div>}
-                      {a.state === "fail" && a.error && <div className="agent-err">{a.error}</div>}
-                    </div>
-                  </li>
+                  <AgentRow key={a.key} l={l} a={a} now={now} />
                 ))}
               </ul>
               <div className="row">
@@ -103,8 +202,9 @@ function AgentsTab({ onClose }: { onClose: () => void }) {
                     {A.open}
                   </button>
                 )}
+                <div className="spacer" />
                 <button className="btn sm danger" onClick={() => cancel(l.taskId)}>
-                  {A.stop}
+                  {A.stopTask}
                 </button>
               </div>
             </div>

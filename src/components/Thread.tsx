@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
-import { ENGINE_LABEL, TIER_LABEL, type Approval, type Budget, type Judgment, type Message, type MessageData, type Step } from "../lib/api";
+import { ENGINE_LABEL, TIER_LABEL, type Approval, type Budget, type CouncilTurn, type EngineId, type Judgment, type Message, type MessageData, type Step } from "../lib/api";
 import { useApp, type Live } from "../store";
 import Markdown from "./Markdown";
-import { ChevronIcon, CopyIcon, FolderIcon, SparkIcon, WrenchIcon } from "./Icons";
+import { ChevronIcon, CopyIcon, CouncilIcon, FolderIcon, SparkIcon, WrenchIcon } from "./Icons";
 
 /** 첫 화면 예시: 눌러서 입력창에 넣고, 만들기(또는 Enter)로 보낸다 */
 const SUGGESTIONS: { title: string; text: string; tone: string }[] = [
@@ -24,10 +24,11 @@ interface RibbonNode {
   title: string;
   sub: string;
   state: NodeState;
-  kind: "jev" | "draft" | "review" | "debate" | "rebuttal" | "judge" | "agent" | "synth";
+  kind: "jev" | "draft" | "review" | "debate" | "rebuttal" | "judge" | "agent" | "synth" | "council" | "plan";
 }
 
 export const ROLE_LABEL: Record<Step["role"], string> = {
+  council: "회의",
   draft: "초안",
   review: "검토",
   debate: "토론",
@@ -35,7 +36,22 @@ export const ROLE_LABEL: Record<Step["role"], string> = {
   judge: "판정",
   agent: "답변",
   synth: "종합",
+  plan: "분할자",
 };
+
+/** 병렬 작업의 이름과 통합 단계 이름 */
+const workTitle = (n: number) => "{n}개 병렬 작업".replace("{n}", String(n));
+export const INTEGRATE = "통합자";
+const partTitle = (n: number, title: string) => "에이전트 {n}: {title}".replace("{n}", String(n)).replace("{title}", title);
+const CONFLICTS = "병합된 파일";
+const CHANGED = "변경된 파일";
+
+/** 회의 리본 칸 이름: "회의 3명" */
+const councilTitle = (n: number) => "회의 {n}명".replace("{n}", String(n));
+/** "2/3라운드" */
+const roundOf = (r: number, max: number) => "{r}/{max}라운드".replace("{r}", String(r)).replace("{max}", String(max));
+/** 진행 중 발언 끝의 '합의: 예/아니오' 줄은 창에 보이지 않는다 */
+const AGREE_LINE = /\n\s*[*#]*\s*합의:[^\n]*$/;
 
 /** "에이전트 3개" 처럼 수가 들어간 이름 */
 export const agentsTitle = (n: number) => "병렬 에이전트 {n}개".replace("{n}", String(n));
@@ -76,16 +92,22 @@ function tune(model: string | null | undefined, effort: string | null | undefine
   return [model, effort].filter(Boolean).join(" · ");
 }
 
-function stepNodes(steps: Step[]): RibbonNode[] {
-  // 토론은 같은 라운드의 두 AI를 한 칸에 나란히 묶는다. 동시 에이전트는 한 칸으로 묶는다.
+function stepNodes(steps: Step[], council?: MessageData["council"], work = false): RibbonNode[] {
+  // 토론은 같은 라운드의 두 AI를 한 칸에 나란히 묶는다. 동시 에이전트·회의는 한 칸으로 묶는다.
   const out: RibbonNode[] = [];
+  if (council) {
+    const last = Math.max(0, ...council.rounds.map((r) => r.round));
+    const ok = council.rounds.some((r) => r.ok);
+    const how = council.agreed ? "합의" : ROLE_LABEL.synth;
+    out.push({ key: "council", kind: "council", title: councilTitle(council.agents.length), sub: `${roundOf(last, council.maxRounds)} · ${how}`, state: ok ? "ok" : "fail" });
+  }
   const agents = steps.filter((x) => x.role === "agent");
   if (agents.length) {
     const ok = agents.filter((x) => x.ok).length;
-    out.push({ key: "team", kind: "agent", title: agentsTitle(agents.length), sub: `${ok}/${agents.length} · ${secs(Math.max(...agents.map((x) => x.ms)))}`, state: ok ? "ok" : "fail" });
+    out.push({ key: "team", kind: "agent", title: work ? workTitle(agents.length) : agentsTitle(agents.length), sub: `${ok}/${agents.length} · ${secs(Math.max(...agents.map((x) => x.ms)))}`, state: ok ? "ok" : "fail" });
   }
   steps.forEach((s, i) => {
-    if (s.role === "agent") return;
+    if (s.role === "agent" || s.role === "council") return;
     const t = tune(s.engine === "claude" || s.engine === "antigravity" ? s.model : null, s.effort);
     const prev = out[out.length - 1];
     if (prev && (s.role === "debate" || s.role === "rebuttal") && prev.kind === s.role && !prev.title.includes(" · ")) {
@@ -94,7 +116,8 @@ function stepNodes(steps: Step[]): RibbonNode[] {
       if (!s.ok) prev.state = "fail";
       return;
     }
-    out.push({ key: `s${i}`, kind: s.role, title: s.label, sub: `${ROLE_LABEL[s.role]} · ${s.ok ? secs(s.ms) : "실패"}${t ? ` · ${t}` : ""}`, state: s.ok ? "ok" : "fail" });
+    const role = work && s.role === "synth" ? INTEGRATE : ROLE_LABEL[s.role];
+    out.push({ key: `s${i}`, kind: s.role, title: s.label, sub: `${role} · ${s.ok ? secs(s.ms) : "실패"}${t ? ` · ${t}` : ""}`, state: s.ok ? "ok" : "fail" });
   });
   return out;
 }
@@ -122,14 +145,122 @@ function debateNodes(l: Live): RibbonNode[] {
 function teamNodes(l: Live): RibbonNode[] {
   const t = l.team!;
   const runs = Object.values(l.agents).filter((a) => a.role === "agent");
+  // 병렬 작업은 나눈 하위 작업 수만큼만 돈다.
+  const total = l.work && Object.keys(l.parts).length ? Object.keys(l.parts).length : t.agents.length;
   const done = runs.filter((a) => a.state !== "run").length;
   const ok = runs.filter((a) => a.state === "ok").length;
-  const state: NodeState = runs.length === 0 ? "wait" : done < t.agents.length ? "run" : ok ? "ok" : "fail";
+  const state: NodeState = runs.length === 0 ? "wait" : done < total ? "run" : ok ? "ok" : "fail";
+  const synth = Object.values(l.agents).find((a) => a.role === "synth");
+  const plan = Object.values(l.agents).find((a) => a.role === "plan");
+  const out: RibbonNode[] = [];
+  if (l.work) out.push({ key: "plan", kind: "plan", title: ENGINE_LABEL[t.synth], sub: ROLE_LABEL.plan, state: plan ? plan.state : "wait" });
+  out.push({ key: "team", kind: "agent", title: l.work ? workTitle(total) : agentsTitle(total), sub: `${ok}/${total} · ${t.agents.map((a) => ENGINE_LABEL[a.engine]).filter((v, i, x) => x.indexOf(v) === i).join(" · ")}`, state });
+  out.push({ key: "synth", kind: "synth", title: ENGINE_LABEL[t.synth], sub: l.work ? INTEGRATE : ROLE_LABEL.synth, state: synth ? (synth.state === "run" ? "run" : synth.state) : "wait" });
+  return out;
+}
+
+/** 진행 중인 회의: 실행 key "council:참가자:라운드"에서 라운드와 상태를 읽는다. */
+function councilRuns(l: Live) {
+  return Object.values(l.agents)
+    .filter((a) => a.role === "council")
+    .map((a) => {
+      const [, idx, round] = a.key.split(":");
+      return { ...a, idx: Number(idx), round: Number(round) };
+    });
+}
+
+function councilNodes(l: Live): RibbonNode[] {
+  const c = l.council!;
+  const runs = councilRuns(l);
+  const round = Math.max(0, ...runs.map((r) => r.round));
+  const now = runs.filter((r) => r.round === round);
+  const state: NodeState = runs.length === 0 ? "wait" : now.some((r) => r.state === "run") ? "run" : now.some((r) => r.state === "ok") ? "ok" : "fail";
   const synth = Object.values(l.agents).find((a) => a.role === "synth");
   return [
-    { key: "team", kind: "agent", title: agentsTitle(t.agents.length), sub: `${ok}/${t.agents.length} · ${t.agents.map((a) => ENGINE_LABEL[a.engine]).filter((v, i, x) => x.indexOf(v) === i).join(" · ")}`, state },
-    { key: "synth", kind: "synth", title: ENGINE_LABEL[t.synth], sub: ROLE_LABEL.synth, state: synth ? (synth.state === "run" ? "run" : synth.state) : "wait" },
+    { key: "council", kind: "council", title: councilTitle(c.agents.length), sub: roundOf(Math.max(round, 1), c.rounds), state },
+    { key: "synth", kind: "synth", title: ENGINE_LABEL[c.synth], sub: ROLE_LABEL.synth, state: synth ? (synth.state === "run" ? "run" : synth.state) : "wait" },
   ];
+}
+
+interface CouncilSeat {
+  engine: EngineId;
+  model: string | null;
+  turns: { round: number; text: string; state: "run" | "ok" | "fail" }[];
+}
+
+/** 회의 창: 참가 AI마다 창 하나. 라운드마다 무엇을 말했는지(진행 중이면 흐르는 글) 보여 준다. */
+function CouncilWindows({ seats, max }: { seats: CouncilSeat[]; max: number }) {
+  return (
+    <div className="council-grid" style={{ "--n": seats.length } as CSSProperties}>
+      {seats.map((seat, i) => {
+        const last = seat.turns[seat.turns.length - 1];
+        const state = last?.state ?? "wait";
+        return (
+          <section key={i} className={`council-win ${state}`} style={{ "--i": i } as CSSProperties} aria-label={`${i + 1} · ${ENGINE_LABEL[seat.engine]}`}>
+            <header className="council-bar">
+              <span className="council-dots" aria-hidden>
+                <i />
+                <i />
+                <i />
+              </span>
+              <b>
+                {i + 1} · {ENGINE_LABEL[seat.engine]}
+              </b>
+              {seat.model && <em>{seat.model}</em>}
+              <span className={`council-state ${state}`}>{last ? roundOf(last.round, max) : "…"}</span>
+            </header>
+            <div className="council-body">
+              {seat.turns.length === 0 && (
+                <div className="typing" aria-hidden>
+                  <i />
+                  <i />
+                  <i />
+                </div>
+              )}
+              {seat.turns.map((t) => (
+                <div key={t.round} className={`council-turn ${t.state}`}>
+                  <div className="council-round">R{t.round}</div>
+                  {t.text ? (
+                    <Markdown text={t.text} />
+                  ) : t.state === "run" ? (
+                    <div className="typing" aria-hidden>
+                      <i />
+                      <i />
+                      <i />
+                    </div>
+                  ) : (
+                    <div className="step-err">—</div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </section>
+        );
+      })}
+    </div>
+  );
+}
+
+function liveSeats(l: Live): CouncilSeat[] {
+  const runs = councilRuns(l);
+  return l.council!.agents.map((a, i) => ({
+    engine: a.engine,
+    model: a.model,
+    turns: runs
+      .filter((r) => r.idx === i)
+      .sort((x, y) => x.round - y.round)
+      .map((r) => ({ round: r.round, state: r.state, text: (l.streams[r.key] ?? "").replace(AGREE_LINE, "") })),
+  }));
+}
+
+function savedSeats(c: NonNullable<MessageData["council"]>): CouncilSeat[] {
+  return c.agents.map((a, i) => ({
+    engine: a.engine,
+    model: a.model,
+    turns: c.rounds
+      .filter((r: CouncilTurn) => r.idx === i)
+      .map((r: CouncilTurn) => ({ round: r.round, text: r.text, state: r.ok ? ("ok" as const) : ("fail" as const) })),
+  }));
 }
 
 function liveNodes(l: Live): RibbonNode[] {
@@ -137,6 +268,7 @@ function liveNodes(l: Live): RibbonNode[] {
   const j = jevNode(l.jev, l.budget);
   const t = tune(l.primary === "claude" || l.primary === "antigravity" ? l.model : null, l.effort);
   if (j) out.push(j);
+  if (l.council) return [...out, ...councilNodes(l)];
   if (l.team) return [...out, ...teamNodes(l)];
   if (l.debate) return [...out, ...debateNodes(l)];
   if (l.primary) {
@@ -149,7 +281,7 @@ function liveNodes(l: Live): RibbonNode[] {
 function Details({ data }: { data: MessageData }) {
   const [open, setOpen] = useState(false);
   const steps = data.steps ?? [];
-  const cost = steps.reduce((s, x) => s + (x.costUsd ?? 0), 0) + (data.jev?.costUsd ?? 0);
+  const cost = steps.reduce((s, x) => s + (x.costUsd ?? 0), 0) + (data.jev?.costUsd ?? 0) + (data.jevChecks ?? []).reduce((s, x) => s + x.costUsd, 0);
   const tokens = steps.reduce((s, x) => s + (x.inputTokens ?? 0) + (x.outputTokens ?? 0), 0);
   return (
     <div className="details">
@@ -185,15 +317,33 @@ function Details({ data }: { data: MessageData }) {
               {s.error && <div className="step-err">{s.error}</div>}
             </div>
           ))}
-          {data.team?.agents.filter((a) => a.text).map((a, i) => (
-            <details key={`t${i}`} className="draft">
-              <summary>
-                {agentAnswerTitle(i + 1)} · {ENGINE_LABEL[a.engine]}
-                {a.model ? ` · ${a.model}` : ""}
-              </summary>
-              <Markdown text={a.text} />
-            </details>
-          ))}
+          {data.team?.conflicts && data.team.conflicts.length > 0 && (
+            <div className="part-files">
+              <b>{CONFLICTS}</b>
+              {data.team.conflicts.map((f) => (
+                <code key={f}>{f}</code>
+              ))}
+            </div>
+          )}
+          {data.team?.agents.map((a, i) =>
+            a.text || (a.files && a.files.length) ? (
+              <details key={`t${i}`} className="draft">
+                <summary>
+                  {a.title ? partTitle(i + 1, a.title) : agentAnswerTitle(i + 1)} · {ENGINE_LABEL[a.engine]}
+                  {a.model ? ` · ${a.model}` : ""}
+                </summary>
+                {a.files && a.files.length > 0 && (
+                  <div className="part-files">
+                    <b>{CHANGED}</b>
+                    {a.files.map((f) => (
+                      <code key={f}>{f}</code>
+                    ))}
+                  </div>
+                )}
+                {a.text && <Markdown text={a.text} />}
+              </details>
+            ) : null,
+          )}
           {data.debate?.rounds.filter((r) => r.text).map((r, i) => (
             <details key={i} className="draft">
               <summary>
@@ -264,7 +414,8 @@ function Card({ ex, live, approvals, index }: { ex: Exchange; live?: Live; appro
   const a = ex.answer;
   const data = a?.data ?? null;
   const failed = !!a && a.content.startsWith("⚠");
-  const nodes = live ? liveNodes(live) : data ? [jevNode(data.jev, data.budget), ...stepNodes(data.steps ?? [])].filter((n): n is RibbonNode => !!n) : [];
+  const nodes = live ? liveNodes(live) : data ? [jevNode(data.jev, data.budget), ...stepNodes(data.steps ?? [], data.council, !!data.team?.work)].filter((n): n is RibbonNode => !!n) : [];
+  const council = !!(live?.council ?? data?.council ?? ex.user?.data?.askedCouncil);
   const work = live?.work ?? data?.work ?? ex.user?.data?.work;
   const build = !!ex.user?.data?.build;
   const skill = live?.skill ?? data?.skill;
@@ -284,10 +435,24 @@ function Card({ ex, live, approvals, index }: { ex: Exchange; live?: Live; appro
                 <WrenchIcon /> {build ? "만들기" : "작업"}
               </span>
             )}
+            {council && (
+              <span className="tag council">
+                <CouncilIcon size={12} /> {ROLE_LABEL.council}
+              </span>
+            )}
           </div>
         </header>
       )}
       <Ribbon nodes={nodes} />
+      {live?.council && <CouncilWindows seats={liveSeats(live)} max={live.council.rounds} />}
+      {!live && data?.council && (
+        <details className="council-log">
+          <summary>
+            <CouncilIcon size={14} /> 회의 대화 기록 보기
+          </summary>
+          <CouncilWindows seats={savedSeats(data.council)} max={data.council.maxRounds} />
+        </details>
+      )}
       {approvals.map((ap) => (
         <ApprovalView key={ap.id} a={ap} />
       ))}

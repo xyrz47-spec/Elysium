@@ -20,8 +20,6 @@ pub struct Api {
     pub default_model: &'static str,
     pub secret: SecretName,
     pub key_hint: &'static str,
-    /// USD / 1M 토큰(입력, 출력). 모르면 None(비용 표시 안 함).
-    pub price: Option<(f64, f64)>,
     /// OpenAI 호환 `reasoning_effort`를 받는지
     pub reasoning: bool,
 }
@@ -35,7 +33,6 @@ pub fn api(e: EngineId) -> Option<Api> {
             default_model: "claude-sonnet-5-5",
             secret: SecretName::Anthropic,
             key_hint: "console.anthropic.com에서 발급(sk-ant-…)",
-            price: Some((3.0, 15.0)),
             reasoning: false,
         },
         EngineId::OpenAi => Api {
@@ -44,7 +41,6 @@ pub fn api(e: EngineId) -> Option<Api> {
             default_model: "gpt-5",
             secret: SecretName::OpenAi,
             key_hint: "platform.openai.com에서 발급(sk-…)",
-            price: Some((2.5, 10.0)),
             reasoning: true,
         },
         EngineId::GeminiApi => Api {
@@ -53,7 +49,6 @@ pub fn api(e: EngineId) -> Option<Api> {
             default_model: "gemini-2.5-flash",
             secret: SecretName::Gemini,
             key_hint: "aistudio.google.com에서 발급",
-            price: Some((0.10, 0.40)),
             reasoning: true,
         },
         EngineId::Nvidia => Api {
@@ -63,7 +58,6 @@ pub fn api(e: EngineId) -> Option<Api> {
             default_model: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
             secret: SecretName::Nvidia,
             key_hint: "build.nvidia.com에서 무료 발급(nvapi-…, 체험 크레딧·분당 약 40회)",
-            price: Some((0.0, 0.0)),
             reasoning: false,
         },
         _ => return None,

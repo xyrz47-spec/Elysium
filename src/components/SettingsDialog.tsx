@@ -244,7 +244,7 @@ export default function SettingsDialog() {
           <label className="toggle-row">
             <span>
               JEV로 판단하기
-              <small>요청의 종류(코드·글쓰기·조사·분석·대화·번역)와 난이도를 판단해 어느 AI가 답하고 검토할지 정하고, 세션 기억(요약·최근 대화) 중 지금 요청에 필요한 부분만 골라 AI에 전달해 토큰을 아낍니다. (1M 입력 토큰당 $0.042)</small>
+              <small>질문 난이도와 필요한 도구를 미리 판단해 최적의 모델을 선택하고 작업 과정을 조율합니다. 불필요한 검토 단계와 세션 메모리를 생략하여 토큰 소모를 크게 절약합니다. (1M 입력 토큰당 $0.042)</small>
             </span>
             <input type="checkbox" className="switch" role="switch" checked={settings.jevEnabled} onChange={(e) => saveSettings({ ...settings, jevEnabled: e.target.checked })} />
           </label>

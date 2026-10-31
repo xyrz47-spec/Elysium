@@ -1,6 +1,5 @@
 # Elysium
 
-<<<<<<< HEAD
 여러 AI(CLI: Claude Code·Codex·Antigravity, API: Claude·OpenAI·Gemini·NVIDIA)를 엮어 완성도 높은 답과 결과를 내는 데스크톱 AI 클라이언트입니다(Tauri 2 + Rust + React/TS, Windows 11).
 2026-10-17에 JARVIS에서 방향을 바꿨습니다. 음성·로컬 LLM 기능과 예전 코드·모델은 정리했습니다(2026-10-17 휴지통으로 이동).
 
@@ -177,8 +176,3 @@ CLI(확인·다시 찾기), API 키(저장·지우기·모델·확인), JEV(켜�
 - API: Claude·OpenAI·Gemini는 키가 없어 실제 호출을 확인하지 못했습니다. NVIDIA는 사용자 키로 `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning`(기본, 실제 대화 확인·첫 호출 2~23초·가끔 503 과부하)과 `deepseek-ai/deepseek-v4.1-flash` 호출을 확인했습니다. 처음 저장된 키는 403이었고 다시 넣은 키는 정상, Gemma 4·Nemotron 3.5는 30초 안에 응답이 없었고 Nemotron 3 Ultra(`Function id … not found` 404, 같은 키·주소로 다른 모델은 정상이라 NVIDIA 쪽 문제로 보임)·Kimi K2.6은 이 계정에서 404였습니다. 거절된(401·403) API는 키를 다시 넣을 때까지 자동 선택에서 빠집니다.
 - 예전 JARVIS의 `%USERPROFILE%\.jarvis-models`(17GB), `com.hoya.jarvis` 앱 데이터, `_archive`는 2026-10-17 휴지통으로 옮겼습니다.
 - 프로젝트 폴더 이름은 아직 `Desktop\JARVIS`입니다.
-#   E l y s i u m  
- 
-=======
-README안써
->>>>>>> refs/remotes/origin/main

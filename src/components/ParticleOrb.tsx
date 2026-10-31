@@ -200,7 +200,7 @@ export default function ParticleOrb({ mode }: { mode: OrbMode }) {
 
     let dpr = 1;
     const fit = () => {
-      dpr = Math.min(window.devicePixelRatio || 1, 2);
+      dpr = Math.min(window.devicePixelRatio || 1, 1.5);
       canvas.width = Math.round(canvas.clientWidth * dpr);
       canvas.height = Math.round(canvas.clientHeight * dpr);
       gl.viewport(0, 0, canvas.width, canvas.height);
@@ -217,10 +217,25 @@ export default function ParticleOrb({ mode }: { mode: OrbMode }) {
     const t0 = performance.now();
     let last = t0;
     let raf = 0;
-    const ease = (x: number, y: number, k: number) => x + (y - x) * k;
+    let frame = 0;
+    let to = { ...at };
+    let steps = 1;
+    let tick = t0;
+    let acc = 0;
+    let glowKey = "";
+    // 60fps 기준 계수를 실제 프레임 간격에 맞춘다(30fps로 그려도 같은 속도로 따라간다).
+    const ease = (x: number, y: number, k: number) => x + (y - x) * (1 - Math.pow(1 - k, steps));
 
     const draw = (now: number) => {
+      raf = requestAnimationFrame(draw);
+      // 고주사율 화면에서도 60fps, 대화 화면(구가 옅을 때)에서는 30fps면 충분하다. 뒤가 덜 바뀌면 유리 판의 backdrop-filter도 덜 다시 계산된다.
+      const budget = at.dim < 0.5 && modeRef.current !== "thinking" ? 1000 / 30 : 1000 / 60;
+      acc += now - tick;
+      tick = now;
+      if (acc < budget - 1) return;
+      acc = Math.min(acc - budget, budget);
       const dt = Math.min(0.05, (now - last) / 1000);
+      steps = dt * 60;
       last = now;
       const t = (now - t0) / 1000;
       const m = modeRef.current;
@@ -237,15 +252,22 @@ export default function ParticleOrb({ mode }: { mode: OrbMode }) {
       rot += cur.spin * dt * (reduce.matches ? 0.25 : 1);
 
       // 첫 화면 ↔ 대화 화면 사이를 미끄러지듯 옮겨 간다.
-      const to = target(dpr);
+      // 위치는 여섯 프레임에 한 번만 잰다(매 프레임 강제 레이아웃 방지). 사이는 보간이 메운다.
+      if (frame++ % 6 === 0) to = target(dpr);
       at.x = ease(at.x, to.x, 0.07);
       at.y = ease(at.y, to.y, 0.07);
       at.radius = ease(at.radius, to.radius, 0.07);
       at.dim = ease(at.dim, to.dim, 0.05);
       const glow = glowRef.current;
       if (glow) {
-        glow.style.transform = `translate(${at.x / dpr}px, ${at.y / dpr}px) translate(-50%, -50%) scale(${Math.max(0.2, at.radius / dpr / 160)})`;
-        glow.style.opacity = String(0.35 + at.dim * 0.65);
+        const tf = `translate(${(at.x / dpr).toFixed(1)}px, ${(at.y / dpr).toFixed(1)}px) translate(-50%, -50%) scale(${Math.max(0.2, at.radius / dpr / 160).toFixed(3)})`;
+        const op = (0.35 + at.dim * 0.65).toFixed(2);
+        // 자리 잡은 뒤에는 스타일을 다시 쓰지 않는다.
+        if (tf + op !== glowKey) {
+          glowKey = tf + op;
+          glow.style.transform = tf;
+          glow.style.opacity = op;
+        }
       }
 
       // 다크는 빛이 겹치며 밝아지는 가산 합성, 화이트는 일반 합성(가산은 흰 바탕에서 사라진다)
@@ -269,11 +291,22 @@ export default function ParticleOrb({ mode }: { mode: OrbMode }) {
       gl.uniform3fv(u.a, cur.a.map((v) => v * (light ? 0.34 : 1)));
       gl.uniform3fv(u.b, cur.b.map((v) => v * (light ? 0.62 : 1)));
       gl.drawArrays(gl.POINTS, 0, geo.n);
-      raf = requestAnimationFrame(draw);
     };
     raf = requestAnimationFrame(draw);
+    // 창을 내리거나 가리면 멈춘다.
+    const onVis = () => {
+      cancelAnimationFrame(raf);
+      raf = 0;
+      if (!document.hidden) {
+        last = tick = performance.now();
+        acc = 0;
+        raf = requestAnimationFrame(draw);
+      }
+    };
+    document.addEventListener("visibilitychange", onVis);
     return () => {
       cancelAnimationFrame(raf);
+      document.removeEventListener("visibilitychange", onVis);
       // 개발 모드(StrictMode)는 같은 캔버스로 다시 마운트하므로 컨텍스트를 버리지 않는다.
       ro.disconnect();
     };

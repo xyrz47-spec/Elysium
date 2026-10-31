@@ -12,6 +12,7 @@ import Composer from "./components/Composer";
 import SettingsDialog from "./components/SettingsDialog";
 import SkillsDialog from "./components/SkillsDialog";
 import { FolderIcon } from "./components/Icons";
+import { GlassDefs, useGlassLight, useLiquidRefraction } from "./lib/glass";
 
 /** 세션 머리: 제목과 이 세션의 작업 폴더(눌러서 바꾸기) */
 function SessionHead() {
@@ -51,6 +52,8 @@ function loadPanel(): boolean {
 
 export default function App() {
   const { dialog, setDialog, toasts, openConversation, engines, live, approvals } = useApp();
+  useGlassLight();
+  useLiquidRefraction();
   const [draft, setDraft] = useState<string | null>(null);
   const clearDraft = useCallback(() => setDraft(null), []);
   const [panel, setPanel] = useState(loadPanel);
@@ -105,6 +108,7 @@ export default function App() {
 
   return (
     <div className={`app ${panel ? "panel-open" : ""}`}>
+      <GlassDefs />
       <ParticleOrb mode={orb} />
       <Dock panelOpen={panel} onTogglePanel={togglePanel} />
       <SessionPanel

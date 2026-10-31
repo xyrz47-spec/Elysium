@@ -131,6 +131,9 @@ function DailyBars({ days }: { days: UsageSummary["days"] }) {
 }
 
 /** 토큰 단가표 및 실시간 비용 계산기 컴포넌트 */
+/** 1M 토큰당 단가: 아주 싼 값(캐시 읽기 $0.005 등)도 0으로 보이지 않게 자릿수를 늘린다. */
+const perM = (v: number) => `$${v < 0.1 ? v.toFixed(3) : v.toFixed(2)}`;
+
 function PricingView({
   pricingList,
   onSelectModel,
@@ -184,7 +187,7 @@ function PricingView({
               <th>모델명</th>
               <th>입력 (1M)</th>
               <th>출력 (1M)</th>
-              <th>1k 환산 (입/출)</th>
+              <th>캐시 입력 (1M)</th>
               <th>설명</th>
             </tr>
           </thead>
@@ -210,11 +213,9 @@ function PricingView({
                   <td>
                     <code className="model-code">{p.displayName}</code>
                   </td>
-                  <td className="cost-num">{p.inputUsdPerM === 0 ? "무료 ($0)" : `$${p.inputUsdPerM.toFixed(2)}`}</td>
-                  <td className="cost-num">{p.outputUsdPerM === 0 ? "무료 ($0)" : `$${p.outputUsdPerM.toFixed(2)}`}</td>
-                  <td className="cost-sub">
-                    ${(p.inputUsdPerM / 1000).toFixed(4)} / ${(p.outputUsdPerM / 1000).toFixed(4)}
-                  </td>
+                  <td className="cost-num">{p.inputUsdPerM === 0 ? "무료 ($0)" : perM(p.inputUsdPerM)}</td>
+                  <td className="cost-num">{p.outputUsdPerM === 0 ? "무료 ($0)" : perM(p.outputUsdPerM)}</td>
+                  <td className="cost-sub">{p.cachedUsdPerM == null || p.inputUsdPerM === 0 ? "—" : perM(p.cachedUsdPerM)}</td>
                   <td>
                     <small className="price-desc">{p.description}</small>
                   </td>

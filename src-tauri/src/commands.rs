@@ -80,9 +80,18 @@ pub fn secret_shape(name: String) -> AppResult<secrets::SecretShape> {
 
 /// 키를 저장하고 API 엔진 목록(키 있음 여부)을 다시 만든다. 값은 화면으로 돌려주지 않는다.
 #[tauri::command]
-pub async fn secret_set(st: S<'_>, name: String, value: String) -> AppResult<Vec<EngineInfo>> {
-    secrets::set(SecretName::parse(&name)?, &value)?;
+pub async fn secret_set(app: AppHandle, st: S<'_>, name: String, value: String) -> AppResult<Vec<EngineInfo>> {
+    let which = SecretName::parse(&name)?;
+    secrets::set(which, &value)?;
     audit::record(&st.db, "user", "secret.set", "ok", json!({ "name": name }));
+    // TypeSafe 키를 넣었다는 것은 JEV를 쓰겠다는 뜻이다: 따로 켜지 않아도 바로 쓰게 한다.
+    if which == SecretName::TypeSafe && !st.settings().jev_enabled {
+        let s = Settings { jev_enabled: true, ..st.settings() };
+        settings::save(&st.db, &s)?;
+        *st.settings.write().unwrap_or_else(|p| p.into_inner()) = s;
+        audit::record(&st.db, "user", "settings.updated", "ok", json!({ "jev": true, "by": "secret.set" }));
+        let _ = app.emit("settings:changed", ());
+    }
     engines_refresh(st).await
 }
 
@@ -132,12 +141,13 @@ pub fn conversation_delete(st: S, conversation_id: String) -> AppResult<()> {
 
 /// engine: "auto"(또는 없음) | "claude" | "codex" | "antigravity". work: 파일 수정 허용(승인 후).
 /// build: '만들기' 버튼. 누른 것이 곧 허락이라 승인 없이 폴더 안에서 끝까지 완성한다.
+/// council: '회의' 버튼. 여러 AI가 라운드마다 서로의 발언을 읽고 대화하며 푼다(대화 모드).
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-pub fn chat_send(app: AppHandle, st: S, conversation_id: Option<String>, text: String, engine: Option<String>, work: Option<bool>, build: Option<bool>, workspace: Option<String>) -> AppResult<SendResult> {
+pub fn chat_send(app: AppHandle, st: S, conversation_id: Option<String>, text: String, engine: Option<String>, work: Option<bool>, build: Option<bool>, workspace: Option<String>, council: Option<bool>) -> AppResult<SendResult> {
     let choice = engine.as_deref().filter(|e| *e != "auto").map(|e| EngineId::parse(e).ok_or_else(|| AppError::msg(format!("알 수 없는 엔진: {e}")))).transpose()?;
     let workspace = workspace.filter(|w| !w.trim().is_empty()).map(|w| checked_dir(&w)).transpose()?;
-    orchestrator::send(&app, st.inner(), conversation_id, text, choice, work.unwrap_or(false), build.unwrap_or(false), workspace).map_err(AppError::msg)
+    orchestrator::send(&app, st.inner(), conversation_id, text, choice, work.unwrap_or(false), build.unwrap_or(false), workspace, council.unwrap_or(false)).map_err(AppError::msg)
 }
 
 /// 있는 폴더만 작업 폴더로 쓸 수 있다.
@@ -175,6 +185,12 @@ pub fn task_cancel(st: S, task_id: String) -> bool {
         }
         None => false,
     }
+}
+
+/// 실행 중인 에이전트 하나만 멈춘다(같은 작업의 다른 에이전트는 계속 돈다).
+#[tauri::command]
+pub fn agent_cancel(st: S, task_id: String, key: String) -> bool {
+    orchestrator::cancel_agent(&st, &task_id, &key)
 }
 
 /// 작업 중에 보내는 메시지. API 작업 모드가 다음 차례에 읽는다. 받지 않는 AI면 오류를 돌려준다.

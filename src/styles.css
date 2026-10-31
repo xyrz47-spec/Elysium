@@ -722,3 +722,196 @@ input[type="text"].rail-search { height: 36px; margin-top: 10px; }
   .calc-res-breakdown { justify-content: flex-start; }
   .pricing-guide-cards { grid-template-columns: 1fr; }
 }
+
+/* 회의: 참가 AI마다 창 하나(라운드별 발언). 진행 중인 창은 테두리가 흐른다. */
+.council-btn { flex: none; display: inline-flex; align-items: center; gap: 6px; height: 38px; padding: 0 14px 0 11px; border-radius: 999px; background: var(--surface-2); color: var(--ink); border: 1px solid var(--line-2); font-size: 13.5px; font-weight: 600; white-space: nowrap; transition: transform 0.3s var(--spring), border-color 0.2s, color 0.2s; }
+.council-btn:hover:not(:disabled) { transform: translateY(-1px); border-color: var(--accent-2); color: var(--accent); }
+.council-btn:active:not(:disabled) { transform: scale(0.94); }
+.council-btn:disabled { opacity: 0.45; cursor: default; }
+.tag.council { color: var(--accent); background: rgba(var(--accent-rgb), 0.1); border-color: transparent; }
+.ribbon-node.council .ribbon-dot { background: conic-gradient(var(--accent), var(--accent-2), var(--hl), var(--accent)); }
+.ribbon-node.council.run .ribbon-dot { animation: spin 1.6s linear infinite; }
+.council-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 230px), 1fr)); gap: 10px; padding: 8px 20px 4px; }
+.council-win { display: flex; flex-direction: column; min-width: 0; max-height: 340px; border-radius: 14px; background: var(--card); border: 1px solid var(--line); overflow: hidden; animation: pop 0.45s var(--spring) both; animation-delay: calc(var(--i, 0) * 70ms); transition: border-color 0.3s, box-shadow 0.3s; }
+.council-win.run { border-color: rgba(var(--accent-rgb), 0.55); box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.12); }
+.council-win.fail { border-color: var(--line); opacity: 0.75; }
+.council-bar { display: flex; align-items: center; gap: 7px; padding: 7px 10px; border-bottom: 1px solid var(--line); background: var(--surface-2); font-size: 12px; min-width: 0; }
+.council-bar b { font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.council-bar em { font-style: normal; font-family: var(--mono); font-size: 10.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.council-dots { display: inline-flex; gap: 4px; flex: none; }
+.council-dots i { width: 7px; height: 7px; border-radius: 50%; background: var(--line-2); }
+.council-win.run .council-dots i:first-child { background: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
+.council-win.ok .council-dots i:first-child { background: var(--accent); }
+.council-state { margin-left: auto; flex: none; font-family: var(--mono); font-size: 10.5px; color: var(--muted); }
+.council-state.run { color: var(--accent); }
+.council-body { flex: 1; overflow-y: auto; padding: 4px 11px 10px; font-size: 12.5px; scrollbar-width: thin; }
+.council-body .md { font-size: 12.5px; }
+.council-turn { padding-top: 8px; animation: fade 0.3s ease both; }
+.council-turn + .council-turn { border-top: 1px dashed var(--line); margin-top: 8px; }
+.council-round { display: inline-block; margin-bottom: 2px; padding: 0 6px; border-radius: 6px; font-family: var(--mono); font-size: 10px; color: var(--accent); background: rgba(var(--accent-rgb), 0.1); }
+.council-log { margin: 6px 20px 0; }
+.council-log > summary { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; font-size: 12.5px; color: var(--muted); list-style: none; }
+.council-log > summary::-webkit-details-marker { display: none; }
+.council-log > summary:hover { color: var(--ink); }
+.council-log .council-grid { padding: 8px 0 4px; }
+@media (max-width: 640px) {
+  .council-grid { padding: 8px 14px 4px; }
+  .council-log { margin: 6px 14px 0; }
+  .council-btn { padding: 0 11px; }
+}
+
+/* ── 리퀴드 글라스(2026-10-31) ──────────────────────────────
+   모든 판은 뒤(입자·빛 덩어리)가 비치는 유리다. 테두리는 빛이 맺히는 가장자리(::before),
+   포인터가 지나는 곳에는 반사광(::after)이 따라온다. 도크·입력창·칩은 가장자리에서 뒤를 굴절시킨다(--lg-filter, glass.tsx). */
+.app::before { content: ""; position: fixed; inset: -18vmax; z-index: 0; pointer-events: none; background: radial-gradient(36vmax 28vmax at 18% 22%, var(--glass-blob-1), transparent 70%), radial-gradient(32vmax 26vmax at 84% 30%, var(--glass-blob-2), transparent 70%), radial-gradient(40vmax 30vmax at 52% 92%, var(--glass-blob-3), transparent 70%); animation: liquid-drift 40s ease-in-out infinite alternate; will-change: transform; }
+@keyframes liquid-drift { 50% { transform: translate(3vmax, -2vmax) rotate(7deg) scale(1.05); } 100% { transform: translate(-2vmax, 2vmax) rotate(-5deg) scale(0.97); } }
+.glass-defs { position: absolute; width: 0; height: 0; overflow: hidden; pointer-events: none; }
+
+/* 유리 안의 작은 판·칸은 불투명한 회색 대신 옅은 유리를 쓴다 */
+.main, .dock, .panel-inner, .tools-inner, .modal, .menu, .slash-menu, .mem-pop { --card: var(--glass-ctl-hi); --surface: var(--glass-ctl); --surface-2: var(--glass-ctl); }
+
+/* 판 */
+.dock, .composer, .welcome-cards button { background: var(--glass-sheen), var(--glass); }
+/* 내용 층(카드·작업·회의 창·허락 요청)은 유리가 아니다(애플 규칙). 뒤를 실시간으로 흐리지 않아 스크롤·스트리밍이 가볍다. */
+.card, .agent-task, .council-win, .approval { background: var(--content); }
+.panel-inner, .tools-inner, .modal, .menu, .slash-menu, .mem-pop, .toast { background: var(--glass-sheen), var(--glass-2); }
+.dock, .composer, .welcome-cards button { -webkit-backdrop-filter: var(--glass-blur); backdrop-filter: var(--glass-blur); box-shadow: var(--glass-inner), var(--glass-shadow); }
+.card, .agent-task, .council-win, .approval { -webkit-backdrop-filter: none; backdrop-filter: none; box-shadow: var(--content-shadow); }
+.dock, .card, .composer, .agent-task, .council-win, .approval, .panel-inner, .tools-inner, .modal, .menu, .slash-menu, .mem-pop { border-color: transparent; }
+.panel-inner, .tools-inner, .composer, .modal, .agent-task, .council-win, .approval { position: relative; }
+.agent-task, .council-win { box-shadow: var(--glass-inner), 0 6px 18px rgba(var(--shade-rgb), 0.12); }
+.welcome-cards button { border-color: rgba(255, 255, 255, 0.12); }
+:root[data-theme="light"] .welcome-cards button { border-color: rgba(255, 255, 255, 0.8); }
+.toast { border-top-color: rgba(255, 255, 255, 0.14); border-right-color: rgba(255, 255, 255, 0.14); border-bottom-color: rgba(255, 255, 255, 0.14); }
+
+/* 가장자리: 왼쪽 위와 오른쪽 아래에 빛이 맺히는 1px 테 */
+.dock::before, .card::before, .composer::before, .agent-task::before, .council-win::before, .approval::before, .panel-inner::before, .tools-inner::before, .modal::before, .menu::before, .slash-menu::before, .mem-pop::before { content: ""; position: absolute; inset: -1px; border-radius: inherit; padding: 1px; pointer-events: none; background: var(--glass-rim); -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite: xor; mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0); }
+/* 반사광: 포인터 위치(--mx, --my)를 따라 움직인다 */
+.dock::after, .composer::after, .head-folder::after { content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none; opacity: 0; background: radial-gradient(240px circle at var(--mx, 50%) var(--my, -30%), var(--glass-spec), transparent 62%); transition: opacity 0.4s var(--ease); }
+.dock:hover::after, .composer:hover::after, .composer:focus-within::after, .head-folder:hover::after { opacity: 1; }
+
+/* 진행 중인 카드: 가장자리를 따라 빛이 돈다 */
+.card.live { border: 1px solid transparent; background: var(--glass-sheen), var(--glass); animation: rise 0.5s var(--ease) both; }
+.card.live::before { padding: 1.5px; background: conic-gradient(from var(--angle), rgba(var(--accent-rgb), 0.95), rgba(255, 255, 255, 0.55), rgba(var(--hl-rgb), 0.9), rgba(var(--accent2-rgb), 0.8), rgba(var(--accent-rgb), 0.95)); animation: border-run 3s linear infinite; }
+.card-ask { background: linear-gradient(180deg, rgba(var(--accent2-rgb), 0.12), transparent); border-bottom-color: rgba(255, 255, 255, 0.06); }
+:root[data-theme="light"] .card-ask { border-bottom-color: rgba(20, 24, 30, 0.07); }
+
+/* 입력창: 강조 테두리는 가장자리 빛으로 */
+.composer, .composer.work { background: var(--glass-sheen), var(--glass); }
+.composer::before { padding: 1.5px; background: linear-gradient(135deg, rgba(var(--accent2-rgb), 0.8), rgba(255, 255, 255, 0.22) 38%, rgba(255, 255, 255, 0.05) 60%, rgba(var(--hl-rgb), 0.75)); }
+.composer.work::before { background: linear-gradient(135deg, rgba(var(--accent-rgb), 1), rgba(255, 255, 255, 0.3) 45%, rgba(var(--accent-rgb), 0.9)); }
+.composer:focus-within { box-shadow: var(--glass-inner), 0 24px 60px rgba(var(--accent-rgb), 0.24), 0 0 0 5px rgba(var(--accent2-rgb), 0.14); }
+
+/* 작은 컨트롤: 옅은 유리 + 위쪽 반사선 */
+.btn, .pill, .head-folder, .seg, .tabs, .tool-search, .send.quiet, .council-btn, .ribbon-node, input[type="text"], input[type="password"] { background-color: var(--glass-ctl); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.07); }
+:root[data-theme="light"] .btn, :root[data-theme="light"] .pill, :root[data-theme="light"] .head-folder, :root[data-theme="light"] .seg, :root[data-theme="light"] .tabs, :root[data-theme="light"] .tool-search, :root[data-theme="light"] .send.quiet, :root[data-theme="light"] .council-btn, :root[data-theme="light"] .ribbon-node { box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 1px 3px rgba(28, 40, 58, 0.06); }
+.btn:hover:not(:disabled), .pill:hover, .head-folder:hover, .council-btn:hover:not(:disabled) { background-color: var(--glass-ctl-hi); }
+.btn.ghost { background-color: transparent; box-shadow: none; }
+.btn.danger { background-color: rgba(var(--err-rgb), 0.07); }
+.btn.danger.solid { background-color: var(--err); }
+/* 고른 칸 뒤의 판은 물방울: 둥근 반사와 그림자 */
+.seg-thumb { background: var(--glass-ctl-hi); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45), inset 0 0 0 1px rgba(255, 255, 255, 0.1), 0 4px 14px rgba(var(--shade-rgb), 0.22); }
+:root[data-theme="light"] .seg-thumb { background: rgba(255, 255, 255, 0.55); box-shadow: inset 0 1px 0 #fff, 0 0 0 1px rgba(20, 24, 30, 0.05), 0 4px 12px rgba(28, 40, 58, 0.14); }
+/* 강조 버튼: 그라데이션 위에 유리 광택 */
+.send:not(.quiet):not(.stop):not(:disabled), .build-btn:not(:disabled), .new-session, .dock-btn.primary, .btn.primary { background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.36), rgba(255, 255, 255, 0) 55%), var(--grad); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.55), inset 0 -2px 6px rgba(0, 0, 0, 0.1), 0 8px 20px rgba(var(--accent-rgb), 0.32); }
+.switch::after { background: linear-gradient(180deg, #ffffff, #e9eef0); box-shadow: inset 0 1px 0 #fff, 0 2px 8px rgba(var(--shade-rgb), 0.3); }
+/* 눌렀다 놓으면 젤리처럼 튕긴다 */
+.btn:active:not(:disabled), .pill:active, .dock-btn:active, .send:active:not(:disabled), .build-btn:active:not(:disabled), .council-btn:active:not(:disabled) { transform: scale(0.94, 0.9); }
+
+/* 세션 목록·도구 패널 안의 칸 */
+.session { background: var(--glass-ctl); border-color: rgba(255, 255, 255, 0.04); }
+.session:hover, .session.on { background: var(--glass-ctl-hi); }
+.dock-btn:hover { background: var(--glass-ctl-hi); }
+.dock-btn[data-tip]::after { background: var(--glass-2); -webkit-backdrop-filter: var(--glass-blur); backdrop-filter: var(--glass-blur); border-color: rgba(255, 255, 255, 0.12); }
+.modal-back { background: rgba(var(--shade-rgb), 0.18); -webkit-backdrop-filter: blur(10px) saturate(1.3); backdrop-filter: blur(10px) saturate(1.3); }
+.details-body, .tool-stats div, .tool-mem, .mem-sum, .ustats div { background: var(--glass-ctl); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05); }
+
+/* ── 에이전트 관리(2026-10-31): 줄을 눌러 펼치고, 실행 중인 에이전트를 하나씩 멈춘다 ── */
+.agent-stop-all { margin-left: auto; height: 24px !important; padding: 0 9px !important; font-size: 11.5px; }
+.agent-task-head .tag { flex: none; }
+.agent-task-head b { flex: 1; min-width: 0; }
+.agent-progress { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; font-size: 11px; color: var(--dim); font-variant-numeric: tabular-nums; }
+.agent-progress i { display: block; height: 4px; border-radius: 4px; background: linear-gradient(90deg, var(--accent), var(--hl)) 0 0 / var(--w) 100% no-repeat, var(--glass-ctl-hi); transition: background-size 0.5s var(--ease); }
+.agent-run { display: grid; gap: 0; }
+.agent-row { display: flex; align-items: flex-start; gap: 4px; min-width: 0; }
+.agent-toggle { flex: 1; min-width: 0; display: flex; align-items: flex-start; gap: 8px; padding: 4px 6px; margin: -4px -6px; border: 0; border-radius: 10px; background: transparent; text-align: left; transition: background 0.2s; }
+.agent-toggle:hover { background: var(--glass-ctl); }
+.agent-toggle > svg { flex: none; margin-top: 4px; color: var(--dim); }
+.agent-stop { flex: none; width: 24px; height: 24px; display: grid; place-items: center; border: 0; border-radius: 8px; background: transparent; color: var(--dim); transition: background 0.2s, color 0.2s, transform 0.25s var(--spring); }
+.agent-stop svg { width: 13px; height: 13px; }
+.agent-stop:hover { background: rgba(var(--err-rgb), 0.12); color: var(--err); }
+.agent-stop:active { transform: scale(0.88); }
+.agent-detail { display: grid; gap: 8px; margin: 6px 0 2px 16px; padding: 8px 10px; border-radius: 12px; background: var(--glass-ctl); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05); animation: rise 0.3s var(--ease) both; min-width: 0; }
+.agent-block { display: grid; gap: 3px; min-width: 0; }
+.agent-block h5 { margin: 0; font-size: 10.5px; font-weight: 700; color: var(--muted); letter-spacing: 0.02em; }
+.agent-act.full { white-space: normal; overflow-wrap: anywhere; }
+.agent-files { display: flex; flex-wrap: wrap; gap: 4px; }
+.agent-files code, .part-files code { font-size: 10.5px; padding: 1px 6px; }
+.agent-out { margin: 0; max-height: 220px; overflow: auto; padding: 8px 10px; border-radius: 10px; background: rgba(var(--shade-rgb), 0.1); font-family: var(--mono); font-size: 11px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--muted); scrollbar-width: thin; }
+:root[data-theme="light"] .agent-out { background: rgba(255, 255, 255, 0.25); }
+.agent-run.fail .agent-state { background: rgba(var(--err-rgb), 0.1); }
+.ribbon-node.plan .ribbon-dot { background: conic-gradient(var(--c3), var(--accent), var(--c3)); }
+.ribbon-node.plan.ok .ribbon-dot { background: var(--grad-ai); }
+.part-files { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin: 8px 0 6px; font-size: 11.5px; }
+.part-files b { margin-right: 4px; color: var(--muted); font-size: 11.5px; }
+@media (prefers-reduced-motion: reduce) { .app::before { animation: none; } .dock::after, .card::after, .composer::after { transition: none; } }
+
+/* ── 애플식 리퀴드 글라스(2026-10-31 2차) ──────────────────────────────
+   늘 보이는 크롬(도크·입력창·머리 칩·카드)은 거의 맑은 유리: 블러를 줄이고 가장자리에서 뒤가 렌즈처럼 휜다(--lg-filter).
+   테두리는 얇고 밝은 반사선, 컨트롤은 캡슐 모양. 옆·위로 떠서 뜨는 창(세션·도구 패널, 모델 메뉴, 스킬 메뉴, 기억 창,
+   툴팁, 설정·사용량 창, 알림)은 불투명하게 해 내용이 바로 읽힌다. */
+
+/* 크롬: 맑은 유리 + 가장자리 굴절 */
+.dock, .composer, .head-folder, .welcome-cards button { -webkit-backdrop-filter: var(--lg-backdrop); backdrop-filter: var(--lg-backdrop); box-shadow: var(--lg-edge), var(--lg-drop); }
+.composer:focus-within { box-shadow: var(--lg-edge), 0 18px 48px rgba(var(--accent-rgb), 0.22), 0 0 0 4px rgba(var(--accent2-rgb), 0.12); }
+.head-folder { position: relative; background: var(--glass-sheen), var(--glass); border: 0; }
+/* 맑은 유리 위 글자는 뒤 배경과 섞이지 않게 아주 옅은 그림자 */
+:root:not([data-theme="light"]) .dock, :root:not([data-theme="light"]) .composer, :root:not([data-theme="light"]) .welcome-cards button, :root:not([data-theme="light"]) .session-head { text-shadow: 0 1px 2px rgba(0, 0, 0, 0.35); }
+:root[data-theme="light"] .composer, :root[data-theme="light"] .welcome-cards button { text-shadow: 0 0 8px rgba(255, 255, 255, 0.6); }
+.code-block, .code-block * { text-shadow: none; }
+/* 반사 테두리(::before)는 더 얇고 밝게 */
+.dock::before, .composer::before { opacity: 0.85; }
+.card::before, .agent-task::before, .council-win::before, .approval::before { opacity: 0.45; }
+
+/* 캡슐 모양과 같은 중심의 둥근 정도 */
+.dock { border-radius: 30px; }
+.composer { border-radius: 30px; }
+.card { border-radius: 26px; }
+.btn, .btn.sm, .seg, .seg button, .seg-thumb, .seg.tabs .seg-thumb, .tabs, .tabs button, .head-folder, .tool-search, .ribbon-node { border-radius: 999px; }
+.welcome-cards button { border-radius: 24px; }
+.btn:hover:not(:disabled), .pill:hover, .council-btn:hover:not(:disabled), .head-folder:hover { transform: translateY(-1px) scale(1.03); }
+
+/* ── 떠서 뜨는 창: 불투명 ── */
+.panel-inner, .tools-inner, .menu, .slash-menu, .mem-pop, .modal, .toast, .dock-btn[data-tip]::after { --card: var(--pop-card); --surface: var(--pop-surface); --surface-2: var(--pop-surface-2); --glass-ctl: var(--pop-surface-2); --glass-ctl-hi: var(--pop-card); background: var(--pop); -webkit-backdrop-filter: none; backdrop-filter: none; border: 1px solid var(--pop-line); text-shadow: none; }
+.panel-inner, .tools-inner, .modal { box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 24px 60px rgba(0, 0, 0, 0.45); }
+.menu, .slash-menu, .mem-pop, .toast, .dock-btn[data-tip]::after { box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 14px 36px rgba(0, 0, 0, 0.4); }
+:root[data-theme="light"] .panel-inner, :root[data-theme="light"] .tools-inner, :root[data-theme="light"] .modal { box-shadow: 0 24px 56px rgba(28, 40, 58, 0.2); }
+:root[data-theme="light"] .menu, :root[data-theme="light"] .slash-menu, :root[data-theme="light"] .mem-pop, :root[data-theme="light"] .toast, :root[data-theme="light"] .dock-btn[data-tip]::after { box-shadow: 0 12px 32px rgba(28, 40, 58, 0.18); }
+.toast { border-left: 4px solid var(--hl); }
+.panel-inner::before, .tools-inner::before, .modal::before, .menu::before, .slash-menu::before, .mem-pop::before { opacity: 0.35; }
+.panel-inner::after, .tools-inner::after, .modal::after { display: none; }
+.modal-back { background: rgba(var(--shade-rgb), 0.35); -webkit-backdrop-filter: blur(4px); backdrop-filter: blur(4px); }
+/* 불투명한 창 안의 칸·버튼 */
+.panel-inner .session, .tools-inner .agent-task { background: var(--pop-surface); text-shadow: none; }
+.panel-inner .session:hover, .panel-inner .session.on { background: var(--pop-surface-2); }
+.tools-inner .agent-task { box-shadow: inset 0 0 0 1px var(--pop-line); }
+.tools-inner .agent-task::before, .tools-inner .agent-task::after { display: none; }
+.menu .seg, .modal .seg, .tools-inner .seg, .panel-inner input[type="text"], .modal input[type="text"], .modal input[type="password"], .tools-inner .tool-search { background-color: var(--pop-surface-2); }
+
+/* 떠서 뜨는 창은 불투명이라 가장자리 반사선이 필요 없다. 스크롤되는 창 밖으로 1px 나간 반사선이 가로 스크롤바와
+   오른쪽 아래 하얀 모서리(스크롤바 교차점)를 만들던 것을 없앤다. */
+.modal::before, .menu::before, .slash-menu::before, .mem-pop::before, .panel-inner::before, .tools-inner::before { display: none; }
+.modal, .menu, .slash-menu, .mem-pop { overflow-x: hidden; }
+::-webkit-scrollbar-corner { background: transparent; }
+/* 카드·회의 창은 overflow: hidden이라 테두리 밖(-1px)에 그린 반사선이 잘린다: 안쪽에 그린다. */
+.card::before, .council-win::before { inset: 0; }
+
+/* ── 애플 리퀴드 글라스(2026-11-01 3차): 누름·반응 ──────────────────────────────
+   유리 컨트롤은 누르면 젤리처럼 살짝 커지고 안쪽에서 빛난다(iOS 26). 손을 떼면 스프링으로 돌아온다. */
+.dock, .composer, .head-folder, .welcome-cards button { transition: transform 0.45s var(--spring), box-shadow 0.3s var(--ease); isolation: isolate; }
+.head-folder:active, .welcome-cards button:active { transform: scale(1.06); transition-duration: 0.18s; }
+.head-folder:active::after, .composer:active::after { opacity: 1; background: radial-gradient(160px circle at var(--mx, 50%) var(--my, 50%), var(--glass-press), transparent 70%); }
+.dock-btn { transition: background 0.2s, color 0.2s, transform 0.45s var(--spring); }
+.dock-btn:active { transform: scale(1.14); transition-duration: 0.15s; background: var(--glass-ctl-hi); box-shadow: inset 0 0 12px var(--glass-press); }
+.welcome-cards button:hover { transform: translateY(-2px) scale(1.015); }
+@media (prefers-reduced-motion: reduce) { .head-folder:active, .welcome-cards button:active, .dock-btn:active { transform: none; } }

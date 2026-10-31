@@ -10,6 +10,7 @@ use crate::settings::{ReviewMode, Settings};
 use crate::skills::{self, Catalog, Skill};
 use crate::memory;
 use crate::store;
+use crate::teamwork;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -27,6 +28,8 @@ pub struct AppState {
     pub settings: RwLock<Settings>,
     pub engines: RwLock<Vec<EngineInfo>>,
     pub tasks: Mutex<HashMap<String, CancellationToken>>,
+    /// 실행 중인 에이전트 하나하나("작업 번호/실행 key" → 작업 토큰의 자식). 에이전트 탭에서 하나만 멈출 수 있다.
+    pub agents: Mutex<HashMap<String, CancellationToken>>,
     /// 작업 중 메시지 칸(작업 번호 → 칸). 작업이 끝나면 지운다.
     pub steers: Mutex<HashMap<String, Steer>>,
     pub approvals: Mutex<HashMap<String, oneshot::Sender<bool>>>,
@@ -92,6 +95,20 @@ pub struct Plan {
     pub models: Vec<(EngineId, String)>,
     /// 동시 에이전트: 여러 AI가 같은 요청에 동시에 따로 답하고 종합 AI가 하나로 정리한다(검토·토론 대신).
     pub team: Option<Team>,
+    /// 회의: 여러 AI가 여러 라운드 동안 서로의 발언을 읽고 대화하며 푼다(동시 에이전트·토론·검토 대신).
+    pub council: Option<Council>,
+    /// 동시 에이전트를 정하며 남긴 이유(회의로 바뀌면 지운다)
+    pub team_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Council {
+    pub agents: Vec<TeamAgent>,
+    /// 최대 라운드(합의하면 더 일찍 끝난다)
+    pub rounds: u8,
+    /// 합의하지 못했을 때 회의 기록을 정리하는 AI
+    pub synth: EngineId,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -134,14 +151,28 @@ pub struct Judgment {
     /// 0(틀려도 괜찮음) ~ 3(틀리면 큰일): 정확도가 얼마나 중요한지
     pub stakes: Option<f64>,
     pub stakes_confidence: Option<f64>,
+    /// 최신 웹 정보가 필요할 확률(0~1)
+    #[serde(default)]
+    pub fresh: Option<f64>,
+    /// 이 PC의 파일·프로젝트를 열어 봐야 할 확률(0~1)
+    #[serde(default)]
+    pub local: Option<f64>,
     pub ms: u64,
     pub cost_usd: f64,
 }
 
-/// JEV 단가(USD / 1M 입력 토큰, 2026-10 확인값)
-const JEV_PRICE: f64 = 0.042;
+/// JEV 단가(USD / 1M 입력 토큰, 2026-10-31 확인값)
+const JEV_PRICE: f64 = crate::pricing::JEV_INPUT;
 /// 이 확신도보다 낮은 JEV 판단은 쓰지 않고 규칙으로 정한다.
 const JEV_MIN_CONFIDENCE: f64 = 0.5;
+/// 웹·파일 도구가 필요할 확률이 이 이상이면 도구가 있는 CLI를 API보다 먼저 쓴다(API 대화 모드는 도구가 없다).
+const JEV_TOOLS: f64 = 0.6;
+/// 여러 AI의 답이 같은 결론일 확률이 이 이상이면 반론·판정·종합을 건너뛰고 가장 좋은 답을 쓴다.
+const JEV_AGREE: f64 = 0.8;
+/// 초안이 이미 완성됐을 확률이 이 이상이면 검토를 건너뛴다.
+const JEV_DRAFT_OK: f64 = 0.85;
+/// JEV에 보내는 답 하나의 최대 글자 수
+const JEV_ANSWER_CHARS: usize = 6000;
 
 pub fn jev_questions() -> serde_json::Map<String, Value> {
     let mut q = serde_json::Map::new();
@@ -165,7 +196,66 @@ pub fn jev_questions() -> serde_json::Map<String, Value> {
         "High: facts, numbers, code correctness, technical or historical claims the user will rely on",
         "Critical: health, law, money, safety, calculations or decisions with real consequences"
     ]}));
+    q.insert("fresh".into(), json!({"type": "choice", "instructions": "Does a good answer to `request` need current information from the web?", "criteria": {
+        "needed": "Needs recent or live information: news, prices, releases, versions, schedules, weather, scores, or documentation that may have changed in the last year",
+        "no": "General knowledge, reasoning or the text in `request` is enough"
+    }}));
+    q.insert("local".into(), json!({"type": "choice", "instructions": "Does answering `request` require opening the user's own files, folders, project or code on this computer?", "criteria": {
+        "needed": "Refers to the user's files, folder, project, repository, codebase, logs or documents that must be read to answer",
+        "no": "Can be answered without reading any local file"
+    }}));
     q
+}
+
+fn cut(text: &str, n: usize) -> String {
+    text.chars().take(n).collect()
+}
+
+/// JEV가 본 여러 답의 관계: 같은 결론일 확률과 가장 좋은 답.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Consensus {
+    pub agree: f64,
+    /// answers 안의 위치
+    pub best: usize,
+    pub ms: u64,
+    pub cost_usd: f64,
+}
+
+/// 같은 요청에 대한 여러 답이 같은 결론인지, 어느 답이 가장 좋은지 JEV에게 한 번에 묻는다.
+pub async fn compare_answers(http: &reqwest::Client, key: &str, request: &str, answers: &[&str]) -> Result<Consensus, String> {
+    let mut state = serde_json::Map::new();
+    state.insert("request".into(), Value::String(cut(request, memory::FILTER_REQUEST_CHARS)));
+    let mut best = serde_json::Map::new();
+    for (i, a) in answers.iter().enumerate() {
+        let k = format!("a{}", i + 1);
+        state.insert(k.clone(), Value::String(cut(a, JEV_ANSWER_CHARS)));
+        best.insert(k.clone(), Value::String(format!("`{k}` is the most correct, complete and useful answer to `request`")));
+    }
+    let mut q = serde_json::Map::new();
+    q.insert("agree".into(), json!({"type": "choice", "instructions": "`a1`… are answers from different AIs to the same `request`. Do they reach the same conclusion?", "criteria": {
+        "same": "All answers agree on the key facts, numbers, results, code behaviour and recommendations, even if wording, length or order differ",
+        "differ": "At least one answer contradicts another on a key fact, number, result or recommendation, or misses a key part the others cover"
+    }}));
+    q.insert("best".into(), json!({"type": "choice", "instructions": "Which answer is the best answer to `request`?", "criteria": best}));
+    let r = jev::ask(http, key, "jev-latest", Value::Object(state), q, 1, Duration::from_secs(15)).await.map_err(|e| secrets::redact(&e.to_string()))?;
+    let a = &r.response.answers;
+    let agree = jev::prob(a, "agree", "same").ok_or("JEV가 답을 비교하지 못했습니다")?;
+    let best = jev::choice(a, "best").and_then(|(c, _)| c.trim_start_matches('a').parse::<usize>().ok()).filter(|n| (1..=answers.len()).contains(n)).map(|n| n - 1).unwrap_or(0);
+    Ok(Consensus { agree, best, ms: r.latency_ms, cost_usd: r.response.usage.input_tokens as f64 * JEV_PRICE / 1e6 })
+}
+
+/// 초안이 이미 요청에 완전하고 정확하게 답했을 확률(검토를 건너뛸지 정한다). (확률, ms, 비용)
+pub async fn draft_ready(http: &reqwest::Client, key: &str, request: &str, draft: &str) -> Result<(f64, u64, f64), String> {
+    let state = json!({ "request": cut(request, memory::FILTER_REQUEST_CHARS), "draft": cut(draft, JEV_ANSWER_CHARS) });
+    let mut q = serde_json::Map::new();
+    q.insert("ready".into(), json!({"type": "choice", "instructions": "`draft` is an AI's answer to `request`. Would a careful expert reviewer leave it as it is?", "criteria": {
+        "complete": "`draft` fully and correctly answers every part of `request` with no errors, gaps, vague steps or made-up facts",
+        "fix": "`draft` has an error, a missing part, a vague or unrunnable step, a doubtful claim, or does not really answer `request`"
+    }}));
+    let r = jev::ask(http, key, "jev-latest", state, q, 1, Duration::from_secs(12)).await.map_err(|e| secrets::redact(&e.to_string()))?;
+    let p = jev::prob(&r.response.answers, "ready", "complete").ok_or("JEV가 초안을 판단하지 못했습니다")?;
+    Ok((p, r.latency_ms, r.response.usage.input_tokens as f64 * JEV_PRICE / 1e6))
 }
 
 pub async fn judge(http: &reqwest::Client, key: &str, text: &str) -> Result<Judgment, String> {
@@ -182,6 +272,8 @@ pub async fn judge(http: &reqwest::Client, key: &str, text: &str) -> Result<Judg
         difficulty_confidence: diff.map(|d| d.1),
         stakes: stakes.map(|s| s.0),
         stakes_confidence: stakes.map(|s| s.1),
+        fresh: jev::prob(a, "fresh", "needed"),
+        local: jev::prob(a, "local", "needed"),
         ms: r.latency_ms,
         cost_usd: r.response.usage.input_tokens as f64 * JEV_PRICE / 1e6,
     })
@@ -355,8 +447,19 @@ pub fn plan_with(text: &str, choice: Option<EngineId>, work_requested: bool, ins
     // 작업 모드도 API를 쓸 수 있다(엘리시움이 파일·PowerShell 도구를 대신 실행). 다만 CLI가 있으면 CLI가 먼저다.
     let usable = |e: &EngineId| installed.contains(e);
     let mut available: Vec<EngineId> = order.iter().copied().filter(usable).collect();
-    if work {
+    // JEV가 최신 웹 정보나 이 PC의 파일이 필요하다고 보면 도구가 있는 CLI를 먼저 쓴다(API 대화 모드는 도구가 없어 헛답이 된다).
+    let needs_tools = !work && jev.is_some_and(|j| j.fresh.unwrap_or(0.0) >= JEV_TOOLS || j.local.unwrap_or(0.0) >= JEV_TOOLS);
+    let first_before = available.first().copied();
+    if work || needs_tools {
         available.sort_by_key(|e| e.is_api());
+    }
+    if needs_tools && first_before.is_some_and(|e| e.is_api()) && available.first().is_some_and(|e| !e.is_api()) {
+        let what = if jev.and_then(|j| j.local).unwrap_or(0.0) >= JEV_TOOLS { "local" } else { "fresh" };
+        reasons.push(if what == "local" {
+            "JEV: 로컬 파일 조회가 필요하여 도구 사용이 가능한 CLI 에이전트를 우선 호출합니다.".to_string()
+        } else {
+            "JEV: 최신 웹 정보가 필요하여 검색 도구를 지원하는 CLI 에이전트를 우선 호출합니다.".to_string()
+        });
     }
     if available.is_empty() {
         return Err("사용할 수 있는 AI가 없습니다".into());
@@ -408,10 +511,8 @@ pub fn plan_with(text: &str, choice: Option<EngineId>, work_requested: bool, ins
     // 동시 에이전트: 요청 글의 모델 여럿 > 요청 글의 에이전트 수 > 설정의 기본 수
     let asked_agents = intent::requested_agents(text);
     let want = if wanted.picks.len() >= 2 { wanted.picks.len() } else { asked_agents.unwrap_or(agents as usize) }.min(intent::MAX_AGENTS);
+    let team_from = reasons.len();
     let team = if want < 2 {
-        None
-    } else if work {
-        reasons.push("작업 모드에서는 파일 충돌을 방지하기 위해 단일 AI만 파일을 편집합니다. 병렬 실행은 채팅 모드에서 지원됩니다.".to_string());
         None
     } else {
         let mut list: Vec<TeamAgent> = vec![];
@@ -421,8 +522,11 @@ pub fn plan_with(text: &str, choice: Option<EngineId>, work_requested: bool, ins
             }
         } else {
             list.push(TeamAgent { engine: primary, model: models.iter().find(|(e, _)| *e == primary).map(|(_, m)| m.clone()) });
-            // 다른 회사의 AI → 다른 엔진 → (모자라면) 같은 엔진을 새 세션으로 더 띄운다.
-            let pool: Vec<EngineId> = order.iter().copied().filter(usable).collect();
+            // 다른 회사의 AI → 다른 엔진 → (모자라면) 같은 엔진을 새 세션으로 더 띄운다. 작업 모드는 도구가 많은 CLI가 먼저다.
+            let mut pool: Vec<EngineId> = order.iter().copied().filter(usable).collect();
+            if work {
+                pool.sort_by_key(|e| e.is_api());
+            }
             for e in &pool {
                 if list.len() < want && !list.iter().any(|a| a.engine.vendor() == e.vendor()) {
                     list.push(TeamAgent { engine: *e, model: None });
@@ -440,17 +544,25 @@ pub fn plan_with(text: &str, choice: Option<EngineId>, work_requested: bool, ins
                 list.push(TeamAgent { engine: *e, model: None });
             }
         }
-        // 종합은 쓸 수 있는 AI 중 가장 강한 AI가(같으면 먼저 오는 쪽)
-        let synth = order.iter().copied().filter(usable).enumerate().max_by_key(|(i, e)| (strength(*e), std::cmp::Reverse(*i))).map(|(_, e)| e).unwrap_or(primary);
+        // 종합은 쓸 수 있는 AI 중 가장 강한 AI가(같으면 먼저 오는 쪽). 작업 모드의 통합은 되도록 CLI가 맡는다.
+        let synth_pool: Vec<EngineId> = order.iter().copied().filter(usable).filter(|e| !work || !e.is_api() || !available.iter().any(|x| !x.is_api())).collect();
+        let synth = synth_pool.iter().copied().enumerate().max_by_key(|(i, e)| (strength(*e), std::cmp::Reverse(*i))).map(|(_, e)| e).unwrap_or(primary);
         let n = list.len();
         let names = list.iter().map(|a| match &a.model { Some(m) => format!("{}({m})", a.engine.label()), None => a.engine.label().to_string() }).collect::<Vec<_>>().join(", ");
         let synth_label = synth.label();
         if asked_agents.is_none() && wanted.picks.len() < 2 {
             reasons.push(format!("설정에 지정된 기본 실행 수에 따라 {n}개의 에이전트를 동시에 실행합니다."));
         }
-        reasons.push(format!("{n}개 에이전트({names})의 개별 답변을 {synth_label}에서 하나로 종합하여 전달합니다."));
+        if work {
+            reasons.push(format!("작업을 하위 작업으로 나누어 {n}개의 에이전트({names})가 별도 복사본에서 동시 작업한 후, 변경 사항을 병합하여 {synth_label}이 최종 검증 및 요약을 진행합니다."));
+        } else {
+            reasons.push(format!("{n}개 에이전트({names})의 개별 답변을 {synth_label}에서 하나로 종합하여 전달합니다."));
+        }
         Some(Team { agents: list, synth })
     };
+
+    // 회의로 바뀌면 동시 에이전트 이유를 지울 수 있게 따로 둔다.
+    let team_reasons: Vec<String> = reasons[team_from..].to_vec();
 
     // 3) 검토: 스킬 설정 > JEV 난이도 > 규칙 (토론으로 바뀌면 아래에서 검토 이유를 지운다)
     let review_reasons_from = reasons.len();
@@ -551,7 +663,7 @@ pub fn plan_with(text: &str, choice: Option<EngineId>, work_requested: bool, ins
             b.max_tokens
         ));
     }
-    Ok(Plan { primary, fallbacks, reviewer, skill, prompt, work, reasons, jev: jev.cloned(), budget, debate, models, team })
+    Ok(Plan { primary, fallbacks, reviewer, skill, prompt, work, reasons, jev: jev.cloned(), budget, debate, models, team, council: None, team_reasons })
 }
 
 pub fn system_prompt(work: bool, workspace: &str, skill: Option<&(SkillRef, String)>) -> String {
@@ -634,6 +746,130 @@ pub fn team_prompt(request: &str, answers: &[(String, &str)]) -> String {
     s
 }
 
+// ---------------------------------------------------------------------------
+// 회의: 여러 AI(되도록 CLI)가 라운드마다 서로의 발언을 읽고 대화하며 푼다.
+
+/// 회의 한 라운드에서 한 AI가 기다리는 최대 시간
+const COUNCIL_TURN: Duration = Duration::from_secs(240);
+/// 다른 참가자에게 전하는 발언 하나의 최대 글자 수(토큰 절약)
+const COUNCIL_MSG_CHARS: usize = 2500;
+pub const COUNCIL_MAX_AGENTS: usize = 4;
+/// 발언 끝의 합의 표시(JEV가 없을 때 회의를 끝낼지 정한다)
+const AGREE_MARK: &str = "합의:";
+
+/// 회의 참가자와 라운드 수를 정한다. 다른 회사의 CLI → 다른 CLI → API → (모자라면) 같은 AI를 새 세션으로.
+pub fn council_plan(p: &Plan, installed: &[EngineId], want: usize) -> Option<Council> {
+    let want = want.clamp(2, COUNCIL_MAX_AGENTS);
+    let mut pool: Vec<EngineId> = order_for("general").into_iter().filter(|e| installed.contains(e)).collect();
+    // 회의는 CLI 창끼리의 대화가 중심이다. 파일·웹 도구도 CLI에만 있다.
+    pool.sort_by_key(|e| e.is_api());
+    if pool.is_empty() {
+        return None;
+    }
+    let mut list: Vec<TeamAgent> = vec![];
+    let model = |e: EngineId| p.models.iter().find(|(x, _)| *x == e).map(|(_, m)| m.clone());
+    for e in &pool {
+        if list.len() < want && !list.iter().any(|a| a.engine.vendor() == e.vendor()) {
+            list.push(TeamAgent { engine: *e, model: model(*e) });
+        }
+    }
+    for e in &pool {
+        if list.len() < want && !list.iter().any(|a| a.engine == *e) {
+            list.push(TeamAgent { engine: *e, model: model(*e) });
+        }
+    }
+    for e in pool.iter().cycle().take(want * pool.len()) {
+        if list.len() >= want {
+            break;
+        }
+        list.push(TeamAgent { engine: *e, model: model(*e) });
+    }
+    let synth = pool.iter().copied().enumerate().max_by_key(|(i, e)| (strength(*e), std::cmp::Reverse(*i))).map(|(_, e)| e)?;
+    let rounds = if p.budget.as_ref().is_some_and(|b| b.tier == "light") { 2 } else { 3 };
+    Some(Council { agents: list, rounds, synth })
+}
+
+/// 회의에서 부르는 이름: "참가자 2 · Codex" / "참가자 1 · Claude Code(opus)"
+pub fn council_name(i: usize, a: &TeamAgent) -> String {
+    match &a.model {
+        Some(m) => format!("참가자 {} · {}({m})", i + 1, a.engine.label()),
+        None => format!("참가자 {} · {}", i + 1, a.engine.label()),
+    }
+}
+
+pub fn council_system(me: &str, others: &[String]) -> String {
+    format!(
+        "\n[회의] 이 요청은 AI 여러 명이 여러 라운드 동안 서로의 발언을 읽고 대화하며 함께 푸는 회의입니다. 당신은 '{me}'입니다. 다른 참가자: {}.\n\
+         - 한 번에 핵심만 밀도 있게 말하세요(600단어 이내). 근거·계산·코드를 보이고, 다른 참가자가 틀렸으면 분명히 짚고, 설득되면 인정하세요.\n\
+         - 다른 참가자의 말을 되풀이하지 말고 새로 보탤 것만 쓰세요. 모르는 것을 지어내지 마세요.\n\
+         - 발언 앞에 자기 이름·라운드 같은 머리말을 붙이지 말고 바로 본론부터 쓰세요.\n",
+        others.join(", ")
+    )
+}
+
+/// 1라운드: 다른 참가자의 의견을 보기 전에 각자 해결안을 낸다.
+pub fn council_open(request: &str) -> String {
+    format!("[요청]\n{request}\n\n1라운드입니다. 다른 참가자의 의견을 보기 전에 당신의 해결안을 제시하세요.")
+}
+
+fn council_reply_rule(round: u8) -> String {
+    format!(
+        "{round}라운드입니다. 위 발언에 답하세요: 동의하는 점과 틀렸거나 빠진 점을 짚고, 당신의 해결안을 고쳐 다시 제시하세요.\n\
+         마지막 줄에는 반드시 '{AGREE_MARK} 예'(모든 참가자의 결론이 사실상 같다고 볼 때) 또는 '{AGREE_MARK} 아니오' 중 하나만 쓰세요."
+    )
+}
+
+/// 2라운드부터, 자기 세션을 이어 쓰는 AI에게: 마지막으로 말한 뒤 나온 다른 참가자 발언만 보낸다(이미 본 내용은 다시 보내지 않는다). others: ("2라운드 · 참가자 2 · Codex", 발언)
+pub fn council_followup(round: u8, others: &[(String, &str)]) -> String {
+    let mut s = String::from("[당신이 마지막으로 말한 뒤 다른 참가자의 발언]\n");
+    for (who, text) in others {
+        s.push_str(&format!("[{who}]\n{}\n\n", cut(strip_agree(text), COUNCIL_MSG_CHARS)));
+    }
+    s.push_str(&council_reply_rule(round));
+    s
+}
+
+/// 2라운드부터, 세션을 이어 쓰지 못하는 AI에게: 요청과 지금까지의 회의 기록 전체.
+pub fn council_full(request: &str, round: u8, me: &str, log: &[(u8, String, &str)]) -> String {
+    let mut s = format!("[요청]\n{request}\n\n[지금까지의 회의]\n");
+    for (r, who, text) in log {
+        let mine = if who == me { "(당신)" } else { "" };
+        s.push_str(&format!("[{r}라운드 · {who}{mine}]\n{}\n\n", cut(strip_agree(text), COUNCIL_MSG_CHARS)));
+    }
+    s.push_str(&council_reply_rule(round));
+    s
+}
+
+/// 합의하지 못하고 끝났을 때 정리 AI에게: 마지막 라운드는 전부, 그 전 라운드는 줄여서 보낸다.
+pub fn council_synth(request: &str, last_round: u8, log: &[(u8, String, &str)]) -> String {
+    let mut s = format!("[요청]\n{request}\n\n[회의 기록]\n");
+    for (r, who, text) in log {
+        let n = if *r == last_round { JEV_ANSWER_CHARS } else { 1200 };
+        s.push_str(&format!("[{r}라운드 · {who}]\n{}\n\n", cut(strip_agree(text), n)));
+    }
+    s.push_str(
+        "여러 AI가 회의하며 이 요청을 함께 풀었습니다. 마지막 라운드의 의견을 중심으로 맞는 내용과 근거를 모으고, 남은 이견은 사실·숫자·논리를 확인해 바로잡아 하나의 완성된 최종 답을 쓰세요.\n\
+         끝까지 갈린 점이 있으면 답 끝에 '### 회의에서 갈린 점' 짧은 목록으로 무엇이 왜 맞는지 적으세요(없으면 생략). 회의 과정 서술로 시작하지 말고 바로 답하세요.",
+    );
+    s
+}
+
+/// 발언 끝의 '합의: 예/아니오' 줄을 뗀다.
+pub fn strip_agree(text: &str) -> &str {
+    let t = text.trim_end();
+    match t.rfind('\n') {
+        Some(i) if t[i + 1..].trim_start().trim_start_matches(['*', '#', ' ']).starts_with(AGREE_MARK) => t[..i].trim_end(),
+        None if t.trim_start_matches(['*', '#', ' ']).starts_with(AGREE_MARK) => "",
+        _ => t,
+    }
+}
+
+/// 마지막 줄이 '합의: 예'인지
+pub fn says_agree(text: &str) -> bool {
+    let last = text.trim_end().rsplit('\n').next().unwrap_or("").trim().trim_matches(['*', '#', ' ']);
+    last.strip_prefix(AGREE_MARK).is_some_and(|r| r.trim().trim_matches(['*', '.']).starts_with('예'))
+}
+
 /// evidence: 초안을 쓴 AI가 쓴 도구(읽은 파일·검색 등). 검토자가 볼 수 없는 자료에 근거한 내용을 지우지 않게 알려 준다.
 pub fn review_prompt(request: &str, draft: &str, evidence: &[String]) -> String {
     let mut s = format!(
@@ -686,13 +922,16 @@ pub fn decide_approval(app: &AppHandle, st: &AppState, approval_id: &str, approv
 }
 
 /// build: '만들기' 버튼. 작업 모드로 돌고, 누른 것이 곧 허락이라 승인을 묻지 않는다.
+/// council: '회의' 버튼. 여러 AI가 서로 대화하며 푼다(대화 모드에서만).
 #[allow(clippy::too_many_arguments)]
-pub fn send(app: &AppHandle, st: &std::sync::Arc<AppState>, conversation_id: Option<String>, text: String, choice: Option<EngineId>, work: bool, build: bool, workspace: Option<String>) -> Result<SendResult, String> {
+pub fn send(app: &AppHandle, st: &std::sync::Arc<AppState>, conversation_id: Option<String>, text: String, choice: Option<EngineId>, work: bool, build: bool, workspace: Option<String>, council: bool) -> Result<SendResult, String> {
     let text = text.trim().to_string();
     if text.is_empty() {
         return Err("보낼 내용이 없습니다".into());
     }
-    let work = work || build;
+    // 회의는 여러 AI가 같은 폴더를 동시에 고치지 않도록 대화 모드로만 돈다.
+    let council = council && !build;
+    let work = !council && (work || build);
     let conv = match conversation_id {
         Some(c) if store::conversation_exists(&st.db, &c).map_err(|e| e.to_string())? => c,
         // 새 대화는 입력창에서 고른 폴더(없으면 기본 작업 폴더)로 시작한다.
@@ -705,14 +944,14 @@ pub fn send(app: &AppHandle, st: &std::sync::Arc<AppState>, conversation_id: Opt
             store::create_conversation(&st.db, &text, workspace.as_deref()).map_err(|e| e.to_string())?
         }
     };
-    let user_message_id = store::insert_message(&st.db, &conv, "user", &text, Some(&json!({ "work": work, "build": build, "engine": choice.map(|c| c.as_str()) }))).map_err(|e| e.to_string())?;
+    let user_message_id = store::insert_message(&st.db, &conv, "user", &text, Some(&json!({ "work": work, "build": build, "askedCouncil": council, "engine": choice.map(|c| c.as_str()) }))).map_err(|e| e.to_string())?;
     let task_id = new_id();
     let cancel = CancellationToken::new();
     st.tasks.lock().unwrap_or_else(|p| p.into_inner()).insert(task_id.clone(), cancel.clone());
     st.steers.lock().unwrap_or_else(|p| p.into_inner()).insert(task_id.clone(), Steer::default());
     let (app2, st2, conv2, task2) = (app.clone(), st.clone(), conv.clone(), task_id.clone());
     tauri::async_runtime::spawn(async move {
-        run_task(&app2, &st2, &conv2, &task2, &text, choice, work, build, cancel).await;
+        run_task(&app2, &st2, &conv2, &task2, &text, choice, work, build, council, cancel).await;
         st2.tasks.lock().unwrap_or_else(|p| p.into_inner()).remove(&task2);
         st2.steers.lock().unwrap_or_else(|p| p.into_inner()).remove(&task2);
         emit(&app2, "task:done", json!({ "taskId": task2, "conversationId": conv2 }));
@@ -807,6 +1046,24 @@ fn message_data(steps: &[Step], p: &Plan, extra: Value) -> Value {
     d
 }
 
+/// 에이전트 하나만 멈췄을 때 그 실행의 오류(같은 작업의 다른 에이전트는 계속 돈다)
+pub const AGENT_STOPPED: &str = "사용자에 의해 중지되었습니다.";
+
+fn agent_slot(task: &str, key: &str) -> String {
+    format!("{task}/{key}")
+}
+
+/// 에이전트 하나만 멈춘다. 없거나 이미 끝났으면 false.
+pub fn cancel_agent(st: &AppState, task: &str, key: &str) -> bool {
+    match st.agents.lock().unwrap_or_else(|p| p.into_inner()).get(&agent_slot(task, key)) {
+        Some(t) => {
+            t.cancel();
+            true
+        }
+        None => false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_engine(app: &AppHandle, st: &AppState, conv: &str, task: &str, mid: &str, role: &'static str, spec: RunSpec, timeout: Duration, cancel: &CancellationToken) -> Outcome {
     let key = format!("{role}:{}", spec.engine.as_str());
@@ -823,8 +1080,14 @@ async fn run_engine_as(app: &AppHandle, st: &AppState, conv: &str, task: &str, m
     } else {
         emit(app, "task:debate", json!({ "taskId": task, "conversationId": conv, "engine": spec.engine, "role": role, "state": "run" }));
     }
-    let o = engines::run(&st.http, &spec, timeout, cancel, |ev| match ev {
+    // 에이전트 하나만 멈출 수 있게 작업 토큰의 자식 토큰으로 돌린다(작업을 멈추면 같이 멈춘다).
+    let own = cancel.child_token();
+    let slot = agent_slot(task, key);
+    st.agents.lock().unwrap_or_else(|p| p.into_inner()).insert(slot.clone(), own.clone());
+    let mut o = engines::run(&st.http, &spec, timeout, &own, |ev| match ev {
         Event::Text(t) if stream => emit(app, "task:delta", json!({ "taskId": task, "conversationId": conv, "messageId": mid, "phase": role, "delta": t })),
+        // 여러 AI가 동시에 쓸 때는 실행(key)별로 흘려 각 창이 따로 보여 준다(회의 창).
+        Event::Text(t) => emit(app, "task:agent-delta", json!({ "taskId": task, "conversationId": conv, "key": key, "delta": t })),
         Event::Activity(a) => {
             emit(app, "task:agent-activity", json!({ "taskId": task, "conversationId": conv, "key": key, "text": a }));
             if stream {
@@ -834,8 +1097,14 @@ async fn run_engine_as(app: &AppHandle, st: &AppState, conv: &str, task: &str, m
         _ => {}
     })
     .await;
+    st.agents.lock().unwrap_or_else(|p| p.into_inner()).remove(&slot);
+    let stopped = own.is_cancelled() && !cancel.is_cancelled();
+    if stopped {
+        o.ok = false;
+        o.error = Some(AGENT_STOPPED.into());
+    }
     let done = o.ok && !o.text.trim().is_empty();
-    emit(app, "task:agent", json!({ "taskId": task, "conversationId": conv, "key": key, "engine": spec.engine, "label": spec.engine.label(), "role": role, "state": if done { "ok" } else { "fail" }, "ms": o.latency_ms, "error": o.error, "chars": o.text.chars().count() }));
+    emit(app, "task:agent", json!({ "taskId": task, "conversationId": conv, "key": key, "engine": spec.engine, "label": spec.engine.label(), "role": role, "state": if done { "ok" } else { "fail" }, "stopped": stopped, "ms": o.latency_ms, "error": o.error, "chars": o.text.chars().count() }));
     if !stream {
         emit(app, "task:debate", json!({ "taskId": task, "conversationId": conv, "engine": spec.engine, "role": role, "state": if o.ok && !o.text.trim().is_empty() { "ok" } else { "fail" }, "ms": o.latency_ms }));
     }
@@ -853,7 +1122,7 @@ async fn run_engine_as(app: &AppHandle, st: &AppState, conv: &str, task: &str, m
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: &str, choice: Option<EngineId>, work_req: bool, build: bool, cancel: CancellationToken) {
+async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: &str, choice: Option<EngineId>, work_req: bool, build: bool, council_req: bool, cancel: CancellationToken) {
     let mid = new_id();
     let s = st.settings();
     let workspace = store::get_workspace(&st.db, conv).ok().flatten().map(PathBuf::from).unwrap_or_else(|| s.workspace());
@@ -917,7 +1186,12 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
             Err(e) => memory_note = Some(format!("JEV로 기억을 거르지 못해 기억을 그대로 보냅니다: {e}")),
         }
     }
-    let finish = |content: String, data: Value| {
+    let checks: Mutex<Vec<Value>> = Mutex::new(vec![]);
+    let finish = |content: String, mut data: Value| {
+        let c = checks.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let (false, Some(o)) = (c.is_empty(), data.as_object_mut()) {
+            o.insert("jevChecks".into(), json!(c));
+        }
         let _ = store::insert_message_as(&st.db, &mid, conv, "assistant", &content, Some(&data));
         emit(app, "message:created", json!({ "conversationId": conv, "messageId": mid, "taskId": task }));
     };
@@ -936,9 +1210,37 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
         p.budget = budget_for("deep");
         p.reasons.push("만들기: 승인 없이 이 폴더 안에서 끝까지 완성하도록 노력 단계를 '깊게'로 정했습니다".into());
     }
+    // 회의: 버튼 또는 요청 글("서로 대화하며", "회의해서")로 켠다. 동시 에이전트·토론·검토를 대신한다.
+    if !p.work && (council_req || intent::requested_council(text)) {
+        let want = intent::requested_agents(text).unwrap_or(if s.agents >= 2 { s.agents as usize } else { 3 });
+        // 회의는 AI 수 × 라운드만큼 호출이 늘어난다: 노력 단계가 정해지지 않았으면 기본(가장 비싼) 모델 대신 '보통'으로 돈다.
+        if p.budget.is_none() {
+            p.budget = budget_for("standard");
+            if let Some(b) = &p.budget {
+                p.reasons.push(format!("노력 단계 '{}': 노력치 {}, Claude Code {}, API 출력 최대 {}토큰", tier_label(b.tier), b.effort, b.claude_model.unwrap_or("기본 모델"), b.max_tokens));
+            }
+        }
+        match council_plan(&p, &st.installed(), want) {
+            Some(c) => {
+                let names = c.agents.iter().enumerate().map(|(i, a)| council_name(i, a)).collect::<Vec<_>>().join(", ");
+                p.reasons.push(format!(
+                    "{names} 참여로 최대 {rounds}라운드 동안 의견을 조율하며 합의 도달 시 조기 종료합니다.",
+                    names = names,
+                    rounds = c.rounds
+                ));
+                let stale = std::mem::take(&mut p.team_reasons);
+                p.reasons.retain(|r| !stale.contains(r));
+                p.team = None;
+                p.debate = None;
+                p.reviewer = None;
+                p.council = Some(c);
+            }
+            None => p.reasons.push("회의에 참여 가능한 AI가 없어 단일 AI가 단독으로 답변합니다.".into()),
+        }
+    }
     emit(app, "task:started", json!({
         "taskId": task, "conversationId": conv, "messageId": mid,
-        "primary": p.primary, "reviewer": p.reviewer, "work": p.work, "skill": p.skill.as_ref().map(|s| &s.0), "reasons": p.reasons, "jev": judgment, "budget": p.budget, "debate": p.debate, "team": p.team, "model": model_for(&p, p.primary, &s),
+        "primary": p.primary, "reviewer": p.reviewer, "work": p.work, "skill": p.skill.as_ref().map(|s| &s.0), "reasons": p.reasons, "jev": judgment, "budget": p.budget, "debate": p.debate, "team": p.team, "council": p.council, "model": model_for(&p, p.primary, &s),
     }));
 
     // 작업 모드: 파일을 고치기 전에 사용자의 허락을 받는다. '만들기'는 버튼을 누른 것이 허락이다.
@@ -969,6 +1271,19 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
     let skill_dirs: Vec<String> = p.skill.as_ref().and_then(|s| s.0.dir.clone()).into_iter().collect();
     // 세션 메모리: JEV가 걸렀으면 남긴 것만, 아니면 요약 + 최근 대화를 붙인다.
     let ctx = |seen: Option<&str>, prompt: &str| memory::context(summary.as_deref(), upto.as_deref(), &history, seen, prompt, selection.as_ref());
+    let system = if build { format!("{}{BUILD_SYSTEM}", system_prompt(true, &ws, p.skill.as_ref())) } else { system_prompt(p.work, &ws, p.skill.as_ref()) };
+    let plugin_dirs = catalog.enabled_plugin_dirs();
+    let timeout = Duration::from_secs(if build { 1800 } else if p.work { 1200 } else { 600 });
+    let mut steps: Vec<Step> = vec![];
+    // 병렬 작업: 작업(만들기)을 하위 작업으로 나눠 에이전트마다 폴더 사본에서 동시에 하고 → 바뀐 파일을 합치고 → 통합 AI가 마무리한다.
+    if p.work {
+        if let Some(team) = p.team.clone() {
+            let tw = TeamWork { app, st, conv, task, mid: &mid, workspace: &workspace, settings: &s, system: &system, timeout, cancel: &cancel, extra_dirs: &skill_dirs, plugin_dirs: &plugin_dirs };
+            if let Some((content, data)) = run_team_work(&tw, &mut p, &team, &ctx, &mut steps).await {
+                return finish(content, data);
+            }
+        }
+    }
     let spec_for = |engine: EngineId, prompt: String, system: String, work: bool| RunSpec {
         engine,
         prompt,
@@ -983,13 +1298,152 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
         extra_dirs: skill_dirs.clone(),
         steer: None,
     };
-    let system = if build { format!("{}{BUILD_SYSTEM}", system_prompt(true, &ws, p.skill.as_ref())) } else { system_prompt(p.work, &ws, p.skill.as_ref()) };
-    let plugin_dirs = catalog.enabled_plugin_dirs();
-    let timeout = Duration::from_secs(if build { 1800 } else if p.work { 1200 } else { 600 });
-    let mut steps: Vec<Step> = vec![];
+    // JEV로 확인해 건너뛴 단계(답 비교·검토 생략)를 사용량과 답 기록에 남긴다.
+    let jev_note = |kind: &'static str, value: f64, ms: u64, cost: f64| {
+        let _ = store::record_usage(&st.db, &store::Usage { engine: "jev", role: kind, ok: true, latency_ms: ms, input_tokens: None, output_tokens: None, cost_usd: Some(cost) });
+        checks.lock().unwrap_or_else(|p| p.into_inner()).push(json!({ "kind": kind, "value": value, "ms": ms, "costUsd": cost }));
+    };
+    let pct = |x: f64| (x * 100.0).round() as u32;
+
+    // 회의: 여러 AI가 라운드마다 서로의 발언을 읽고 대화한다 → 합의하면 가장 좋은 발언을, 아니면 정리 AI가 하나로 정리한다.
+    if let Some(cn) = p.council.clone() {
+        let n = cn.agents.len();
+        let names: Vec<String> = cn.agents.iter().enumerate().map(|(i, a)| council_name(i, a)).collect();
+        let base_sys = system_prompt(false, &ws, p.skill.as_ref());
+        let systems: Vec<String> = (0..n)
+            .map(|i| {
+                let others: Vec<String> = names.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, x)| x.clone()).collect();
+                format!("{base_sys}{}", council_system(&names[i], &others))
+            })
+            .collect();
+        let good = |o: &Outcome| o.ok && !o.text.trim().is_empty();
+        // 자기 세션을 이어 쓰는 CLI(Claude Code·Antigravity)는 2라운드부터 새 발언만 받는다.
+        let mut sessions: Vec<Option<String>> = vec![None; n];
+        // (라운드, 참가자 위치, 발언): 답한 발언만
+        let mut log: Vec<(u8, usize, String)> = vec![];
+        let mut rounds_json: Vec<Value> = vec![];
+        // (합의 확률, 가장 좋은 발언을 한 참가자)
+        let mut agreed: Option<(f64, usize)> = None;
+        let opening = ctx(None, &council_open(&p.prompt));
+        // 참가자마다 회의 기록(log) 중 어디까지 들었는지. 2라운드부터 세션을 이어 쓰는 AI는 그 뒤의 다른 참가자 발언만 받는다.
+        let mut heard: Vec<usize> = vec![0; n];
+        let record = |i: usize, round: u8, o: &Outcome, log: &mut Vec<(u8, usize, String)>, sessions: &mut Vec<Option<String>>, steps: &mut Vec<Step>, rounds_json: &mut Vec<Value>| {
+            let a = &cn.agents[i];
+            steps.push(step(a.engine, "council", o, &spec_effort(&p), a.model.clone().or_else(|| spec_model(&p, a.engine, &s))));
+            rounds_json.push(json!({ "round": round, "idx": i, "engine": a.engine, "ok": good(o), "text": strip_agree(&o.text) }));
+            if good(o) {
+                if let (true, Some(sid)) = (a.engine.resumable(), &o.session_id) {
+                    sessions[i] = Some(sid.clone());
+                }
+                log.push((round, i, o.text.clone()));
+            }
+        };
+        let turn = |i: usize, round: u8, prompt: String, resume: Option<String>| {
+            let a = &cn.agents[i];
+            let mut spec = spec_for(a.engine, prompt, systems[i].clone(), false);
+            if a.model.is_some() {
+                spec.model = a.model.clone();
+            }
+            spec.resume = resume;
+            let (key, mid, cancel) = (format!("council:{i}:{round}"), &mid, &cancel);
+            async move { run_engine_as(app, st, conv, task, mid, "council", spec, COUNCIL_TURN, cancel, false, &key).await }
+        };
+        for round in 1..=cn.rounds {
+            if cancel.is_cancelled() {
+                break;
+            }
+            emit(app, "task:activity", json!({ "taskId": task, "conversationId": conv, "phase": "council", "text": format!("{round}라운드 진행 중: AI {n}개가 발언하는 중", round = round, n = n) }));
+            if round == 1 {
+                // 1라운드: 서로 보기 전에 각자 해결안을 동시에 낸다.
+                let outs: Vec<Outcome> = futures_util::future::join_all((0..n).map(|i| turn(i, round, opening.clone(), None))).await;
+                for (i, o) in outs.iter().enumerate() {
+                    record(i, round, o, &mut log, &mut sessions, &mut steps, &mut rounds_json);
+                }
+            } else {
+                // 2라운드부터는 차례로 말한다: 동시에 말하면 서로의 지난 입장에 답하느라 입장이 엇갈리기만 한다.
+                for i in 0..n {
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+                    let prompt = if sessions[i].is_some() {
+                        let others: Vec<(String, &str)> = log[heard[i]..].iter().filter(|l| l.1 != i).map(|(r, j, t)| (format!("{r}라운드 · {}", names[*j]), t.as_str())).collect();
+                        council_followup(round, &others)
+                    } else {
+                        let full: Vec<(u8, String, &str)> = log.iter().map(|(r, j, t)| (*r, names[*j].clone(), t.as_str())).collect();
+                        council_full(&p.prompt, round, &names[i], &full)
+                    };
+                    let o = turn(i, round, prompt, sessions[i].clone()).await;
+                    record(i, round, &o, &mut log, &mut sessions, &mut steps, &mut rounds_json);
+                    heard[i] = log.len();
+                }
+            }
+            // 각 참가자의 가장 최근 발언(이번 라운드에 실패했으면 그 전 발언)
+            let mut latest: Vec<(usize, &str)> = (0..n).filter_map(|i| log.iter().rev().find(|l| l.1 == i).map(|l| (i, l.2.as_str()))).collect();
+            latest.retain(|(i, _)| log.iter().any(|l| l.1 == *i && l.0 == round));
+            if latest.len() < 2 {
+                break;
+            }
+            // 합의 확인: JEV가 있으면 JEV가(1라운드부터), 없으면 2라운드부터 모든 발언의 '합의: 예'로 정한다.
+            if let Some(key) = jev_key.as_ref().filter(|_| !cancel.is_cancelled()) {
+                let texts: Vec<&str> = latest.iter().map(|(_, t)| strip_agree(t)).collect();
+                if let Ok(c) = compare_answers(&st.http, key, &p.prompt, &texts).await {
+                    jev_note("council", c.agree, c.ms, c.cost_usd);
+                    if c.agree >= JEV_AGREE {
+                        agreed = Some((c.agree, latest[c.best].0));
+                        break;
+                    }
+                }
+            } else if round >= 2 && latest.iter().all(|(_, t)| says_agree(t)) {
+                agreed = Some((1.0, latest[latest.len() - 1].0));
+                break;
+            }
+        }
+        let agents_json: Vec<Value> = cn.agents.iter().map(|a| json!({ "engine": a.engine, "model": a.model })).collect();
+        let council_json = |synth: Option<EngineId>, agree: Option<f64>| json!({ "agents": agents_json, "rounds": rounds_json, "synth": synth, "agreed": agree.is_some(), "agree": agree, "maxRounds": cn.rounds });
+        let Some(last_round) = log.last().map(|l| l.0) else {
+            let why = if cancel.is_cancelled() { "중지했습니다.".to_string() } else { steps.iter().rev().find_map(|x| x.error.clone()).unwrap_or_else(|| "답을 받지 못했습니다".into()) };
+            return finish(format!("⚠ {why}"), message_data(&steps, &p, json!({ "error": why, "council": council_json(None, None) })));
+        };
+        let last: Vec<&(u8, usize, String)> = log.iter().filter(|l| l.0 == last_round).collect();
+        if let Some((agree, best)) = agreed {
+            let text = log.iter().rev().find(|l| l.1 == best).map(|l| strip_agree(&l.2).to_string()).unwrap_or_default();
+            let mut p2 = p.clone();
+            p2.reasons.push(format!(
+                "{round}라운드에서 조기 합의(일치율 {pct}%)되어 요약 단계를 생략하고 {who}의 답변을 표시합니다.",
+                round = last_round,
+                pct = pct(agree),
+                who = names[best]
+            ));
+            return finish(text, message_data(&steps, &p2, json!({ "draftedBy": cn.agents[best].engine, "council": council_json(None, Some(agree)) })));
+        }
+        if last.len() == 1 || cancel.is_cancelled() {
+            let (_, i, t) = last[0];
+            let mut p2 = p.clone();
+            p2.reasons.push(format!(
+                "회의가 조기 종료되어 추가 요약 없이 {who}의 마지막 답변을 표시합니다.",
+                who = names[*i]
+            ));
+            return finish(strip_agree(t).to_string(), message_data(&steps, &p2, json!({ "draftedBy": cn.agents[*i].engine, "council": council_json(None, None) })));
+        }
+        let full: Vec<(u8, String, &str)> = log.iter().map(|(r, i, t)| (*r, names[*i].clone(), t.as_str())).collect();
+        let sp = council_synth(&p.prompt, last_round, &full);
+        let j = run_engine(app, st, conv, task, &mid, "synth", spec_for(cn.synth, ctx(None, &sp), base_sys.clone(), false), timeout, &cancel).await;
+        steps.push(step(cn.synth, "synth", &j, &spec_effort(&p), spec_model(&p, cn.synth, &s)));
+        let first = last[0];
+        if good(&j) {
+            return finish(j.text.clone(), message_data(&steps, &p, json!({ "synthBy": cn.synth, "draftedBy": cn.agents[first.1].engine, "council": council_json(Some(cn.synth), None) })));
+        }
+        let mut p2 = p.clone();
+        p2.reasons.push(format!(
+            "{synth}의 회의 요약 생성에 실패하여 {who}의 마지막 답변을 대신 표시합니다.",
+            synth = cn.synth.label(),
+            who = names[first.1]
+        ));
+        return finish(strip_agree(&first.2).to_string(), message_data(&steps, &p2, json!({ "draftedBy": cn.agents[first.1].engine, "council": council_json(None, None) })));
+    }
 
     // 동시 에이전트: 여러 AI가 동시에 따로 답하고 → 종합 AI가 하나로 정리한다.
-    if let Some(team) = p.team.clone() {
+    if let Some(team) = p.team.clone().filter(|_| !p.work) {
         let n = team.agents.len();
         let tsys = format!("{}{}", system_prompt(false, &ws, p.skill.as_ref()), team_system(n));
         emit(app, "task:activity", json!({ "taskId": task, "conversationId": conv, "phase": "agents", "text": format!("{n}개의 에이전트가 동시에 답변을 생성하는 중") }));
@@ -1023,6 +1477,23 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
             let mut p2 = p.clone();
             p2.reasons.push(format!("단일 답변만 완료되어 종합 과정 없이 {label}의 결과를 그대로 표시합니다."));
             return finish(o.text.clone(), message_data(&steps, &p2, json!({ "draftedBy": a.engine, "team": { "agents": agents_json, "synth": null } })));
+        }
+        // 답들이 같은 결론이면 종합 AI를 부르지 않고 JEV가 고른 가장 좋은 답을 쓴다.
+        if let Some(key) = &jev_key {
+            let texts: Vec<&str> = ok.iter().map(|(_, o)| o.text.as_str()).collect();
+            if let Ok(c) = compare_answers(&st.http, key, &p.prompt, &texts).await {
+                jev_note("compare", c.agree, c.ms, c.cost_usd);
+                if c.agree >= JEV_AGREE {
+                    let (a, o) = ok[c.best];
+                    let mut p2 = p.clone();
+                    p2.reasons.push(format!(
+                        "JEV: 에이전트 간 결론이 일치(합의율 {pct}%)하여 추가 종합을 생략하고 {who}의 답변을 표시합니다.",
+                        pct = pct(c.agree),
+                        who = who(a)
+                    ));
+                    return finish(o.text.clone(), message_data(&steps, &p2, json!({ "draftedBy": a.engine, "team": { "agents": agents_json, "synth": null } })));
+                }
+            }
         }
         let answers: Vec<(String, &str)> = ok.iter().map(|(a, o)| (who(a), o.text.as_str())).collect();
         let sp = team_prompt(&p.prompt, &answers);
@@ -1065,6 +1536,22 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
                 return finish(o.text.clone(), message_data(&steps, &p2, json!({ "draftedBy": e, "debate": { "participants": [dbt.a, dbt.b], "judge": null, "rounds": rounds } })));
             }
             (true, true) => {}
+        }
+        // 두 답이 이미 같은 결론이면 반론·판정(AI 호출 3번)을 건너뛰고 JEV가 고른 더 좋은 답을 쓴다.
+        if let Some(key) = jev_key.as_ref().filter(|_| !cancel.is_cancelled()) {
+            if let Ok(c) = compare_answers(&st.http, key, &p.prompt, &[&ra.text, &rb.text]).await {
+                jev_note("compare", c.agree, c.ms, c.cost_usd);
+                if c.agree >= JEV_AGREE {
+                    let (e, o) = if c.best == 1 { (dbt.b, &rb) } else { (dbt.a, &ra) };
+                    let mut p2 = p.clone();
+                    p2.reasons.push(format!(
+                        "JEV: 초기 답변의 결론이 일치(합의율 {pct}%)하여 반론 및 판정을 생략하고 {who}의 답변을 채택합니다.",
+                        pct = pct(c.agree),
+                        who = e.label()
+                    ));
+                    return finish(o.text.clone(), message_data(&steps, &p2, json!({ "draftedBy": e, "debate": { "participants": [dbt.a, dbt.b], "judge": null, "rounds": rounds } })));
+                }
+            }
         }
         let (mut fa, mut fb) = (ra.text.clone(), rb.text.clone());
         let mut rebuttals: Option<(String, String)> = None;
@@ -1129,6 +1616,8 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
             steer: Some(steer.clone()),
         };
         let o = run_engine(app, st, conv, task, &mid, "draft", spec, timeout, &cancel).await;
+        // 에이전트 탭에서 이 AI만 멈췄으면 다음 AI로 넘어가지 않는다.
+        let stopped = o.error.as_deref() == Some(AGENT_STOPPED);
         let left = steer.lock().unwrap_or_else(|p| p.into_inner()).take().unwrap_or_default();
         if !left.is_empty() {
             emit(app, "task:activity", json!({ "taskId": task, "conversationId": conv, "phase": "draft", "text": format!("작업이 끝나 전달하지 못한 메시지 {}개가 있습니다. 다시 보내 주세요", left.len()) }));
@@ -1141,6 +1630,9 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
         }
         if o.ok && !o.text.trim().is_empty() {
             draft = Some((engine, o));
+            break;
+        }
+        if stopped {
             break;
         }
         // 키가 거절된 API는 키를 다시 넣을 때까지 자동 선택에서 뺀다(매번 실패를 거치지 않도록).
@@ -1161,6 +1653,24 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
 
     // 검토: 다른 AI가 초안을 다듬는다(실패하면 초안을 그대로 쓴다).
     if let Some(rev) = p.reviewer.filter(|_| !cancel.is_cancelled()) {
+        // 초안이 이미 완성됐다고 JEV가 확신하면 검토 AI를 부르지 않는다.
+        if let Some(key) = &jev_key {
+            emit(app, "task:activity", json!({ "taskId": task, "conversationId": conv, "phase": "review", "text": "JEV가 초안 검토 생략 여부를 판단하는 중" }));
+            if let Ok((ready, ms, cost)) = draft_ready(&st.http, key, &p.prompt, &d.text).await {
+                jev_note("draft", ready, ms, cost);
+                if ready >= JEV_DRAFT_OK {
+                    let mut p2 = p.clone();
+                    p2.reasons.push(format!(
+                        "JEV: 초안의 완성도가 충분하다고 판단(신뢰도 {pct}%)하여 {rev}의 검토를 생략합니다.",
+                        rev = rev.label(),
+                        pct = pct(ready)
+                    ));
+                    finish(d.text.clone(), message_data(&steps, &p2, json!({ "draftedBy": drafted_by, "skippedReview": rev })));
+                    mark_seen(st, conv, drafted_by);
+                    return;
+                }
+            }
+        }
         let spec = RunSpec {
             engine: rev,
             prompt: ctx(None, &review_prompt(&p.prompt, &d.text, &d.activities)),
@@ -1193,11 +1703,255 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
     mark_seen(st, conv, drafted_by);
 }
 
+/// 병렬 작업에 필요한 작업 정보
+struct TeamWork<'a> {
+    app: &'a AppHandle,
+    st: &'a AppState,
+    conv: &'a str,
+    task: &'a str,
+    mid: &'a str,
+    workspace: &'a std::path::Path,
+    settings: &'a Settings,
+    /// 작업(만들기) 시스템 지시
+    system: &'a str,
+    timeout: Duration,
+    cancel: &'a CancellationToken,
+    extra_dirs: &'a [String],
+    plugin_dirs: &'a [String],
+}
+
+/// 나누는 AI 한 번에 기다리는 최대 시간
+const SPLIT_TIMEOUT: Duration = Duration::from_secs(300);
+
+fn remove_dir_quietly(dir: PathBuf) {
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 병렬 작업. Some이면 끝난 답(내용, 기록), None이면 나눌 수 없어 한 에이전트로 돌아간다(이유는 p에 남기고 p.team을 지운다).
+async fn run_team_work(tw: &TeamWork<'_>, p: &mut Plan, team: &Team, ctx: &(dyn Fn(Option<&str>, &str) -> String + Sync), steps: &mut Vec<Step>) -> Option<(String, Value)> {
+    let (app, st, conv, task, mid, s) = (tw.app, tw.st, tw.conv, tw.task, tw.mid, tw.settings);
+    let act = |text: String| emit(app, "task:activity", json!({ "taskId": task, "conversationId": conv, "phase": "agents", "text": text }));
+    let single = |p: &mut Plan, why: String| {
+        p.reasons.push(why);
+        p.team = None;
+        emit(app, "task:plan", json!({ "taskId": task, "conversationId": conv, "team": null, "reasons": p.reasons }));
+    };
+    let no_copy = |p: &mut Plan, e: String| single(p, format!("프로젝트 폴더를 복사할 수 없어({e}) 단일 에이전트가 파일 수정 작업을 직접 진행합니다."));
+    let stopped = |steps: &[Step], p: &Plan, team_json: Value| {
+        let why = "중지했습니다.".to_string();
+        Some((format!("⚠ {why}"), message_data(steps, p, json!({ "error": why, "team": team_json }))))
+    };
+    let root = tw.workspace.to_path_buf();
+    let ws = root.to_string_lossy().to_string();
+    let n = team.agents.len();
+
+    // 1) 지금 폴더의 파일 목록(사본·변경 비교의 기준)
+    act("작업 분할을 위해 프로젝트 폴더 검사 중".to_string());
+    let base = {
+        let r = root.clone();
+        match tokio::task::spawn_blocking(move || teamwork::snapshot(&r)).await.map_err(|e| e.to_string()).and_then(|r| r) {
+            Ok(b) => b,
+            Err(e) => {
+                no_copy(p, e);
+                return None;
+            }
+        }
+    };
+
+    // 2) 나누기: 가장 강한 AI가 대화 모드로 하위 작업 목록(JSON)을 만든다.
+    act(format!("{who}이(가) 요청을 하위 작업으로 분할 중", who = team.synth.label()));
+    let split = RunSpec {
+        engine: team.synth,
+        prompt: ctx(None, &teamwork::split_prompt(&p.prompt, &teamwork::listing(&base), n)),
+        system: system_prompt(false, &ws, p.skill.as_ref()),
+        cwd: root.clone(),
+        work: false,
+        resume: None,
+        plugin_dirs: vec![],
+        model: model_for(p, team.synth, s),
+        effort: Some("medium".into()),
+        max_tokens: Some(4000),
+        extra_dirs: tw.extra_dirs.to_vec(),
+        steer: None,
+    };
+    let o = run_engine_as(app, st, conv, task, mid, "plan", split, SPLIT_TIMEOUT, tw.cancel, false, "plan").await;
+    steps.push(step(team.synth, "plan", &o, &Some("medium".into()), spec_model(p, team.synth, s)));
+    if tw.cancel.is_cancelled() {
+        return stopped(steps, p, Value::Null);
+    }
+    let Some(parts) = o.ok.then(|| teamwork::parse_parts(&o.text, n)).flatten() else {
+        single(p, "독립된 하위 작업으로 분할할 수 없어 단일 에이전트가 전체 파일 수정을 진행합니다.".to_string());
+        return None;
+    };
+
+    // 3) 에이전트마다 폴더 사본
+    let tmp = st.data_dir.join("teamwork").join(task);
+    let dirs: Vec<PathBuf> = (0..parts.len()).map(|i| tmp.join(format!("agent-{}", i + 1))).collect();
+    let copied = {
+        let (r, d, b) = (root.clone(), dirs.clone(), base.clone());
+        tokio::task::spawn_blocking(move || d.iter().try_for_each(|x| teamwork::copy_tree(&r, x, &b))).await.map_err(|e| e.to_string()).and_then(|r| r)
+    };
+    if let Err(e) = copied {
+        tokio::task::spawn_blocking({
+            let t = tmp.clone();
+            move || remove_dir_quietly(t)
+        });
+        no_copy(p, e);
+        return None;
+    }
+
+    // 4) 하위 작업을 동시에
+    let agents: Vec<&TeamAgent> = team.agents.iter().take(parts.len()).collect();
+    let who = |a: &TeamAgent| match &a.model {
+        Some(m) => format!("{} · {m}", a.engine.label()),
+        None => a.engine.label().to_string(),
+    };
+    emit(app, "task:parts", json!({ "taskId": task, "conversationId": conv, "parts": parts.iter().enumerate().map(|(i, x)| json!({ "key": format!("agent:{i}"), "title": x.title, "files": x.files })).collect::<Vec<_>>() }));
+    act(format!("{n}개의 에이전트가 개별 작업 공간에서 동시 작업 중", n = parts.len()));
+    let effort = p.budget.as_ref().map(|b| b.effort.to_string());
+    let max_tokens = p.budget.as_ref().map(|b| b.max_tokens);
+    let outs: Vec<Outcome> = {
+        let pr: &Plan = p;
+        let runs = parts.iter().enumerate().map(|(i, part)| {
+            let a = agents[i];
+            let spec = RunSpec {
+                engine: a.engine,
+                prompt: ctx(None, &teamwork::part_prompt(&pr.prompt, part)),
+                system: format!("{}{}", tw.system, teamwork::part_system(i, &parts)),
+                cwd: dirs[i].clone(),
+                work: true,
+                resume: None,
+                plugin_dirs: if a.engine == EngineId::Claude { tw.plugin_dirs.to_vec() } else { vec![] },
+                model: a.model.clone().or_else(|| model_for(pr, a.engine, s)),
+                effort: effort.clone(),
+                max_tokens,
+                extra_dirs: tw.extra_dirs.to_vec(),
+                steer: None,
+            };
+            let key = format!("agent:{i}");
+            async move { run_engine_as(app, st, conv, task, mid, "agent", spec, tw.timeout, tw.cancel, false, &key).await }
+        });
+        futures_util::future::join_all(runs).await
+    };
+    let good = |o: &Outcome| o.ok && !o.text.trim().is_empty();
+    for (a, o) in agents.iter().zip(&outs) {
+        steps.push(step(a.engine, "agent", o, &spec_effort(p), a.model.clone().or_else(|| spec_model(p, a.engine, s))));
+    }
+
+    // 5) 바뀐 파일 찾기(실패·중지한 에이전트는 합치지 않는다)
+    let changes: Vec<Option<teamwork::Changes>> = {
+        let (d, b, ok): (Vec<PathBuf>, teamwork::Snapshot, Vec<bool>) = (dirs.clone(), base.clone(), outs.iter().map(good).collect());
+        tokio::task::spawn_blocking(move || d.iter().zip(ok).map(|(x, ok)| if ok { teamwork::snapshot(x).ok().map(|a| teamwork::diff(&b, &a)) } else { None }).collect()).await.unwrap_or_default()
+    };
+    let changes: Vec<Option<teamwork::Changes>> = (0..parts.len()).map(|i| changes.get(i).cloned().flatten()).collect();
+    let team_json = |synth: Option<EngineId>, conflicts: &[String]| {
+        json!({
+            "agents": agents.iter().zip(&outs).enumerate().map(|(i, (a, o))| json!({ "engine": a.engine, "model": a.model, "ok": good(o), "text": o.text, "title": parts[i].title, "files": changes[i].as_ref().map(|c| c.paths()).unwrap_or_default() })).collect::<Vec<_>>(),
+            "synth": synth,
+            "work": true,
+            "conflicts": conflicts,
+        })
+    };
+    if tw.cancel.is_cancelled() {
+        tokio::task::spawn_blocking(move || remove_dir_quietly(tmp));
+        return stopped(steps, p, team_json(None, &[]));
+    }
+
+    // 6) 합치기: 한 에이전트만 바꾼 파일은 그대로, 충돌 파일은 첫 판을 쓰고 통합 AI가 나머지를 합친다.
+    let merge = teamwork::plan_merge(&changes);
+    let conflicts: Vec<String> = merge.conflicts.keys().cloned().collect();
+    if !merge.apply.is_empty() {
+        act(format!("변경된 {files}개 파일 병합 중", files = merge.apply.len()));
+    }
+    let errors: Vec<String> = {
+        let (r, d, apply) = (root.clone(), dirs.clone(), merge.apply.clone());
+        tokio::task::spawn_blocking(move || apply.iter().filter_map(|(path, i, del)| teamwork::apply_one(&d[*i], &r, path, *del).err()).collect()).await.unwrap_or_default()
+    };
+    for e in errors.iter().take(5) {
+        act(format!("⚠ {e}"));
+    }
+    let results: Vec<teamwork::PartResult> = agents
+        .iter()
+        .zip(&outs)
+        .enumerate()
+        .map(|(i, (a, o))| teamwork::PartResult { title: &parts[i].title, who: who(a), ok: good(o), summary: &o.text, files: changes[i].as_ref().map(|c| c.paths()).unwrap_or_default() })
+        .collect();
+    let conflict_views: Vec<teamwork::ConflictView> = merge
+        .conflicts
+        .iter()
+        .map(|(path, idx)| teamwork::ConflictView {
+            path: path.clone(),
+            kept: format!("{} · {}", parts[idx[0]].title, who(agents[idx[0]])),
+            others: idx[1..]
+                .iter()
+                .map(|j| {
+                    let deleted = changes[*j].as_ref().is_some_and(|c| c.deleted.contains(path));
+                    let text = if deleted { Some("(deleted)".to_string()) } else { teamwork::read_version(&dirs[*j], path) };
+                    (format!("{} · {}", parts[*j].title, who(agents[*j])), teamwork::version_path(&dirs[*j], path), text)
+                })
+                .collect(),
+        })
+        .collect();
+    if results.iter().all(|r| !r.ok) {
+        tokio::task::spawn_blocking(move || remove_dir_quietly(tmp));
+        let why = outs.iter().find_map(|o| o.error.clone()).unwrap_or_else(|| "답을 받지 못했습니다".into());
+        return Some((format!("⚠ {why}"), message_data(steps, p, json!({ "error": why, "team": team_json(None, &conflicts) }))));
+    }
+
+    // 7) 통합: 원래 폴더에서 맞물림·충돌·실패한 부분을 마무리하고 하나의 결과 요약을 쓴다.
+    let mut extra = tw.extra_dirs.to_vec();
+    extra.push(tmp.to_string_lossy().to_string());
+    let spec = RunSpec {
+        engine: team.synth,
+        prompt: ctx(None, &teamwork::integrate_prompt(&p.prompt, &results, &conflict_views)),
+        system: format!("{}{}", tw.system, teamwork::INTEGRATE_SYSTEM),
+        cwd: root.clone(),
+        work: true,
+        resume: None,
+        plugin_dirs: if team.synth == EngineId::Claude { tw.plugin_dirs.to_vec() } else { vec![] },
+        model: model_for(p, team.synth, s),
+        effort: effort.clone(),
+        max_tokens,
+        extra_dirs: extra,
+        steer: None,
+    };
+    let j = run_engine(app, st, conv, task, mid, "synth", spec, tw.timeout, tw.cancel).await;
+    steps.push(step(team.synth, "synth", &j, &spec_effort(p), spec_model(p, team.synth, s)));
+    tokio::task::spawn_blocking(move || remove_dir_quietly(tmp));
+    let first_ok = agents.iter().zip(&outs).find(|(_, o)| good(o)).map(|(a, _)| a.engine);
+    if good(&j) {
+        return Some((j.text.clone(), message_data(steps, p, json!({ "synthBy": team.synth, "draftedBy": first_ok, "team": team_json(Some(team.synth), &conflicts) }))));
+    }
+    // 통합에 실패하면 합친 결과는 폴더에 남기고 각 에이전트의 요약을 이어 붙여 보여 준다.
+    let joined: String = results.iter().filter(|r| r.ok).map(|r| format!("### {} · {}\n{}\n", r.title, r.who, r.summary.trim())).collect::<Vec<_>>().join("\n");
+    let mut p2 = p.clone();
+    p2.reasons.push(format!("통합 에이전트 {who}의 작업이 실패하여 병합된 파일은 유지되고 각 에이전트의 요약이 대신 표시됩니다.", who = team.synth.label()));
+    Some((joined, message_data(steps, &p2, json!({ "draftedBy": first_ok, "team": team_json(None, &conflicts) }))))
+}
+
 /// 자기 세션을 이어 쓰는 엔진(Claude Code·Antigravity)이 지금까지를 봤다고 적는다.
 fn mark_seen(st: &AppState, conv: &str, engine: EngineId) {
     if engine.resumable() {
         let _ = store::set_seen(&st.db, conv, engine.as_str(), &crate::db::now());
     }
+}
+
+/// 요약은 쉬운 일이라 엔진마다 가장 싼 모델로 시킨다(None이면 설정·기본 모델). 공식 단가표 기준 확인값(2026-10-31).
+fn summary_model(e: EngineId) -> Option<&'static str> {
+    match e {
+        EngineId::Claude => Some("haiku"),
+        EngineId::ClaudeApi => Some("claude-haiku-5-5"),
+        EngineId::OpenAi => Some("gpt-5-nano"),
+        EngineId::GeminiApi => Some("gemini-2.5-flash-lite"),
+        _ => None,
+    }
+}
+
+/// 요약을 맡길 순서: 단가표로 계산한 싼 순서(같으면 API 먼저 — CLI는 띄우는 데 시간이 더 든다).
+pub fn summarizers(installed: &[EngineId]) -> Vec<(EngineId, Option<&'static str>)> {
+    let mut v: Vec<(EngineId, Option<&'static str>)> = engines::ALL.into_iter().filter(|e| installed.contains(e)).map(|e| (e, summary_model(e))).collect();
+    v.sort_by(|a, b| crate::pricing::blended(a.0, a.1).total_cmp(&crate::pricing::blended(b.0, b.1)).then(b.0.is_api().cmp(&a.0.is_api())));
+    v
 }
 
 /// 세션 요약 갱신: 오래된 대화가 충분히 쌓이면 가장 싼 AI가 요약에 접어 넣는다(화면에는 흘리지 않음).
@@ -1216,10 +1970,8 @@ pub async fn refresh_memory(app: &AppHandle, st: &AppState, conv: &str) {
     }
     let new_upto = fold.last().map(|t| t.at.clone());
     let installed = st.installed();
-    // 가장 싼 쪽부터: 빠른 API → Claude Code(haiku·low) → 다른 CLI
-    let order = [EngineId::GeminiApi, EngineId::Nvidia, EngineId::ClaudeApi, EngineId::OpenAi, EngineId::Claude, EngineId::Antigravity, EngineId::Codex];
     let s = st.settings();
-    for engine in order.into_iter().filter(|e| installed.contains(e)) {
+    for (engine, model) in summarizers(&installed) {
         let spec = RunSpec {
             engine,
             prompt: memory::summary_prompt(summary.as_deref(), &fold),
@@ -1228,7 +1980,7 @@ pub async fn refresh_memory(app: &AppHandle, st: &AppState, conv: &str) {
             work: false,
             resume: None,
             plugin_dirs: vec![],
-            model: if engine == EngineId::Claude { Some("haiku".into()) } else { s.models.get(engine.as_str()).cloned() },
+            model: model.map(str::to_string).or_else(|| s.models.get(engine.as_str()).cloned()),
             effort: Some("low".into()),
             max_tokens: Some(1200),
             extra_dirs: vec![],
@@ -1328,7 +2080,7 @@ mod tests {
         let p = plan(deep, None, false, &[Claude, ClaudeApi, GeminiApi], &c, ReviewMode::Auto, None).unwrap();
         assert_eq!((p.primary, p.reviewer), (Claude, Some(GeminiApi)));
         // JEV: 가벼운 대화 → 빠른 API 먼저, 난이도 낮으면 검토 안 함
-        let j = Judgment { model: "jev".into(), task: Some("chat".into()), task_confidence: Some(0.9), difficulty: Some(0.4), difficulty_confidence: Some(0.8), stakes: None, stakes_confidence: None, ms: 1, cost_usd: 0.0 };
+        let j = Judgment { model: "jev".into(), task: Some("chat".into()), task_confidence: Some(0.9), difficulty: Some(0.4), difficulty_confidence: Some(0.8), stakes: None, stakes_confidence: None, fresh: None, local: None, ms: 1, cost_usd: 0.0 };
         let p = plan(deep, None, false, &[Claude, GeminiApi], &c, ReviewMode::Auto, Some(&j)).unwrap();
         assert_eq!(p.primary, GeminiApi);
         assert!(p.reviewer.is_none(), "JEV 난이도가 낮으면 규칙(자세히)보다 우선");
@@ -1350,7 +2102,7 @@ mod tests {
 
     #[test]
     fn jev_difficulty_sets_model_and_effort() {
-        let j = |task: &str, d: f64, conf: f64| Judgment { model: "jev".into(), task: Some(task.into()), task_confidence: Some(0.9), difficulty: Some(d), difficulty_confidence: Some(conf), stakes: None, stakes_confidence: None, ms: 1, cost_usd: 0.0 };
+        let j = |task: &str, d: f64, conf: f64| Judgment { model: "jev".into(), task: Some(task.into()), task_confidence: Some(0.9), difficulty: Some(d), difficulty_confidence: Some(conf), stakes: None, stakes_confidence: None, fresh: None, local: None, ms: 1, cost_usd: 0.0 };
         assert_eq!(budget(None, false), None, "JEV가 없으면 기본값");
         let b = budget(Some(&j("code", 0.5, 0.9)), false).unwrap();
         assert_eq!((b.tier, b.effort, b.claude_model, b.max_tokens), ("light", "low", Some("haiku"), 1500));
@@ -1387,7 +2139,7 @@ mod tests {
     }
 
     fn jj(task: &str, d: f64, stakes: f64) -> Judgment {
-        Judgment { model: "jev".into(), task: Some(task.into()), task_confidence: Some(0.9), difficulty: Some(d), difficulty_confidence: Some(0.9), stakes: Some(stakes), stakes_confidence: Some(0.9), ms: 1, cost_usd: 0.0 }
+        Judgment { model: "jev".into(), task: Some(task.into()), task_confidence: Some(0.9), difficulty: Some(d), difficulty_confidence: Some(0.9), stakes: Some(stakes), stakes_confidence: Some(0.9), fresh: None, local: None, ms: 1, cost_usd: 0.0 }
     }
 
     #[test]
@@ -1478,10 +2230,90 @@ mod tests {
         let t = plan("opus랑 gemini로 동시에 답해 줘", None, false, &all, &c, ReviewMode::Auto, None).unwrap().team.unwrap();
         assert_eq!(t.agents, vec![TeamAgent { engine: Claude, model: Some("opus".into()) }, TeamAgent { engine: Antigravity, model: None }]);
         // 작업 모드는 파일 충돌을 막으려고 한 AI만, 정확도 요청이어도 팀이면 토론 대신 팀
-        assert!(plan_with("파일 고쳐", None, true, &all, &c, ReviewMode::Auto, None, 3).unwrap().team.is_none());
+        // 작업 모드도 나눠서 동시에 한다: CLI가 먼저, 통합도 CLI가 맡는다.
+        let w = plan_with("파일 고쳐", None, true, &all, &c, ReviewMode::Auto, None, 3).unwrap();
+        let t = w.team.expect("작업 팀");
+        assert_eq!(t.agents.len(), 3);
+        assert!(!t.agents[0].engine.is_api() && !t.agents[1].engine.is_api(), "{:?}", t.agents);
+        assert!(!t.synth.is_api() && w.reviewer.is_none() && w.debate.is_none());
+        assert!(plan_with("파일 고쳐", None, true, &all, &c, ReviewMode::Auto, None, 1).unwrap().team.is_none());
         let p = plan("에이전트 2개로 정확히 계산해 줘", None, false, &all, &c, ReviewMode::Auto, None).unwrap();
         assert!(p.team.is_some() && p.debate.is_none());
         let pr = team_prompt("질문", &[("Claude Code · opus".into(), "답1"), ("Antigravity".into(), "답2")]);
         assert!(pr.contains("[에이전트 1: Claude Code · opus]\n답1") && pr.contains("[에이전트 2: Antigravity]\n답2"));
+    }
+
+    #[test]
+    fn council_prefers_cli_windows_from_different_vendors() {
+        let (_t, c) = catalog();
+        use EngineId::*;
+        let all = [Claude, Codex, Antigravity, GeminiApi, Nvidia];
+        let p = plan("이 설계의 장단점", None, false, &all, &c, ReviewMode::Auto, None).unwrap();
+        let cn = council_plan(&p, &all, 3).unwrap();
+        let engines: Vec<EngineId> = cn.agents.iter().map(|a| a.engine).collect();
+        assert_eq!(engines, vec![Claude, Antigravity, Codex], "CLI 창 셋, 회사가 모두 다름");
+        assert_eq!(cn.synth, Claude);
+        assert_eq!(cn.rounds, 3);
+        // 쓸 수 있는 AI가 하나뿐이면 같은 AI를 새 세션으로 둘 띄운다
+        let one = council_plan(&p, &[Claude], 3).unwrap();
+        assert_eq!(one.agents.len(), 3);
+        // 최소 2명, 최대 4명
+        assert_eq!(council_plan(&p, &all, 1).unwrap().agents.len(), 2);
+        assert_eq!(council_plan(&p, &all, 9).unwrap().agents.len(), COUNCIL_MAX_AGENTS);
+        // 가벼운 단계면 2라운드
+        let mut light = p.clone();
+        light.budget = budget_for("light");
+        assert_eq!(council_plan(&light, &all, 2).unwrap().rounds, 2);
+    }
+
+    #[test]
+    fn council_prompts_send_only_what_is_new() {
+        let others = [("1라운드 · 참가자 2 · Codex".to_string(), "B안이 낫다\n합의: 아니오")];
+        let f = council_followup(2, &others);
+        assert!(f.contains("[당신이 마지막으로 말한 뒤 다른 참가자의 발언]") && f.contains("[1라운드 · 참가자 2 · Codex]\nB안이 낫다"));
+        assert!(!f.contains("합의: 아니오\n\n"), "이전 발언의 합의 표시는 떼고 보낸다");
+        assert!(f.contains("2라운드입니다"));
+        let me = "참가자 1 · Claude Code".to_string();
+        let log = [(1u8, me.clone(), "A안"), (1, "참가자 2 · Codex".to_string(), "B안")];
+        let full = council_full("요청", 2, &me, &log);
+        assert!(full.contains("[1라운드 · 참가자 1 · Claude Code(당신)]\nA안") && full.contains("[요청]\n요청"));
+        let syn = council_synth("요청", 2, &log);
+        assert!(syn.contains("[회의 기록]") && syn.contains("회의에서 갈린 점"));
+    }
+
+    #[test]
+    fn agree_marker_is_read_and_stripped() {
+        assert!(says_agree("결론은 A\n합의: 예"));
+        assert!(says_agree("결론은 A\n**합의: 예**"));
+        assert!(!says_agree("결론은 A\n합의: 아니오"));
+        assert!(!says_agree("합의: 예라고 하기엔 이르다\n더 보자"));
+        assert_eq!(strip_agree("결론은 A\n합의: 예"), "결론은 A");
+        assert_eq!(strip_agree("결론은 A"), "결론은 A");
+    }
+
+    #[test]
+    fn memory_summary_goes_to_the_cheapest_engine_first() {
+        use EngineId::*;
+        let order: Vec<EngineId> = summarizers(&[Codex, Claude, Antigravity, ClaudeApi, OpenAi, GeminiApi, Nvidia]).into_iter().map(|x| x.0).collect();
+        assert_eq!(order.first(), Some(&Nvidia), "무료 체험 크레딧");
+        assert_eq!(order.last(), Some(&Codex));
+        let ca = order.iter().position(|e| *e == ClaudeApi).unwrap();
+        let cc = order.iter().position(|e| *e == Claude).unwrap();
+        assert!(ca < cc, "같은 Haiku 단가면 API가 먼저");
+        assert_eq!(summarizers(&[ClaudeApi]), vec![(ClaudeApi, Some("claude-haiku-5-5"))]);
+    }
+
+    #[test]
+    fn jev_tool_need_moves_cli_ahead_of_api() {
+        let (_t, c) = catalog();
+        use EngineId::*;
+        let installed = [GeminiApi, Claude];
+        let mut j = jj("chat", 0.5, 0.0);
+        let p = plan("오늘 비트코인 시세", None, false, &installed, &c, ReviewMode::Off, Some(&j)).unwrap();
+        assert_eq!(p.primary, GeminiApi, "가벼운 대화는 API 먼저");
+        j.fresh = Some(0.9);
+        let p = plan("오늘 비트코인 시세", None, false, &installed, &c, ReviewMode::Off, Some(&j)).unwrap();
+        assert_eq!(p.primary, Claude, "최신 정보가 필요하면 웹 검색이 되는 CLI 먼저");
+        assert!(p.reasons.iter().any(|r| r.starts_with("JEV")));
     }
 }

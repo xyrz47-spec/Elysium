@@ -91,3 +91,58 @@
   --ambient-2: rgba(63, 143, 138, 0.1);
   --ambient-3: rgba(107, 143, 163, 0.08);
 }
+
+/* 리퀴드 글라스(2026-10-31): 판은 뒤가 비치는 유리, 테두리는 빛이 맺히는 가장자리, 위쪽은 반사광 */
+:root, :root[data-theme="dark"] {
+  --glass: rgba(22, 24, 29, 0.06);
+  --glass-2: rgba(34, 37, 44, 0.24);
+  --glass-ctl: rgba(255, 255, 255, 0.03);
+  --glass-ctl-hi: rgba(255, 255, 255, 0.07);
+  --glass-blur: blur(5px) saturate(1.8) brightness(1.05);
+  --pop: #1d2025;
+  --pop-card: #282b31;
+  --pop-surface: #24272c;
+  --pop-surface-2: #2b2e35;
+  --pop-line: rgba(255, 255, 255, 0.1);
+  --glass-sheen: linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0) 30%);
+  --glass-rim: linear-gradient(140deg, rgba(255, 255, 255, 0.46), rgba(255, 255, 255, 0.07) 28%, rgba(255, 255, 255, 0) 52%, rgba(255, 255, 255, 0.1) 80%, rgba(255, 255, 255, 0.32));
+  --glass-inner: inset 0 1px 0 rgba(255, 255, 255, 0.1), inset 0 -14px 28px rgba(255, 255, 255, 0.015);
+  --glass-shadow: 0 20px 50px rgba(0, 0, 0, 0.4), 0 2px 8px rgba(0, 0, 0, 0.22);
+  --glass-spec: rgba(255, 255, 255, 0.1);
+  --glass-blob-1: rgba(121, 184, 179, 0.26);
+  --glass-blob-2: rgba(169, 195, 208, 0.17);
+  --glass-blob-3: rgba(90, 120, 140, 0.16);
+  /* 애플 리퀴드 글라스: 아주 옅은 서리(blur) → 가장자리 렌즈 굴절(--lg-filter) → 채도·밝기 */
+  --lg-backdrop: blur(2px) var(--lg-filter, ) saturate(1.8) brightness(1.06);
+  --lg-edge: inset 0 0 0 0.5px rgba(255, 255, 255, 0.18), inset 1.5px 1.5px 1px -1px rgba(255, 255, 255, 0.6), inset -1.5px -1.5px 1px -1px rgba(255, 255, 255, 0.3), inset 0 -10px 22px -14px rgba(255, 255, 255, 0.14);
+  --lg-drop: 0 10px 28px rgba(0, 0, 0, 0.26), 0 1px 3px rgba(0, 0, 0, 0.14);
+  --glass-press: rgba(255, 255, 255, 0.22);
+  --content: rgba(27, 29, 34, 0.8);
+  --content-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 8px 24px rgba(0, 0, 0, 0.22);
+}
+:root[data-theme="light"] {
+  --glass: rgba(255, 255, 255, 0.07);
+  --glass-2: rgba(255, 255, 255, 0.24);
+  --glass-ctl: rgba(255, 255, 255, 0.12);
+  --glass-ctl-hi: rgba(255, 255, 255, 0.28);
+  --glass-blur: blur(5px) saturate(1.7) brightness(1.03);
+  --pop: #f7f8fa;
+  --pop-card: #ffffff;
+  --pop-surface: #f1f3f6;
+  --pop-surface-2: #eaedf1;
+  --pop-line: rgba(20, 24, 30, 0.1);
+  --glass-sheen: linear-gradient(180deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0) 30%);
+  --glass-rim: linear-gradient(140deg, rgba(255, 255, 255, 1), rgba(255, 255, 255, 0.4) 28%, rgba(255, 255, 255, 0.12) 52%, rgba(255, 255, 255, 0.5) 80%, rgba(255, 255, 255, 0.95));
+  --glass-inner: inset 0 1px 0 rgba(255, 255, 255, 0.95), inset 0 -12px 24px rgba(255, 255, 255, 0.06);
+  --glass-shadow: 0 20px 46px rgba(28, 40, 58, 0.16), 0 2px 6px rgba(28, 40, 58, 0.08);
+  --glass-spec: rgba(255, 255, 255, 0.5);
+  --glass-blob-1: rgba(63, 143, 138, 0.3);
+  --glass-blob-2: rgba(107, 143, 163, 0.28);
+  --glass-blob-3: rgba(140, 165, 190, 0.34);
+  --lg-backdrop: blur(2px) var(--lg-filter, ) saturate(1.7) brightness(1.04);
+  --lg-edge: inset 0 0 0 0.5px rgba(255, 255, 255, 0.75), inset 1.5px 1.5px 1px -1px rgba(255, 255, 255, 1), inset -1.5px -1.5px 1px -1px rgba(255, 255, 255, 0.8), inset 0 -10px 22px -14px rgba(255, 255, 255, 0.5);
+  --lg-drop: 0 10px 26px rgba(28, 40, 58, 0.14), 0 1px 3px rgba(28, 40, 58, 0.08);
+  --glass-press: rgba(255, 255, 255, 0.6);
+  --content: rgba(255, 255, 255, 0.82);
+  --content-shadow: 0 1px 2px rgba(20, 22, 26, 0.06), 0 8px 22px rgba(28, 40, 58, 0.1);
+}

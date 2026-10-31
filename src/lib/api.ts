@@ -71,7 +71,7 @@ export const TIER_LABEL: Record<Budget["tier"], string> = { light: "가볍게", 
 export interface Step {
   engine: EngineId;
   label: string;
-  role: "draft" | "review" | "debate" | "rebuttal" | "judge" | "agent" | "synth";
+  role: "draft" | "review" | "debate" | "rebuttal" | "judge" | "agent" | "synth" | "council" | "plan";
   effort: string | null;
   model: string | null;
   ok: boolean;
@@ -98,6 +98,10 @@ export interface Judgment {
   /** 0~3: 정확도가 얼마나 중요한지(틀리면 얼마나 곤란한지) */
   stakes?: number | null;
   stakesConfidence?: number | null;
+  /** 0~1: 최신 웹 정보가 필요할 확률 */
+  fresh?: number | null;
+  /** 0~1: 이 PC의 파일을 열어 봐야 할 확률 */
+  local?: number | null;
   ms: number;
   costUsd: number;
 }
@@ -116,6 +120,29 @@ export interface TeamPlan {
   synth: EngineId;
 }
 
+/** 회의: 여러 AI가 라운드마다 서로의 발언을 읽고 대화하며 푼다 */
+export interface CouncilPlan {
+  agents: { engine: EngineId; model: string | null }[];
+  rounds: number;
+  synth: EngineId;
+}
+
+export interface CouncilTurn {
+  round: number;
+  idx: number;
+  engine: EngineId;
+  ok: boolean;
+  text: string;
+}
+
+/** JEV가 답 비교·검토 생략을 판단한 기록 */
+export interface JevCheck {
+  kind: "compare" | "council" | "draft";
+  value: number;
+  ms: number;
+  costUsd: number;
+}
+
 export interface MessageData {
   steps?: Step[];
   work?: boolean;
@@ -126,8 +153,12 @@ export interface MessageData {
   reviewedBy?: EngineId;
   judgedBy?: EngineId;
   synthBy?: EngineId;
-  team?: { agents: { engine: EngineId; model: string | null; ok: boolean; text: string }[]; synth: EngineId | null };
+  /** work: 병렬 작업(하위 작업마다 폴더 사본에서 고친 뒤 합침) — title·files·conflicts가 있다 */
+  team?: { agents: { engine: EngineId; model: string | null; ok: boolean; text: string; title?: string; files?: string[] }[]; synth: EngineId | null; work?: boolean; conflicts?: string[] };
   debate?: { participants: EngineId[]; judge: EngineId | null; rounds: { round: number; engine: EngineId; text: string }[] };
+  council?: { agents: { engine: EngineId; model: string | null }[]; rounds: CouncilTurn[]; synth: EngineId | null; agreed: boolean; agree: number | null; maxRounds: number };
+  jevChecks?: JevCheck[];
+  skippedReview?: EngineId;
   primary?: EngineId;
   reviewer?: EngineId | null;
   jev?: Judgment | null;
@@ -137,6 +168,8 @@ export interface MessageData {
   engine?: EngineId | null;
   /** '만들기'로 보낸 요청(사용자 메시지에 저장) */
   build?: boolean;
+  /** '회의'로 보낸 요청(사용자 메시지에 저장) */
+  askedCouncil?: boolean;
 }
 
 export interface Message {
@@ -217,9 +250,11 @@ export const api = {
   conversationSetWorkspace: (conversationId: string, path: string | null) => invoke<void>("conversation_set_workspace", { conversationId, path }),
   pickFolder: () => invoke<string | null>("pick_folder"),
   /** work: 작업 모드(허락을 받은 뒤 파일 수정) · build: '만들기' — 승인 없이 폴더 안에서 끝까지 완성(작업 모드 포함) */
-  chatSend: (conversationId: string | null, text: string, engine: EngineChoice, work: boolean, build: boolean, workspace: string | null) =>
-    invoke<{ conversationId: string; taskId: string; userMessageId: string }>("chat_send", { conversationId, text, engine, work: work || build, build, workspace }),
+  chatSend: (conversationId: string | null, text: string, engine: EngineChoice, work: boolean, build: boolean, workspace: string | null, council = false) =>
+    invoke<{ conversationId: string; taskId: string; userMessageId: string }>("chat_send", { conversationId, text, engine, work: !council && (work || build), build, workspace, council }),
   taskCancel: (taskId: string) => invoke<boolean>("task_cancel", { taskId }),
+  /** 실행 중인 에이전트 하나만 멈춘다(같은 작업의 다른 에이전트는 계속) */
+  agentCancel: (taskId: string, key: string) => invoke<boolean>("agent_cancel", { taskId, key }),
   /** 작업 중 메시지: API 작업 모드가 다음 차례에 읽는다. 받지 않는 AI면 오류 */
   taskSteer: (taskId: string, text: string) => invoke<void>("task_steer", { taskId, text }),
   cancelAll: () => invoke<number>("cancel_all"),
@@ -294,6 +329,8 @@ export interface ModelPrice {
   displayName: string;
   inputUsdPerM: number;
   outputUsdPerM: number;
+  /** 캐시에서 읽은 입력 1M 토큰당 */
+  cachedUsdPerM?: number;
   description: string;
 }
 
