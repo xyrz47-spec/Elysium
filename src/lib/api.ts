@@ -34,6 +34,8 @@ export interface Settings {
   agentsAuto: boolean;
   /** 입력하는 동안 JEV가 모드·스킬을 추천한다 */
   jevSuggest: boolean;
+  /** 게임 창을 띄우는 테스트를 동시에 몇 개까지 돌릴지(앱 전체, 1~8) */
+  testSlots: number;
 }
 
 /** 채팅에 붙은 파일(사용자가 올렸거나 에이전트가 답에 붙임) */
@@ -180,7 +182,7 @@ export interface MessageData {
   judgedBy?: EngineId;
   synthBy?: EngineId;
   /** work: 병렬 작업(하위 작업마다 폴더 사본에서 고친 뒤 합침) — title·files·conflicts가 있다 */
-  team?: { agents: { engine: EngineId; model: string | null; ok: boolean; text: string; title?: string; files?: string[] }[]; synth: EngineId | null; work?: boolean; conflicts?: string[] };
+  team?: { agents: { engine: EngineId; model: string | null; ok: boolean; text: string; title?: string; files?: string[] }[]; synth: EngineId | null; work?: boolean; conflicts?: string[]; decisions?: LeadDecision[]; groupLog?: GroupNote[] };
   debate?: { participants: EngineId[]; judge: EngineId | null; rounds: { round: number; engine: EngineId; text: string }[] };
   council?: { agents: { engine: EngineId; model: string | null }[]; rounds: CouncilTurn[]; synth: EngineId | null; agreed: boolean; agree: number | null; maxRounds: number };
   jevChecks?: JevCheck[];
@@ -257,7 +259,72 @@ export interface AppInfo {
   workspace: string;
 }
 
+export interface LeadDecision {
+  id: string;
+  taskId: string;
+  key: string;
+  command: string;
+  why: string;
+  verdict: "once" | "deny" | "similar" | "all" | "ask_user";
+  by: "jev" | "lead" | "rule" | "all" | "self";
+  pattern: string | null;
+  window: boolean;
+  reason: string;
+  at: string;
+}
+
+export interface LeadPolicy {
+  allowAll: boolean;
+  rules: { pattern: string; window: boolean }[];
+}
+
+export interface LeadQuestion {
+  id: string;
+  taskId: string;
+  conversationId: string;
+  question: string;
+  options: string[];
+  workers: string[];
+}
+
+export interface GroupNote {
+  taskId: string;
+  group: number;
+  round: number;
+  key: string;
+  who: string;
+  text: string;
+  claim: string[];
+  done: boolean;
+}
+
+export interface GroupInfo {
+  index: number;
+  title: string;
+  keys: string[];
+}
+
+export interface TestItem {
+  id: number;
+  task: string;
+  key: string;
+  command: string;
+}
+
+export interface QueueView {
+  capacity: number;
+  running: TestItem[];
+  waiting: TestItem[];
+}
+
 export const api = {
+  leadSend: (taskId: string, text: string, about: string | null) => invoke<void>("lead_send", { taskId, text, about }),
+  leadAnswer: (questionId: string, text: string) => invoke<void>("lead_answer", { questionId, text }),
+  leadQuestions: () => invoke<LeadQuestion[]>("lead_questions"),
+  leadRevoke: (taskId: string) => invoke<void>("lead_revoke", { taskId }),
+  testCancel: (id: number) => invoke<boolean>("test_cancel", { id }),
+  queueGet: () => invoke<QueueView>("queue_get"),
+  workerWindowOpen: (taskId: string, key: string, title: string) => invoke<void>("worker_window_open", { taskId, key, title }),
   appInfo: () => invoke<AppInfo>("app_info"),
   settingsGet: () => invoke<Settings>("settings_get"),
   settingsUpdate: (settings: Settings) => invoke<Settings>("settings_update", { settings }),

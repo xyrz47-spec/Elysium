@@ -1,6 +1,8 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
-import { api, errorText, type Approval, type Conversation, type EngineChoice, type EngineId, type EngineInfo, type Budget, type CouncilPlan, type DebatePlan, type Judgment, type Message, type Settings, type SkillRef, type SkillsView, type TeamPlan } from "./lib/api";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { api, errorText, type GroupInfo, type GroupNote, type LeadDecision, type LeadPolicy, type LeadQuestion, type QueueView, type Approval, type Conversation, type EngineChoice, type EngineId, type EngineInfo, type Budget, type CouncilPlan, type DebatePlan, type Judgment, type Message, type Settings, type SkillRef, type SkillsView, type TeamPlan } from "./lib/api";
 import { useTauriEvent } from "./lib/events";
+import { emit } from "@tauri-apps/api/event";
+import { ACTIVITY_KEEP, STREAM_KEEP } from "./lib/panel";
 
 export interface Toast {
   id: number;
@@ -26,6 +28,8 @@ export interface AgentRun {
   stopped: boolean;
   /** 사용자가 이 에이전트에게 보낸 메시지 */
   sent: string[];
+  /** 차례 사이에 무엇을 기다리는지(review·question·test·command) */
+  wait?: string | null;
 }
 
 /** 곁질문 한 차례. 앱 메모리에만 두고 대화 기록에 남기지 않는다. */
@@ -46,8 +50,18 @@ export interface PartInfo {
   files: string[];
 }
 
-/** 에이전트 하나가 지금까지 쓴 글은 끝부분만 둔다(오래 도는 작업에서 메모리를 아낀다). */
-const STREAM_KEEP = 20000;
+/** 병렬 작업의 총괄 상태 */
+export interface LeadState {
+  engine: EngineId;
+  label: string;
+  model: string | null;
+  said: { who: "lead" | "user"; text: string }[];
+  policy: LeadPolicy;
+  decisions: LeadDecision[];
+  questions: LeadQuestion[];
+  groups: GroupInfo[];
+  groupLog: GroupNote[];
+}
 
 /** 진행 중인 요청 하나(스트리밍 중인 답) */
 export interface Live {
@@ -72,6 +86,8 @@ export interface Live {
   team: TeamPlan | null;
   /** 회의일 때 참가 AI·최대 라운드·정리 AI */
   council: CouncilPlan | null;
+  /** 병렬 작업의 총괄 */
+  lead: LeadState | null;
   /** 여러 AI가 동시에 쓰는 글(실행 key → 지금까지 받은 글). 회의 창이 보여 준다. */
   streams: Record<string, string>;
   /** 실행 key → 상태(시작한 순서대로) */
@@ -88,6 +104,8 @@ export interface Live {
 export type Dialog = null | "settings" | "keys" | "skills" | "usage";
 
 interface AppCtx {
+  /** 게임 테스트 대기열(앱 전체) */
+  queue: QueueView;
   engines: EngineInfo[];
   setEngines: (e: EngineInfo[]) => void;
   /** 새 세션을 시작할 때 쓸 폴더(없으면 기본 작업 폴더) */
@@ -138,6 +156,7 @@ export function useApp(): AppCtx {
 const blank = (taskId: string, conversationId: string, work: boolean): Live => ({
   taskId,
   conversationId,
+  lead: null,
   messageId: null,
   primary: null,
   reviewer: null,
@@ -184,6 +203,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [live, setLive] = useState<Record<string, Live>>({});
+  const [queue, setQueue] = useState<QueueView>({ capacity: 1, running: [], waiting: [] });
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [skills, setSkills] = useState<SkillsView | null>(null);
   const [dialog, setDialog] = useState<Dialog>(null);
@@ -257,17 +277,54 @@ export function AppProvider({ children }: { children: ReactNode }) {
       const prev = l.agents[p.key];
       const run: AgentRun =
         p.state === "run"
-          ? { key: p.key, engine: p.engine, label: p.label, role: p.role, model: p.model ?? null, effort: p.effort ?? null, state: "run", startedAt: Date.now(), ms: null, error: null, chars: null, activities: [], stopped: false, sent: [] }
-          : { ...(prev ?? { key: p.key, engine: p.engine, label: p.label, role: p.role, model: null, effort: null, startedAt: Date.now(), activities: [], sent: [] }), state: p.state, ms: p.ms ?? null, error: p.error ?? null, chars: p.chars ?? null, stopped: !!p.stopped };
+          ? // 같은 워커의 다음 차례는 앞선 기록을 이어 간다.
+            { key: p.key, engine: p.engine, label: p.label, role: p.role, model: p.model ?? null, effort: p.effort ?? null, state: "run", startedAt: prev?.startedAt ?? Date.now(), ms: null, error: null, chars: null, activities: prev?.activities ?? [], stopped: false, sent: prev?.sent ?? [], wait: null }
+          : { ...(prev ?? { key: p.key, engine: p.engine, label: p.label, role: p.role, model: null, effort: null, startedAt: Date.now(), activities: [], sent: [] }), state: p.state, ms: p.ms ?? null, error: p.error ?? null, chars: p.chars ?? null, stopped: !!p.stopped, wait: null };
       return { ...m, [p.taskId]: { ...l, agents: { ...l.agents, [p.key]: run } } };
     }),
   );
   useTauriEvent<{ taskId: string; key: string; text: string }>("task:agent-activity", (p) =>
     patch(p.taskId, (l) => {
       const a = l.agents[p.key];
-      return a ? { ...l, agents: { ...l.agents, [p.key]: { ...a, activities: [...a.activities, p.text].slice(-6) } } } : l;
+      return a ? { ...l, agents: { ...l.agents, [p.key]: { ...a, activities: [...a.activities, p.text].slice(-ACTIVITY_KEEP) } } } : l;
     }),
   );
+  useTauriEvent<{ taskId: string; key: string; note: string }>("task:agent-wait", (p) =>
+    patch(p.taskId, (l) => {
+      const a = l.agents[p.key];
+      return a ? { ...l, agents: { ...l.agents, [p.key]: { ...a, state: "run", wait: p.note } } } : l;
+    }),
+  );
+  useTauriEvent<{ taskId: string; conversationId: string; engine: EngineId; label: string; model: string | null }>("lead:started", (p) =>
+    setLive((m) => {
+      const l = m[p.taskId] ?? blank(p.taskId, p.conversationId, true);
+      return { ...m, [p.taskId]: { ...l, lead: { engine: p.engine, label: p.label, model: p.model, said: [], policy: { allowAll: false, rules: [] }, decisions: [], questions: [], groups: [], groupLog: [] } } };
+    }),
+  );
+  const patchLead = (taskId: string, fn: (d: LeadState) => LeadState) => patch(taskId, (l) => (l.lead ? { ...l, lead: fn(l.lead) } : l));
+  useTauriEvent<{ taskId: string; text: string }>("lead:said", (p) => patchLead(p.taskId, (d) => ({ ...d, said: [...d.said, { who: "lead", text: p.text }] })));
+  useTauriEvent<{ taskId: string; text: string }>("lead:user", (p) => patchLead(p.taskId, (d) => ({ ...d, said: [...d.said, { who: "user", text: p.text }] })));
+  useTauriEvent<LeadDecision>("lead:decision", (p) => patchLead(p.taskId, (d) => ({ ...d, decisions: [...d.decisions, p] })));
+  useTauriEvent<{ taskId: string; policy: LeadPolicy }>("lead:policy", (p) => patchLead(p.taskId, (d) => ({ ...d, policy: p.policy })));
+  useTauriEvent<LeadQuestion>("lead:question", (p) => patchLead(p.taskId, (d) => ({ ...d, questions: [...d.questions.filter((q) => q.id !== p.id), p] })));
+  useTauriEvent<{ id: string }>("lead:question-closed", (p) =>
+    setLive((m) => Object.fromEntries(Object.entries(m).map(([k, l]) => [k, l.lead ? { ...l, lead: { ...l.lead, questions: l.lead.questions.filter((q) => q.id !== p.id) } } : l]))),
+  );
+  useTauriEvent<{ taskId: string; groups: GroupInfo[] }>("task:groups", (p) => patchLead(p.taskId, (d) => ({ ...d, groups: p.groups })));
+  useTauriEvent<GroupNote>("group:say", (p) => patchLead(p.taskId, (d) => ({ ...d, groupLog: [...d.groupLog, p] })));
+  useTauriEvent<QueueView>("queue:changed", setQueue);
+  useEffect(() => {
+    api.queueGet().then(setQueue).catch(() => {});
+  }, []);
+  // 별도 창이 열리면 지금까지의 상태를 채워 준다.
+  const liveRef = useRef(live);
+  liveRef.current = live;
+  useTauriEvent<{ label: string; task: string; keys: string[] }>("worker-window:hello", (p) => {
+    const l = liveRef.current[p.task];
+    const pick = <T,>(from: Record<string, T> | undefined) => Object.fromEntries(p.keys.filter((k) => from?.[k] !== undefined).map((k) => [k, from![k]]));
+    const groupIndex = l?.lead?.groups.find((g) => g.keys.some((k) => p.keys.includes(k)))?.index;
+    emit("worker-window:snapshot", { label: p.label, runs: pick(l?.agents), streams: pick(l?.streams), parts: pick(l?.parts), decisions: l?.lead?.decisions.filter((d) => p.keys.includes(d.key)) ?? [], groupLog: l?.lead?.groupLog.filter((g) => g.group === groupIndex) ?? [] });
+  });
   useTauriEvent<{ taskId: string; key: string; text: string }>("task:agent-message", (p) =>
     patch(p.taskId, (l) => {
       const a = l.agents[p.key];
@@ -452,6 +509,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const value = useMemo<AppCtx>(
     () => ({
+      queue,
       engines,
       setEngines,
       newFolder,
@@ -484,7 +542,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       toasts,
       toast,
     }),
-    [engines, newFolder, chooseFolder, resetFolder, refreshEngines, settings, saveSettings, conversations, conversationId, deleteConversation, messages, live, approvals, decide, send, cancel, cancelAgent, cancelAll, side, askSide, stopSide, clearSide, skills, refreshSkills, dialog, toasts, toast],
+    [queue, engines, newFolder, chooseFolder, resetFolder, refreshEngines, settings, saveSettings, conversations, conversationId, deleteConversation, messages, live, approvals, decide, send, cancel, cancelAgent, cancelAll, side, askSide, stopSide, clearSide, skills, refreshSkills, dialog, toasts, toast],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

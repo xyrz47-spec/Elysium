@@ -1,6 +1,7 @@
 //! 병렬 작업: 작업(만들기)을 여러 에이전트에게 나눠 맡긴다.
 //! 에이전트마다 작업 폴더의 사본에서 따로 일하고, 끝나면 바뀐 파일만 원래 폴더로 합친다.
 //! 두 에이전트가 같은 파일을 다르게 고쳤으면(충돌) 통합 AI가 원래 폴더에서 하나로 합친다.
+//! 복사하기에 너무 큰 git 저장소는 사본 대신 git worktree에서 일한다.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -14,6 +15,7 @@ const SKIP_DIRS: &[&str] = &[
 /// 이보다 크면 사본을 만들지 않고 한 에이전트로 돌아간다.
 const MAX_FILES: usize = 20_000;
 const MAX_BYTES: u64 = 300 * 1024 * 1024;
+const LIMITS: Limits = Limits { files: MAX_FILES, bytes: MAX_BYTES };
 /// 통합 AI에게 글로 보여 주는 충돌 파일 한 판의 최대 글자 수(넘으면 경로만 준다)
 const CONFLICT_CHARS: usize = 12_000;
 /// 나누는 AI에게 보여 주는 파일 목록의 최대 줄 수
@@ -24,10 +26,50 @@ const LISTING_LINES: usize = 300;
 pub struct Snapshot {
     pub files: BTreeMap<String, [u8; 32]>,
     pub bytes: u64,
+    pub scope: Scope,
+}
+
+/// 어떤 파일을 사본에 넣는가
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Scope {
+    /// SKIP_DIRS를 뺀 전부
+    #[default]
+    All,
+    /// .gitignore에 걸린 파일까지 뺀다. 사본에는 .git이 없어도 .gitignore는 들어가므로 같은 규칙으로 읽힌다.
+    GitIgnore,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    pub files: usize,
+    pub bytes: u64,
+}
+
+/// 사본에서 일하는 AI에게 알리는 말(Scope::GitIgnore일 때만)
+pub const GITIGNORE_NOTE: &str = "- 폴더가 커서 .gitignore에 걸린 파일(캐시·실행 폴더 등)은 작업 공간에 넣지 않았습니다. 없다고 새로 만들지 마세요.\n";
+/// git worktree에서 일하는 AI에게 알리는 말
+pub const WORKTREE_NOTE: &str = "- 이 작업 공간은 git worktree입니다. 커밋·브랜치·stash를 만들지 마세요. 끝나면 바뀐 파일만 합칩니다.\n";
+
+/// 에이전트 작업 공간을 어떻게 만들었는가
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Prepared {
+    Copy,
+    Worktree,
+}
+
+#[derive(Debug)]
+pub struct AgentDirs {
+    pub dirs: Vec<PathBuf>,
+    pub how: Prepared,
 }
 
 fn skip_dir(name: &str) -> bool {
     SKIP_DIRS.iter().any(|d| d.eq_ignore_ascii_case(name))
+}
+
+/// Invariant: a worktree's or submodule's `.git` is a file; it must never enter a snapshot or it gets merged into the root.
+fn is_git_meta(name: &str) -> bool {
+    name.eq_ignore_ascii_case(".git")
 }
 
 fn hash_file(p: &Path) -> std::io::Result<[u8; 32]> {
@@ -35,9 +77,68 @@ fn hash_file(p: &Path) -> std::io::Result<[u8; 32]> {
     Ok(Sha256::digest(&data).into())
 }
 
-/// 폴더 안 파일의 해시 목록. 크기 한도를 넘으면 Err(사람이 읽는 이유).
+/// 폴더 안 파일의 해시 목록. 전부 넣기에 너무 크면 .gitignore에 걸린 파일을 빼고 다시 센다. 그래도 크면 Err(사람이 읽는 이유).
 pub fn snapshot(root: &Path) -> Result<Snapshot, String> {
-    let mut snap = Snapshot::default();
+    snapshot_within(root, LIMITS)
+}
+
+fn snapshot_within(root: &Path, limits: Limits) -> Result<Snapshot, String> {
+    walk_all(root, limits).or_else(|_| walk_gitignore(root, limits))
+}
+
+/// 사본을 기준과 같은 범위로 다시 센다. 범위가 다르면 무시된 산출물이 새 파일로 잡혀 원래 폴더로 합쳐진다.
+pub fn snapshot_like(root: &Path, scope: Scope) -> Result<Snapshot, String> {
+    match scope {
+        Scope::All => walk_all(root, LIMITS),
+        Scope::GitIgnore => walk_gitignore(root, LIMITS),
+    }
+}
+
+/// 해시하기 전에 크기만 먼저 센다. 한도를 넘는 폴더를 수백 MB씩 읽고 나서야 포기하지 않게 한다.
+#[derive(Default)]
+struct Found {
+    files: Vec<PathBuf>,
+    bytes: u64,
+}
+
+impl Found {
+    fn add(&mut self, path: PathBuf, len: u64, limits: Limits) -> Result<(), String> {
+        self.bytes += len;
+        if self.files.len() >= limits.files || self.bytes > limits.bytes {
+            return Err(format!("files>{} or bytes>{}MB", limits.files, limits.bytes / 1024 / 1024));
+        }
+        self.files.push(path);
+        Ok(())
+    }
+
+    fn hash(self, root: &Path, scope: Scope) -> Snapshot {
+        let files = self.files.iter().filter_map(|p| hash_file(p).ok().map(|h| (rel(root, p), h))).collect();
+        Snapshot { files, bytes: self.bytes, scope }
+    }
+}
+
+fn walk_gitignore(root: &Path, limits: Limits) -> Result<Snapshot, String> {
+    let mut found = Found::default();
+    let mut walk = ignore::WalkBuilder::new(root);
+    // Invariant: standard_filters(false) disables parents(), so rules outside the workspace or copy never apply.
+    walk.standard_filters(false).git_ignore(true).require_git(false);
+    walk.filter_entry(|e| {
+        let name = e.file_name().to_string_lossy();
+        e.depth() == 0 || !(is_git_meta(&name) || (e.file_type().is_some_and(|t| t.is_dir()) && skip_dir(&name)))
+    });
+    for entry in walk.build() {
+        let entry = entry.map_err(|e| format!("{}: {e}", root.display()))?;
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        found.add(entry.into_path(), meta.len(), limits)?;
+    }
+    Ok(found.hash(root, Scope::GitIgnore))
+}
+
+fn walk_all(root: &Path, limits: Limits) -> Result<Snapshot, String> {
+    let mut found = Found::default();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let rd = match std::fs::read_dir(&dir) {
@@ -50,7 +151,7 @@ pub fn snapshot(root: &Path) -> Result<Snapshot, String> {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
             // 심볼릭 링크는 따라가지 않는다(폴더 밖으로 나가거나 순환할 수 있다).
-            if ft.is_symlink() {
+            if ft.is_symlink() || is_git_meta(&name) {
                 continue;
             }
             if ft.is_dir() {
@@ -60,15 +161,10 @@ pub fn snapshot(root: &Path) -> Result<Snapshot, String> {
                 continue;
             }
             let Ok(meta) = entry.metadata() else { continue };
-            snap.bytes += meta.len();
-            if snap.files.len() >= MAX_FILES || snap.bytes > MAX_BYTES {
-                return Err(format!("files>{MAX_FILES} or bytes>{}MB", MAX_BYTES / 1024 / 1024));
-            }
-            let Ok(h) = hash_file(&path) else { continue };
-            snap.files.insert(rel(root, &path), h);
+            found.add(path, meta.len(), limits)?;
         }
     }
-    Ok(snap)
+    Ok(found.hash(root, Scope::All))
 }
 
 fn rel(root: &Path, p: &Path) -> String {
@@ -90,6 +186,85 @@ pub fn copy_tree(src: &Path, dst: &Path, snap: &Snapshot) -> Result<(), String> 
         std::fs::copy(join(src, r), &to).map_err(|e| format!("{r}: {e}"))?;
     }
     Ok(())
+}
+
+fn git_in(dir: &Path) -> std::process::Command {
+    let mut c = std::process::Command::new("git");
+    c.arg("-C").arg(dir).args(["-c", "core.longpaths=true"]);
+    c.stdin(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000);
+    }
+    c
+}
+
+fn git_output(c: &mut std::process::Command) -> Result<String, String> {
+    let o = c.output().map_err(|e| format!("git: {e}"))?;
+    if o.status.success() {
+        Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&o.stderr).trim().to_string())
+    }
+}
+
+/// worktree를 작업 폴더의 지금 상태에 맞춘다. HEAD에는 없는 커밋 전 변경(고침·지움·새 파일)을 옮기는 일이다.
+fn sync_to_base(root: &Path, dir: &Path, base: &Snapshot) -> Result<(), String> {
+    // 두 번째 차례는 .gitignore가 커밋 전에 바뀌었을 때만 돈다(첫 차례는 HEAD의 규칙으로 읽었다).
+    for _ in 0..2 {
+        let c = diff(base, &snapshot_like(dir, base.scope)?);
+        for p in c.written.keys() {
+            apply_one(root, dir, p, !base.files.contains_key(p))?;
+        }
+        for p in &c.deleted {
+            apply_one(root, dir, p, false)?;
+        }
+        if !c.paths().iter().any(|p| p.ends_with(".gitignore")) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn make_worktrees(root: &Path, tmp: &Path, n: usize, base: &Snapshot) -> Result<Vec<PathBuf>, String> {
+    let prefix = git_output(git_in(root).args(["rev-parse", "--show-prefix"]))?;
+    (0..n)
+        .map(|i| {
+            let top = tmp.join(format!("agent-{}", i + 1));
+            git_output(git_in(root).args(["worktree", "add", "--detach"]).arg(&top).arg("HEAD"))?;
+            // 작업 폴더가 저장소의 하위 폴더면 에이전트도 같은 하위 폴더에서 일한다.
+            let dir = prefix.split('/').filter(|s| !s.is_empty()).fold(top, |p, part| p.join(part));
+            std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            sync_to_base(root, &dir, base)?;
+            Ok(dir)
+        })
+        .collect()
+}
+
+/// 에이전트 작업 공간을 만든다: 전부 복사할 수 있으면 사본, 너무 크면 git worktree, git을 못 쓰면 무시된 파일을 뺀 사본.
+pub fn prepare_dirs(root: &Path, tmp: &Path, n: usize, base: &Snapshot) -> Result<AgentDirs, String> {
+    if base.scope == Scope::GitIgnore {
+        match make_worktrees(root, tmp, n, base) {
+            Ok(dirs) => return Ok(AgentDirs { dirs, how: Prepared::Worktree }),
+            Err(_) => remove_dirs(root, tmp),
+        }
+    }
+    let dirs: Vec<PathBuf> = (0..n).map(|i| tmp.join(format!("agent-{}", i + 1))).collect();
+    dirs.iter().try_for_each(|d| copy_tree(root, d, base))?;
+    Ok(AgentDirs { dirs, how: Prepared::Copy })
+}
+
+/// 작업 공간을 지운다. worktree는 저장소의 등록까지 지운다.
+pub fn remove_dirs(root: &Path, tmp: &Path) {
+    let worktrees: Vec<PathBuf> = std::fs::read_dir(tmp).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.join(".git").is_file()).collect();
+    for w in &worktrees {
+        let _ = git_output(git_in(root).args(["worktree", "remove", "--force"]).arg(w));
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+    if !worktrees.is_empty() {
+        let _ = git_output(git_in(root).args(["worktree", "prune"]));
+    }
 }
 
 /// 한 에이전트가 사본에서 바꾼 것
@@ -204,6 +379,13 @@ pub struct Part {
     /// 이 에이전트가 맡는 파일·폴더(다른 에이전트는 건드리지 않는다)
     #[serde(default)]
     pub files: Vec<String>,
+    /// 이 하위 작업을 함께 맡는 워커 수. 2 이상이면 그룹으로 대화하며 같은 작업 공간에서 일한다.
+    #[serde(default = "one")]
+    pub members: usize,
+}
+
+fn one() -> usize {
+    1
 }
 
 /// 나누는 AI의 답에서 하위 작업 목록(JSON 배열)을 꺼낸다. 최대 n개, 둘 미만이면 None.
@@ -221,8 +403,19 @@ pub fn parse_parts(text: &str, n: usize) -> Option<Vec<Part>> {
         return None;
     }
     let parts: Vec<Part> = serde_json::from_str(&body[a..=b]).ok()?;
-    let parts: Vec<Part> = parts.into_iter().filter(|p| !p.task.trim().is_empty()).take(n).collect();
-    (parts.len() >= 2).then_some(parts)
+    let mut parts: Vec<Part> = parts.into_iter().filter(|p| !p.task.trim().is_empty()).take(n).collect();
+    for p in &mut parts {
+        p.members = p.members.max(1);
+    }
+    // 합이 워커 수를 넘으면 가장 큰 그룹부터 줄인다.
+    while parts.iter().map(|p| p.members).sum::<usize>() > n {
+        if let Some(big) = parts.iter_mut().filter(|p| p.members > 1).max_by_key(|p| p.members) {
+            big.members -= 1;
+        } else {
+            break;
+        }
+    }
+    (parts.iter().map(|p| p.members).sum::<usize>() >= 2).then_some(parts)
 }
 
 /// 하위 작업으로 나누라는 요청(나누는 AI는 대화 모드로 돈다)
@@ -234,8 +427,9 @@ pub fn split_prompt(request: &str, listing: &str, n: usize) -> String {
          - 공통 설정·진입 파일(package.json, main 등)처럼 여럿이 고쳐야 하는 파일은 한 하위 작업에만 맡기고, 다른 작업의 task에는 '그 파일은 건드리지 말 것'이라고 적으세요.\n\
          - 각 task는 다른 에이전트의 결과를 보지 않고도 끝낼 수 있게 필요한 이름·경로·인터페이스를 구체적으로 적으세요.\n\
          - 나눌수록 손해인 작은 요청이거나 서로 너무 얽혀 있으면 하위 작업 1개만 쓰세요.\n\
+         - 그룹: members가 2 이상인 하위 작업은 그 수만큼의 워커가 한 그룹이 되어 대화하며 같은 작업 공간에서 함께 합니다. 요청문에 적힌 그룹은 그대로 따르세요. 적혀 있지 않으면 서로 많이 얽혀 혼자 하기 어려운 하위 작업만 묶고 나머지는 members를 1로 두세요. members의 합은 {n}을 넘을 수 없습니다.\n\
          파일을 고치지 말고, 설명 없이 아래 형식의 JSON 배열 하나만 답하세요.\n\
-         [{{\"title\": \"짧은 이름\", \"task\": \"이 에이전트가 할 일(구체적으로)\", \"files\": [\"맡는 파일·폴더 경로\"]}}]"
+         [{{\"title\": \"짧은 이름\", \"task\": \"이 에이전트가 할 일(구체적으로)\", \"files\": [\"맡는 파일·폴더 경로\"], \"members\": 1}}]"
     )
 }
 
@@ -357,6 +551,131 @@ mod tests {
     }
 
     #[test]
+    fn ignored_files_are_left_out_when_scope_is_gitignore() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join(".gitignore"), ".plexus/
+run/
+*.log
+").unwrap();
+        std::fs::create_dir_all(src.path().join(".plexus/cache")).unwrap();
+        std::fs::write(src.path().join(".plexus/cache/huge.bin"), b"x").unwrap();
+        std::fs::create_dir_all(src.path().join("src")).unwrap();
+        std::fs::write(src.path().join("src/a.txt"), b"a").unwrap();
+        std::fs::write(src.path().join("a.log"), b"l").unwrap();
+        let base = snapshot_like(src.path(), Scope::GitIgnore).unwrap();
+        assert_eq!(base.files.keys().map(String::as_str).collect::<Vec<_>>(), vec![".gitignore", "src/a.txt"]);
+
+        // 사본에는 .git이 없어도 같은 규칙으로 읽어 게임 실행 폴더 같은 산출물을 합치지 않는다.
+        let copy = tempfile::tempdir().unwrap();
+        copy_tree(src.path(), copy.path(), &base).unwrap();
+        std::fs::create_dir_all(copy.path().join("run")).unwrap();
+        std::fs::write(copy.path().join("run/world.dat"), b"w").unwrap();
+        std::fs::write(copy.path().join("src/a.txt"), b"changed").unwrap();
+        let after = snapshot_like(copy.path(), base.scope).unwrap();
+        assert_eq!(diff(&base, &after).paths(), vec!["src/a.txt".to_string()]);
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let o = std::process::Command::new("git").arg("-C").arg(dir).args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "core.autocrlf=false"]).args(args).output().unwrap();
+        assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).to_string()
+    }
+
+    fn repo() -> tempfile::TempDir {
+        let r = tempfile::tempdir().unwrap();
+        git(r.path(), &["init", "-q"]);
+        std::fs::write(r.path().join(".gitignore"), "cache/\n").unwrap();
+        std::fs::create_dir_all(r.path().join("sub")).unwrap();
+        std::fs::write(r.path().join("sub/kept.txt"), b"committed").unwrap();
+        std::fs::write(r.path().join("sub/edited.txt"), b"committed").unwrap();
+        std::fs::write(r.path().join("sub/removed.txt"), b"committed").unwrap();
+        git(r.path(), &["add", "."]);
+        git(r.path(), &["commit", "-qm", "base"]);
+        // 커밋하지 않은 상태: 고침·지움·새 파일·무시된 파일
+        std::fs::write(r.path().join("sub/edited.txt"), b"uncommitted").unwrap();
+        std::fs::remove_file(r.path().join("sub/removed.txt")).unwrap();
+        std::fs::write(r.path().join("sub/untracked.txt"), b"new").unwrap();
+        std::fs::create_dir_all(r.path().join("cache")).unwrap();
+        std::fs::write(r.path().join("cache/big.bin"), b"ignored").unwrap();
+        r
+    }
+
+    #[test]
+    fn worktrees_start_from_uncommitted_state_and_never_merge_git_metadata() {
+        let r = repo();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = snapshot_like(r.path(), Scope::GitIgnore).unwrap();
+        let prepared = prepare_dirs(r.path(), tmp.path(), 2, &base).unwrap();
+        assert_eq!(prepared.how, Prepared::Worktree);
+        assert_eq!(prepared.dirs.len(), 2);
+        for d in &prepared.dirs {
+            assert!(d.join(".git").is_file(), "진짜 worktree");
+            assert_eq!(std::fs::read(d.join("sub/edited.txt")).unwrap(), b"uncommitted");
+            assert_eq!(std::fs::read(d.join("sub/untracked.txt")).unwrap(), b"new");
+            assert!(!d.join("sub/removed.txt").exists());
+            assert!(!d.join("cache").exists());
+            assert!(diff(&base, &snapshot_like(d, base.scope).unwrap()).paths().is_empty(), "시작할 때 바뀐 것이 없어야 한다");
+        }
+        std::fs::write(prepared.dirs[0].join("sub/kept.txt"), b"agent").unwrap();
+        assert_eq!(diff(&base, &snapshot_like(&prepared.dirs[0], base.scope).unwrap()).paths(), vec!["sub/kept.txt".to_string()]);
+        assert_eq!(git(r.path(), &["status", "--short", "--", "sub/kept.txt"]), "", "원래 폴더는 그대로");
+
+        remove_dirs(r.path(), tmp.path());
+        assert!(!tmp.path().exists());
+        assert_eq!(git(r.path(), &["worktree", "list"]).lines().count(), 1, "등록도 지운다");
+    }
+
+    #[test]
+    fn worktree_agents_work_in_the_same_subfolder() {
+        let r = repo();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = r.path().join("sub");
+        let base = snapshot_like(&root, Scope::GitIgnore).unwrap();
+        let prepared = prepare_dirs(&root, tmp.path(), 1, &base).unwrap();
+        assert_eq!(prepared.how, Prepared::Worktree);
+        assert_eq!(std::fs::read(prepared.dirs[0].join("edited.txt")).unwrap(), b"uncommitted");
+        assert!(diff(&base, &snapshot_like(&prepared.dirs[0], base.scope).unwrap()).paths().is_empty());
+        remove_dirs(&root, tmp.path());
+        assert_eq!(git(r.path(), &["worktree", "list"]).lines().count(), 1);
+    }
+
+    #[test]
+    fn folder_without_a_commit_falls_back_to_filtered_copy() {
+        let plain = tempfile::tempdir().unwrap();
+        std::fs::write(plain.path().join(".gitignore"), "cache/\n").unwrap();
+        std::fs::write(plain.path().join("a.txt"), b"a").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = snapshot_like(plain.path(), Scope::GitIgnore).unwrap();
+        let prepared = prepare_dirs(plain.path(), tmp.path(), 1, &base).unwrap();
+        assert_eq!(prepared.how, Prepared::Copy);
+        assert_eq!(std::fs::read(prepared.dirs[0].join("a.txt")).unwrap(), b"a");
+        // 작은 폴더는 지금처럼 전부 복사한다.
+        let r = repo();
+        let all = snapshot_like(r.path(), Scope::All).unwrap();
+        let t2 = tempfile::tempdir().unwrap();
+        let p2 = prepare_dirs(r.path(), t2.path(), 1, &all).unwrap();
+        assert_eq!(p2.how, Prepared::Copy);
+        assert!(p2.dirs[0].join("cache/big.bin").exists() && !p2.dirs[0].join(".git").exists());
+    }
+
+    #[test]
+    fn oversized_folder_falls_back_to_gitignore_scope() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join(".gitignore"), "assets/
+").unwrap();
+        std::fs::write(src.path().join("a.txt"), b"a").unwrap();
+        std::fs::create_dir_all(src.path().join("assets")).unwrap();
+        std::fs::write(src.path().join("assets/big.bin"), b"0123456789").unwrap();
+        let small = Limits { files: 100, bytes: 12 };
+        let snap = snapshot_within(src.path(), small).unwrap();
+        assert_eq!(snap.scope, Scope::GitIgnore);
+        assert!(!snap.files.contains_key("assets/big.bin"));
+        let roomy = Limits { files: 100, bytes: 1000 };
+        assert_eq!(snapshot_within(src.path(), roomy).unwrap().scope, Scope::All, "한도 안이면 지금처럼 전부 복사");
+        assert!(snapshot_within(src.path(), Limits { files: 1, bytes: 1 }).is_err(), "걸러도 크면 실패");
+    }
+
+    #[test]
     fn merge_finds_conflicts_and_skips_failed_agents() {
         let mut a = Changes::default();
         a.written.insert("same.txt".into(), h(1));
@@ -375,6 +694,30 @@ mod tests {
         assert!(m.apply.contains(&("shared.txt".into(), 0, false)));
         assert!(!m.apply.iter().any(|(_, i, _)| *i == 1));
         drop(failed);
+    }
+
+    #[test]
+    fn parts_read_members_and_cap_total() {
+        let one = parse_parts("[{\"title\":\"a\",\"task\":\"x\"},{\"title\":\"b\",\"task\":\"y\",\"members\":2}]", 4).unwrap();
+        assert_eq!(one.iter().map(|p| p.members).collect::<Vec<_>>(), vec![1, 2], "members 기본값은 1");
+        let capped = parse_parts("[{\"title\":\"a\",\"task\":\"x\",\"members\":3},{\"title\":\"b\",\"task\":\"y\",\"members\":3}]", 4).unwrap();
+        assert_eq!(capped.iter().map(|p| p.members).sum::<usize>(), 4, "합이 워커 수를 넘지 않는다");
+        assert!(capped.iter().all(|p| p.members >= 1));
+        let zero = parse_parts("[{\"title\":\"a\",\"task\":\"x\",\"members\":0},{\"title\":\"b\",\"task\":\"y\"}]", 4).unwrap();
+        assert_eq!(zero[0].members, 1);
+    }
+
+    #[test]
+    fn one_group_alone_counts_as_a_split() {
+        let g = parse_parts("[{\"title\":\"a\",\"task\":\"x\",\"members\":2}]", 2).unwrap();
+        assert_eq!(g.len(), 1, "워커 둘이 한 그룹이면 나눌 수 있는 것");
+        assert!(parse_parts("[{\"title\":\"a\",\"task\":\"x\"}]", 2).is_none(), "워커 하나뿐이면 나눈 것이 아니다");
+    }
+
+    #[test]
+    fn split_prompt_demands_written_groups() {
+        let p = split_prompt("요청", "목록", 4);
+        assert!(p.contains("members") && p.contains("요청문에 적힌 그룹"), "{p}");
     }
 
     #[test]

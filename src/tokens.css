@@ -15,6 +15,9 @@
 /* 다크(기본) */
 :root, :root[data-theme="dark"] {
   color-scheme: dark;
+  /* 화이트 모드에서도 어두운 선택 상자 */
+  --select-bg: #1f2125;
+  --select-ink: #ececee;
   --bg: #0c0f15;
   --ink: #ececee;
   --muted: #b3b6bd;

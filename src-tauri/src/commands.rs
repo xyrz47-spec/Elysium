@@ -14,7 +14,7 @@ use crate::store::{self, Approval, Conversation, Message, UsageToday};
 use serde::Serialize;
 use serde_json::json;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
 type S<'a> = State<'a, Arc<AppState>>;
@@ -46,6 +46,7 @@ pub fn settings_update(app: AppHandle, st: S, settings: Settings) -> AppResult<S
     let s = settings.sanitized();
     settings::save(&st.db, &s)?;
     *st.settings.write().unwrap_or_else(|p| p.into_inner()) = s.clone();
+    st.tests.set_capacity(s.test_slots as usize);
     // API 엔진에 보여 주는 모델 이름을 바로 맞춘다.
     for e in st.engines.write().unwrap_or_else(|p| p.into_inner()).iter_mut().filter(|e| e.id.is_api()) {
         e.version = Some(s.models.get(e.id.as_str()).cloned().unwrap_or_else(|| apis::api(e.id).map(|a| a.default_model.to_string()).unwrap_or_default()));
@@ -306,6 +307,81 @@ pub fn agent_message(app: AppHandle, st: S, task_id: String, key: String, text: 
     if !orchestrator::message_agent(&app, &st, &task_id, &key, &text) {
         return Err(AppError::msg("이미 끝난 작업입니다"));
     }
+    Ok(())
+}
+
+fn lead_ctx(app: &AppHandle, st: &S, task_id: &str) -> AppResult<crate::leadrun::Ctx> {
+    let lead = st.leads.lock().unwrap_or_else(|p| p.into_inner()).get(task_id).cloned().ok_or_else(|| AppError::msg("총괄이 있는 작업이 아닙니다"))?;
+    Ok(crate::leadrun::Ctx { app: app.clone(), st: st.inner().clone(), lead })
+}
+
+/// 총괄에게 전체 지시를 보내거나 특정 워커(about)의 문제를 알린다.
+#[tauri::command]
+pub fn lead_send(app: AppHandle, st: S, task_id: String, text: String, about: Option<String>) -> AppResult<()> {
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err(AppError::msg("보낼 내용이 없습니다"));
+    }
+    crate::leadrun::user_message(lead_ctx(&app, &st, &task_id)?, text, about);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn lead_answer(app: AppHandle, st: S, question_id: String, text: String) -> AppResult<()> {
+    crate::leadrun::answer_question(&app, &st, &question_id, text, "user").map_err(AppError::msg)
+}
+
+#[tauri::command]
+pub fn lead_questions(st: S) -> Vec<serde_json::Value> {
+    st.questions.list()
+}
+
+/// 자동 허용을 끈다. 다음 요청부터 다시 검토한다.
+#[tauri::command]
+pub fn lead_revoke(app: AppHandle, st: S, task_id: String) -> AppResult<()> {
+    let ctx = lead_ctx(&app, &st, &task_id)?;
+    crate::leadrun::revoke(&app, &st, &ctx.lead, "user");
+    Ok(())
+}
+
+#[tauri::command]
+pub fn test_cancel(st: S, id: u64) -> bool {
+    st.tests.cancel_test(id)
+}
+
+#[tauri::command]
+pub fn queue_get(st: S) -> crate::testqueue::QueueView {
+    st.tests.snapshot()
+}
+
+/// 창 라벨에 쓸 수 없는 글자를 바꾼다.
+fn window_label(task_id: &str, key: &str) -> String {
+    let safe: String = key.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    let short: String = task_id.chars().take(8).collect();
+    format!("worker-{short}-{safe}")
+}
+
+fn query_value(v: &str) -> String {
+    v.bytes().map(|b| if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
+
+/// 워커·그룹을 따로 띄운다(다른 모니터로 옮길 수 있다). 이미 열려 있으면 앞으로 가져온다.
+#[tauri::command]
+pub async fn worker_window_open(app: AppHandle, task_id: String, key: String, title: String) -> AppResult<()> {
+    let label = window_label(&task_id, &key);
+    if let Some(w) = app.get_webview_window(&label) {
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+        return Ok(());
+    }
+    let url = format!("index.html?window=worker&task={}&key={}", query_value(&task_id), query_value(&key));
+    tauri::WebviewWindowBuilder::new(&app, label, tauri::WebviewUrl::App(url.into()))
+        .title(format!("Elysium · {title}"))
+        .inner_size(820.0, 880.0)
+        .min_inner_size(420.0, 420.0)
+        .background_color(tauri::webview::Color(0x13, 0x14, 0x17, 0xff))
+        .build()
+        .map_err(|e| AppError::msg(format!("창을 열 수 없습니다: {e}")))?;
     Ok(())
 }
 

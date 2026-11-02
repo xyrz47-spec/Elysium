@@ -5,6 +5,8 @@ import { useApp, type AgentRun, type Live } from "../store";
 import Segmented from "./Segmented";
 import { AgentsIcon, ArrowDownIcon, ArrowUpIcon, ChatIcon, ChevronIcon, CloseIcon, DownloadIcon, FolderIcon, InfoIcon, ListIcon, SearchIcon, SendIcon, StopIcon, TrashIcon } from "./Icons";
 import Markdown from "./Markdown";
+import { LeadSection, QueueCard } from "./LeadPanel";
+import { tailText } from "../lib/panel";
 import { INTEGRATE, pair, ROLE_LABEL } from "./Thread";
 
 export type ToolTab = "info" | "agents" | "side" | "outline" | "find" | "export";
@@ -145,7 +147,7 @@ function AgentRow({ l, a, now }: { l: Live; a: AgentRun; now: number }) {
           {a.activities.length > 0 && (
             <div className="agent-block">
               <h5>{A.activity}</h5>
-              {a.activities.map((x, i) => (
+              {a.activities.slice(-6).map((x, i) => (
                 <div key={i} className="agent-act full">
                   {x}
                 </div>
@@ -156,7 +158,7 @@ function AgentRow({ l, a, now }: { l: Live; a: AgentRun; now: number }) {
             <h5>{A.output}</h5>
             {text ? (
               <pre ref={outRef} className="agent-out">
-                {text.length > 4000 ? `…${text.slice(-4000)}` : text}
+                {tailText(text, 4000)}
               </pre>
             ) : (
               <div className="agent-sub">{A.noOutput}</div>
@@ -240,11 +242,14 @@ function AgentsTab({ onClose }: { onClose: () => void }) {
                   <span>{progressText(done, runs.length)}</span>
                 </div>
               )}
+              {l.lead && <LeadSection l={l} />}
               <ul className="agent-runs">
                 {runs.length === 0 && <li className="agent-run wait">{waiting ? A.approval : A.preparing}</li>}
-                {runs.map((a) => (
-                  <AgentRow key={a.key} l={l} a={a} now={now} />
-                ))}
+                {runs
+                  .filter((a) => !l.lead || (!a.key.startsWith("agent:") && a.key !== "lead"))
+                  .map((a) => (
+                    <AgentRow key={a.key} l={l} a={a} now={now} />
+                  ))}
               </ul>
               <div className="row">
                 {l.conversationId !== conversationId && (
@@ -267,6 +272,7 @@ function AgentsTab({ onClose }: { onClose: () => void }) {
           );
         })}
       </section>
+      <QueueCard />
       <section className="tool-sec">
         <h4>{A.roster}</h4>
         {installed.length === 0 ? (
@@ -653,7 +659,7 @@ export function ToolDock({ tab, onTab }: { tab: ToolTab | null; onTab: (t: ToolT
 }
 
 /** 오른쪽 도구 패널: 본문을 밀지 않고 위에 떠 있다. */
-export function ToolPanel({ tab, onTab, focusKey }: { tab: ToolTab | null; onTab: (t: ToolTab | null) => void; focusKey: number }) {
+export function ToolPanel({ tab, onTab, focusKey, onResizeStart, onResizeKey }: { tab: ToolTab | null; onTab: (t: ToolTab | null) => void; focusKey: number; onResizeStart: (e: React.PointerEvent) => void; onResizeKey: (e: React.KeyboardEvent) => void }) {
   const [shown, setShown] = useState<ToolTab>(tab ?? "info");
   useEffect(() => {
     if (tab) setShown(tab);
@@ -661,6 +667,7 @@ export function ToolPanel({ tab, onTab, focusKey }: { tab: ToolTab | null; onTab
   const t = TABS.find((x) => x.id === shown)!;
   return (
     <aside className={`tools-panel ${tab ? "open" : ""}`} aria-label={t.label} aria-hidden={!tab} inert={!tab}>
+      <div className="tools-resize" role="separator" aria-orientation="vertical" tabIndex={0} onPointerDown={onResizeStart} onKeyDown={onResizeKey} />
       <div className="tools-inner" key={shown}>
         <div className="tools-head">
           <span className="tools-title">

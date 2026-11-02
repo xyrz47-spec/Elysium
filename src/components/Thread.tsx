@@ -2,6 +2,8 @@ import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { ENGINE_LABEL, TIER_LABEL, stripFileMarkers, type Approval, type Budget, type CouncilTurn, type EngineId, type Judgment, type Message, type MessageData, type Step } from "../lib/api";
 import { useApp, type Live } from "../store";
 import Markdown from "./Markdown";
+import { SavedLeadLog } from "./LeadPanel";
+import { hideBlocks } from "../lib/panel";
 import { MessageAttachments } from "./Attachments";
 import { ChevronIcon, CopyIcon, CouncilIcon, FolderIcon, SparkIcon, WrenchIcon } from "./Icons";
 
@@ -328,6 +330,7 @@ function Details({ data }: { data: MessageData }) {
               ))}
             </div>
           )}
+          <SavedLeadLog decisions={data.team?.decisions} groupLog={data.team?.groupLog} />
           {data.team?.agents.map((a, i) =>
             a.text || (a.files && a.files.length) ? (
               <details key={`t${i}`} className="draft">
@@ -463,7 +466,7 @@ function Card({ ex, live, approvals, index }: { ex: Exchange; live?: Live; appro
       <div className="card-body">
         {live ? (
           <>
-            {live.text ? <Markdown text={stripFileMarkers(live.text)} /> : <div className="typing" aria-label="준비 중"><i /><i /><i /></div>}
+            {live.text ? <Markdown text={stripFileMarkers(hideBlocks(live.text))} /> : <div className="typing" aria-label="준비 중"><i /><i /><i /></div>}
             {live.activities.length > 0 && (
               <div className="live-acts">
                 {live.activities.slice(-4).map((t, i) => (

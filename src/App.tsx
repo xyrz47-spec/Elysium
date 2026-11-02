@@ -7,6 +7,7 @@ import UsageDialog from "./components/UsageDialog";
 import ConfirmDialog from "./components/ConfirmDialog";
 import MemoryButton from "./components/MemoryButton";
 import { ToolDock, ToolPanel, type ToolTab } from "./components/Tools";
+import { clampPanel, DOCK, PANEL_DEFAULT } from "./lib/panel";
 import Thread from "./components/Thread";
 import Composer from "./components/Composer";
 import SettingsDialog from "./components/SettingsDialog";
@@ -38,6 +39,54 @@ function SessionHead() {
 }
 
 const PANEL_KEY = "elysium.panel";
+const TOOLS_WIDTH_KEY = "elysium.toolsWidth";
+
+function loadToolsWidth(): number {
+  try {
+    const v = localStorage.getItem(TOOLS_WIDTH_KEY);
+    return v ? Number(v) : PANEL_DEFAULT;
+  } catch {
+    return PANEL_DEFAULT;
+  }
+}
+
+/** 도구 창 폭: 사용자가 정한 값을 기억하고, 창이 좁으면 대화가 남도록 줄여서 쓴다. */
+function useToolsWidth() {
+  const [stored, setStored] = useState(loadToolsWidth);
+  const [windowWidth, setWindowWidth] = useState(window.innerWidth);
+  const [dragging, setDragging] = useState(false);
+  useEffect(() => {
+    const on = () => setWindowWidth(window.innerWidth);
+    window.addEventListener("resize", on);
+    return () => window.removeEventListener("resize", on);
+  }, []);
+  const save = (w: number) => {
+    const next = clampPanel(w, window.innerWidth);
+    setStored(next);
+    try {
+      localStorage.setItem(TOOLS_WIDTH_KEY, String(next));
+    } catch {
+      /* 저장 못 해도 이번 실행에서는 동작한다 */
+    }
+  };
+  const onResizeStart = (e: React.PointerEvent) => {
+    e.preventDefault();
+    setDragging(true);
+    const move = (m: PointerEvent) => save(window.innerWidth - m.clientX - DOCK);
+    const up = () => {
+      setDragging(false);
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
+  const onResizeKey = (e: React.KeyboardEvent) => {
+    if (e.key === "ArrowLeft") save(clampPanel(stored, windowWidth) + 24);
+    else if (e.key === "ArrowRight") save(clampPanel(stored, windowWidth) - 24);
+  };
+  return { width: clampPanel(stored, windowWidth), dragging, onResizeStart, onResizeKey };
+}
 
 /** 세션 패널은 본문 위에 떠 있다. 본문과 겹치지 않을 만큼 넓은 창에서만 기본으로 펼친다. */
 const WIDE = 1560;
@@ -72,6 +121,7 @@ export default function App() {
   const [tool, setTool] = useState<ToolTab | null>(null);
   const [findKey, setFindKey] = useState(0);
   const lastTool = useRef<ToolTab>("info");
+  const toolsWidth = useToolsWidth();
   if (tool) lastTool.current = tool;
   // 구의 상태: 허락 대기 > 처리 중 > 대기, 쓸 AI가 없으면 꺼짐
   const orb: OrbMode = approvals.length ? "approval" : live.length ? "thinking" : engines.some((e) => e.installed) ? "idle" : "off";
@@ -108,7 +158,7 @@ export default function App() {
   }, [dialog, openConversation, setDialog, togglePanel, tool]);
 
   return (
-    <div className={`app ${panel ? "panel-open" : ""}`}>
+    <div className={`app ${panel ? "panel-open" : ""} ${tool ? "tools-open" : ""} ${toolsWidth.dragging ? "tools-dragging" : ""}`} style={{ "--tools-w": `${toolsWidth.width}px` } as React.CSSProperties}>
       <GlassDefs />
       <ParticleOrb mode={orb} />
       <Dock panelOpen={panel} onTogglePanel={togglePanel} />
@@ -120,7 +170,7 @@ export default function App() {
         }}
       />
       <ToolDock tab={tool} onTab={setTool} />
-      <ToolPanel tab={tool} onTab={setTool} focusKey={findKey} />
+      <ToolPanel tab={tool} onTab={setTool} focusKey={findKey} onResizeStart={toolsWidth.onResizeStart} onResizeKey={toolsWidth.onResizeKey} />
       <main className="main">
         <SessionHead />
         <Thread onPick={setDraft} />

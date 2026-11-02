@@ -1,3 +1,4 @@
+import { QuestionCard, type LeadQuestion } from "./Question";
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { listen } from "@tauri-apps/api/event";
 import ParticleOrb, { type OrbMode } from "../../src/components/ParticleOrb";
@@ -193,6 +194,7 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [live, setLive] = useState<Record<string, Live>>({});
   const [approvals, setApprovals] = useState<Approval[]>([]);
+  const [questions, setQuestions] = useState<LeadQuestion[]>([]);
   const [drawer, setDrawer] = useState(false);
   const [text, setText] = useState("");
   const [engine, setEngine] = useState("auto");
@@ -212,6 +214,7 @@ export default function App() {
   const refreshAll = useCallback(async () => {
     try {
       const [i, e, c, a] = await Promise.all([remote.info(), remote.engines(), remote.conversations(), remote.approvals()]);
+      remote.questions().then(setQuestions).catch(() => {});
       setInfo(i);
       setEngines(e.filter((x) => x.installed));
       setConvs(c);
@@ -259,6 +262,12 @@ export default function App() {
             break;
           case "approval:decided":
             setApprovals((x) => x.filter((y) => y.id !== p.id));
+            break;
+          case "lead:question":
+            setQuestions((x) => [...x.filter((y) => y.id !== p.id), p]);
+            break;
+          case "lead:question-closed":
+            setQuestions((x) => x.filter((y) => y.id !== p.id));
             break;
           case "message:created":
             if (p.conversationId === cidRef.current) loadMessages(p.conversationId);
@@ -385,6 +394,9 @@ export default function App() {
               </button>
             </div>
           </article>
+        ))}
+        {questions.map((q) => (
+          <QuestionCard key={q.id} q={q} onAnswer={(id, text) => remote.answerQuestion(id, text).catch((e) => toast(errorText(e), "error"))} />
         ))}
         {pending.map((a) => (
           <article key={a.id} className="approval">

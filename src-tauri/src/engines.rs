@@ -362,6 +362,15 @@ const CHAT_TOOLS: &str = "Read,Grep,Glob,WebFetch,WebSearch";
 /// 작업 모드는 PowerShell 명령까지 허용한다(Bash는 쓰지 않는다). Windows에서는 샌드박스가 없어 사용자 권한으로 돈다.
 const WORK_TOOLS: &str = "Read,Grep,Glob,Edit,Write,PowerShell,WebFetch,WebSearch";
 
+/// 홈 폴더의 전역 지시문을 뺀다. 프로젝트 자신의 CLAUDE.md·규칙은 그대로 읽는다.
+fn claude_settings(home: &str) -> String {
+    let home = home.replace('\\', "/");
+    serde_json::json!({ "claudeMdExcludes": [format!("{home}/.claude/CLAUDE.md"), format!("{home}/.claude/rules/**")] }).to_string()
+}
+
+/// 대기열을 쓰는 Claude가 직접 띄우지 못하게 막는 게임 창 작업. 패턴이라 모든 경우를 막지는 못한다.
+const WINDOW_BLOCK: &str = "PowerShell(*runClient*),PowerShell(*frameBenchmark*),PowerShell(*clientWorldReloadTest*),PowerShell(*launcherProfileTest*),PowerShell(*gradlew*Client),PowerShell(*gradlew*Client *)";
+
 /// CLI 인자. 요청 본문은 들어가지 않는다(표준 입력으로 보냄).
 pub fn args(spec: &RunSpec) -> Vec<String> {
     let s = |x: &str| x.to_string();
@@ -380,6 +389,15 @@ pub fn args(spec: &RunSpec) -> Vec<String> {
                 s("--allowedTools"), s(tools),
                 s("--permission-mode"), s(if spec.work { "acceptEdits" } else { "default" }),
             ];
+            // --setting-sources project still reads ~/.claude as an ancestor project when the workspace is under the home folder.
+            if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
+                a.push(s("--settings"));
+                a.push(claude_settings(&home));
+            }
+            if spec.work && spec.system.contains(crate::lead::QUEUE_SYSTEM) {
+                a.push(s("--disallowedTools"));
+                a.push(s(WINDOW_BLOCK));
+            }
             if !spec.system.is_empty() {
                 a.push(s("--append-system-prompt"));
                 a.push(spec.system.clone());
@@ -1221,6 +1239,22 @@ mod tests {
         r#"{"event":"step_update","step_update":{"conversation_id":"c-1","step_index":5,"state":"ACTIVE","step_type":"agent_response","text_delta":"끝"}}"#,
         r#"{"event":"result","result":{"conversation_id":"c-1","status":"SUCCESS","response":"zebra-42\n","num_turns":1,"usage":{"input_tokens":27375,"output_tokens":91}}}"#,
     ];
+
+    #[test]
+    fn claude_args_block_known_window_tasks_only_when_the_queue_is_in_use() {
+        let spec = |system: &str| RunSpec { engine: EngineId::Claude, prompt: String::new(), system: system.into(), cwd: PathBuf::from("."), work: true, resume: None, plugin_dirs: vec![], model: None, effort: None, max_tokens: None, extra_dirs: vec![], steer: None, attachments: vec![] };
+        let queued = args(&spec(crate::lead::QUEUE_SYSTEM));
+        let at = queued.iter().position(|a| a == "--disallowedTools").expect("차단 규칙");
+        assert!(queued[at + 1].contains("PowerShell(*runClient*)"), "{}", queued[at + 1]);
+        assert!(!args(&spec("다른 지시")).iter().any(|a| a == "--disallowedTools"), "대기열을 안 쓰는 실행은 그대로");
+    }
+
+    #[test]
+    fn claude_settings_exclude_only_the_home_instructions() {
+        let v: Value = serde_json::from_str(&claude_settings("C:\\Users\\me")).unwrap();
+        let list: Vec<&str> = v["claudeMdExcludes"].as_array().unwrap().iter().map(|x| x.as_str().unwrap()).collect();
+        assert_eq!(list, vec!["C:/Users/me/.claude/CLAUDE.md", "C:/Users/me/.claude/rules/**"]);
+    }
 
     #[test]
     fn parses_antigravity_stream_and_keeps_chat_read_only() {

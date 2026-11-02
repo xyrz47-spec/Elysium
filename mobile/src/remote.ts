@@ -1,3 +1,4 @@
+import type { LeadQuestion } from "./Question";
 // PC의 엘리시움과 이야기하는 래퍼. 실제 통신은 Rust(지문 고정 TLS)가 하고, 토큰은 화면으로 오지 않는다.
 import { invoke } from "@tauri-apps/api/core";
 import type { Approval, Attachment, Conversation, EngineInfo, Message, UsageSummary } from "../../src/lib/api";
@@ -38,6 +39,8 @@ export const remote = {
   discard: (id: string) => del<{ removed: boolean }>(`/api/attachments/${encodeURIComponent(id)}`),
   cancel: (taskId: string) => post<{ cancelled: boolean }>(`/api/tasks/${encodeURIComponent(taskId)}/cancel`),
   approvals: () => get<Approval[]>("/api/approvals"),
+  questions: () => get<LeadQuestion[]>("/api/questions"),
+  answerQuestion: (id: string, text: string) => post<{ answered: boolean }>(`/api/questions/${encodeURIComponent(id)}`, { text }),
   decide: (id: string, approve: boolean) => post<Approval>(`/api/approvals/${encodeURIComponent(id)}`, { approve }),
   usage: (range: string) => get<UsageSummary>(`/api/usage?range=${encodeURIComponent(range)}`),
 };

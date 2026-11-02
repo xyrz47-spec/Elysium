@@ -33,11 +33,13 @@ pub struct Settings {
     pub agents_auto: bool,
     /// 입력하는 동안 JEV가 모드·스킬을 추천한다(보내기 전의 글이 TypeSafe로 전송됨). JEV가 켜져 있을 때만 돈다.
     pub jev_suggest: bool,
+    /// 게임 창을 띄우는 테스트를 동시에 몇 개까지 돌릴지(앱 전체, 1~8)
+    pub test_slots: u8,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { workspace_dir: None, review: ReviewMode::Auto, jev_enabled: false, models: BTreeMap::new(), agents: 1, agents_auto: true, jev_suggest: true }
+        Settings { workspace_dir: None, review: ReviewMode::Auto, jev_enabled: false, models: BTreeMap::new(), agents: 1, agents_auto: true, jev_suggest: true, test_slots: 1 }
     }
 }
 
@@ -53,6 +55,7 @@ impl Settings {
         self.workspace_dir = self.workspace_dir.map(|d| d.trim().to_string()).filter(|d| !d.is_empty());
         self.models = self.models.into_iter().map(|(k, v)| (k, v.trim().to_string())).filter(|(_, v)| !v.is_empty()).collect();
         self.agents = self.agents.clamp(1, crate::intent::MAX_AGENTS as u8);
+        self.test_slots = self.test_slots.clamp(1, 8);
         // OpenCode는 무료 모델만: 다른 값은 저장하지 않는다.
         if self.models.get("opencode").is_some_and(|m| !crate::engines::is_free_model(m)) {
             self.models.remove("opencode");
@@ -104,6 +107,9 @@ mod tests {
         assert!(old.agents_auto, "예전 설정도 JEV 자동 분배로 시작");
         assert_eq!(Settings { agents: 9, ..Default::default() }.sanitized().agents, 5);
         assert_eq!(Settings { agents: 0, ..Default::default() }.sanitized().agents, 1);
+        assert_eq!(old.test_slots, 1, "예전 설정의 테스트 동시 실행은 1개");
+        assert_eq!(Settings { test_slots: 0, ..Default::default() }.sanitized().test_slots, 1);
+        assert_eq!(Settings { test_slots: 99, ..Default::default() }.sanitized().test_slots, 8);
         let mut models = BTreeMap::new();
         models.insert("opencode".to_string(), "anthropic/claude-opus-5-5".to_string());
         assert!(Settings { models, ..Default::default() }.sanitized().models.is_empty(), "유료 모델은 저장하지 않는다");
