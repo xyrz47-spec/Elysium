@@ -35,7 +35,7 @@ const VS = `#version 300 es
 in vec3 aPos;
 in float aSeed;
 in float aKind;
-uniform float uTime, uRot, uSwirl, uEnergy, uSpread, uAssemble, uGlitch, uPx, uRadius, uDim, uField, uDpr, uMote, uReduce;
+uniform float uTime, uRot, uSwirl, uEnergy, uSpread, uAssemble, uGlitch, uPx, uRadius, uDim, uField, uDpr, uMote, uReduce, uInk;
 uniform vec2 uCenter, uRes;
 uniform vec3 uA, uB;
 out vec3 vColor;
@@ -96,8 +96,9 @@ void main() {
   gl_PointSize = size * persp * uPx * (0.7 + front * 0.6);
   vColor = aKind < 0.5 ? mix(uB, uA, clamp(aPos.y * 0.5 + 0.5 + n * 0.25, 0.0, 1.0)) : mix(uB, uA, aSeed);
   float a;
-  if (aKind < 0.5) a = uDim;
-  else if (aKind < 1.5) a = 0.45 * (1.0 - smoothstep(1.05, 1.72, r0)) * mix(1.0, uDim, 0.5) * uField;
+  // 일반 합성은 입자가 겹쳐도 밝아지지 않으므로 화이트 모드의 구와 둘레 먼지는 더 진하게 찍는다.
+  if (aKind < 0.5) a = uDim * (1.0 + uInk * 0.9);
+  else if (aKind < 1.5) a = 0.45 * (1.0 - smoothstep(1.05, 1.72, r0)) * mix(1.0, uDim, 0.5) * uField * (1.0 + uInk * 0.5);
   else a = uField * (0.16 + 0.22 * (1.0 - smoothstep(1.6, 7.5, r0))) * (0.55 + 0.45 * sin(uTime * 0.7 + aSeed * 40.0));
   vAlpha = (0.3 + 0.7 * front) * e * a;
 }`;
@@ -106,12 +107,14 @@ const FS = `#version 300 es
 precision mediump float;
 in vec3 vColor;
 in float vAlpha;
+uniform highp float uInk; // 정점 셰이더와 정밀도가 같아야 링크된다
 out vec4 o;
 void main() {
   float d = length(gl_PointCoord - 0.5);
   float a = smoothstep(0.5, 0.0, d);
-  a *= a;
-  o = vec4(vColor * a * vAlpha, a * vAlpha);
+  a = mix(a * a, a, uInk);
+  float alpha = min(1.0, a * vAlpha);
+  o = vec4(vColor * alpha, alpha);
 }`;
 
 function compile(gl: WebGL2RenderingContext, type: number, src: string) {
@@ -219,7 +222,7 @@ export default function ParticleOrb({ mode }: { mode: OrbMode }) {
     const U = (n: string) => gl.getUniformLocation(prog, n);
     const u = {
       time: U("uTime"), rot: U("uRot"), swirl: U("uSwirl"), energy: U("uEnergy"), spread: U("uSpread"), assemble: U("uAssemble"),
-      glitch: U("uGlitch"), px: U("uPx"), radius: U("uRadius"), dim: U("uDim"), field: U("uField"), dprU: U("uDpr"), mote: U("uMote"), reduceU: U("uReduce"), center: U("uCenter"), res: U("uRes"), a: U("uA"), b: U("uB"),
+      glitch: U("uGlitch"), px: U("uPx"), radius: U("uRadius"), dim: U("uDim"), field: U("uField"), dprU: U("uDpr"), mote: U("uMote"), reduceU: U("uReduce"), ink: U("uInk"), center: U("uCenter"), res: U("uRes"), a: U("uA"), b: U("uB"),
     };
     gl.enable(gl.BLEND);
     gl.clearColor(0, 0, 0, 0);
@@ -316,14 +319,15 @@ export default function ParticleOrb({ mode }: { mode: OrbMode }) {
       gl.uniform1f(u.dim, at.dim);
       gl.uniform1f(u.dprU, dpr);
       gl.uniform1f(u.mote, light ? 0.85 : 1);
+      gl.uniform1f(u.ink, light ? 1 : 0);
       gl.uniform1f(u.reduceU, reduce.matches ? 1 : 0);
       // 둘레 먼지·창 전체 성운은 큰 구(첫 화면)일 때만: 대화 중에는 글 뒤에 아무것도 깔리지 않는다.
       gl.uniform1f(u.field, Math.min(1, Math.max(0, (at.radius / dpr - 24) / 60)));
       // 입자 크기: 작은 상태 구에서는 가늘게(0.45배), 큰 구에서는 최대 1.6배
-      gl.uniform1f(u.px, dpr * (at.radius / dpr < 40 ? 0.45 : Math.max(0.8, Math.min(1.6, at.radius / dpr / 170))));
+      gl.uniform1f(u.px, dpr * (light ? 1.25 : 1) * (at.radius / dpr < 40 ? 0.45 : Math.max(0.8, Math.min(1.6, at.radius / dpr / 170))));
       // 화이트 모드에서는 밝은 입자가 바탕에 묻히므로 진한 회색 쪽으로 내린다.
-      gl.uniform3fv(u.a, cur.a.map((v) => v * (light ? 0.34 : 1)));
-      gl.uniform3fv(u.b, cur.b.map((v) => v * (light ? 0.62 : 1)));
+      gl.uniform3fv(u.a, cur.a.map((v) => v * (light ? 0.26 : 1)));
+      gl.uniform3fv(u.b, cur.b.map((v) => v * (light ? 0.5 : 1)));
       gl.drawArrays(gl.POINTS, 0, geo.n);
     };
     raf = requestAnimationFrame(draw);
