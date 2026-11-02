@@ -1,3 +1,4 @@
+import { LT, SlotsPicker } from "./LeadPanel";
 import { useEffect, useRef, useState, type CSSProperties, type RefObject } from "react";
 import { API_SECRET, api, errorText, type ApiId, type AppInfo, type EngineInfo, type Judgment, type ReviewMode, type SecretStatus } from "../lib/api";
 import { useApp } from "../store";
@@ -335,6 +336,11 @@ export default function SettingsDialog({ focusKeys = false }: { focusKeys?: bool
         <Section title="검토" i={4}>
           <Segmented label="검토" className="wide" value={settings.review} options={REVIEW.map((r) => ({ value: r.id, label: r.label }))} onChange={(v) => saveSettings({ ...settings, review: v })} />
           <p className="help">{REVIEW.find((r) => r.id === settings.review)?.help}</p>
+        </Section>
+
+        <Section title={LT.queue} i={4}>
+          <SlotsPicker />
+          <p className="help">{LT.slotsHelp}</p>
         </Section>
 
         <Section title={AGENT_TEXT.preset} i={4}>

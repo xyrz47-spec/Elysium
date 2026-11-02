@@ -353,6 +353,8 @@ fn router(ctx: Ctx) -> Router {
         .route("/api/tasks/{id}/cancel", post(cancel))
         .route("/api/approvals", get(approvals))
         .route("/api/approvals/{id}", post(decide))
+        .route("/api/questions", get(questions))
+        .route("/api/questions/{id}", post(answer))
         .route("/api/usage", get(usage))
         .route("/api/events", get(events))
         .with_state(ctx)
@@ -473,6 +475,24 @@ async fn decide(State(ctx): State<Ctx>, Authed(d): Authed, Path(id): Path<String
         return Err(ApiError(StatusCode::FORBIDDEN, "PC 설정에서 폰의 허락을 막아 두었습니다. PC에서 허락하세요".into()));
     }
     Ok(Json(orchestrator::decide_approval(&ctx.app, &ctx.st, &id, req.approve, &format!("remote:{}", d.name))?))
+}
+
+async fn questions(State(ctx): State<Ctx>, _: Authed) -> ApiResult<Vec<Value>> {
+    Ok(Json(ctx.st.questions.list()))
+}
+
+#[derive(Deserialize)]
+struct AnswerReq {
+    text: String,
+}
+
+/// 총괄의 질문에 폰에서 답한다. 먼저 온 답을 쓰고, 이미 PC에서 답했으면 오류를 돌려준다.
+async fn answer(State(ctx): State<Ctx>, Authed(d): Authed, Path(id): Path<String>, Json(req): Json<AnswerReq>) -> ApiResult<Value> {
+    if req.text.trim().is_empty() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "답을 입력하세요".into()));
+    }
+    crate::leadrun::answer_question(&ctx.app, &ctx.st, &id, req.text, &format!("remote:{}", d.name)).map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
+    Ok(Json(json!({ "answered": true })))
 }
 
 #[derive(Deserialize)]

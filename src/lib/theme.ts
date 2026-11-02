@@ -34,6 +34,13 @@ export function watchSystem(get: () => ThemeChoice): () => void {
   return () => m.removeEventListener("change", on);
 }
 
+/** 다른 창에서 테마를 바꾸면 이 창도 따라간다. */
+export function watchStorage() {
+  window.addEventListener("storage", (e) => {
+    if (e.key === KEY) document.documentElement.dataset.theme = resolved(loadTheme());
+  });
+}
+
 export function isLight(): boolean {
   return document.documentElement.dataset.theme === "light";
 }

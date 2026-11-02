@@ -175,7 +175,7 @@ impl Drop for TreeGuard {
     }
 }
 
-async fn powershell(root: &Path, command: &str, secs: u64) -> Result<String, String> {
+pub(crate) async fn powershell(root: &Path, command: &str, secs: u64) -> Result<String, String> {
     // -EncodedCommand(UTF-16LE base64)로 넘겨 따옴표·줄바꿈이 섞인 명령도 그대로 전달한다.
     let script = format!("$ProgressPreference='SilentlyContinue'; [Console]::OutputEncoding=[System.Text.Encoding]::UTF8; {command}");
     let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();

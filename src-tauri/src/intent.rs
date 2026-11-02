@@ -87,6 +87,8 @@ struct Hit {
     exact: Option<String>,
     strong_marker: bool,
     joiner: bool,
+    /// 시·화학 용어와 겹치지 않는 이름인지
+    strong: bool,
     /// 지시가 시작하는 곳(앞의 use·with 포함)과 모델 이름이 끝나는 곳. 바이트 위치(ASCII 소문자 글 = 원래 글).
     start: usize,
     end: usize,
@@ -160,7 +162,7 @@ fn scan(text: &str) -> Vec<Hit> {
         let strong_marker = if strong { marker || en_before } else { model_word };
         let joiner = JOINERS.iter().any(|j| after.starts_with(j) || low[e..].starts_with(j));
         taken = e;
-        hits.push(Hit { family: fi, exact, strong_marker, joiner, start, end: e });
+        hits.push(Hit { family: fi, exact, strong_marker, joiner, strong, start, end: e });
     }
     hits
 }
@@ -170,27 +172,13 @@ pub fn requested_models(text: &str, installed: &[EngineId], work: bool) -> Wante
     let hits = scan(text);
     let mut w = Wanted::default();
     for h in accepted(&hits) {
-        let f = &FAMILIES[h.family];
-        let mut alts: Vec<(EngineId, Option<String>)> = f
-            .targets
-            .iter()
-            .filter(|(e, _)| installed.contains(e))
-            .map(|&(e, m)| (e, h.exact.clone().or_else(|| (!m.is_empty()).then(|| m.to_string()))))
-            .collect();
-        // 작업 모드는 API도 쓸 수 있지만, 같은 모델을 CLI로 쓸 수 있으면 CLI가 먼저다.
-        if work {
-            alts.sort_by_key(|(e, _)| e.is_api());
-        }
-        match alts.first().cloned() {
-            Some((engine, model)) => {
-                let name = h.exact.clone().unwrap_or_else(|| f.name.to_string());
-                let p = ModelPick { engine, model, name, alts };
+        match pick_of(h, installed, work) {
+            Ok(p) => {
                 if !w.picks.contains(&p) {
                     w.picks.push(p);
                 }
             }
-            None => {
-                let n = h.exact.clone().unwrap_or_else(|| f.name.to_string());
+            Err(n) => {
                 if !w.missing.contains(&n) {
                     w.missing.push(n);
                 }
@@ -198,6 +186,99 @@ pub fn requested_models(text: &str, installed: &[EngineId], work: bool) -> Wante
         }
     }
     w
+}
+
+/// 이 언급을 맡을 수 있는 엔진들. 쓸 수 있는 엔진이 없으면 Err(모델 이름).
+fn pick_of(h: &Hit, installed: &[EngineId], work: bool) -> Result<ModelPick, String> {
+    let f = &FAMILIES[h.family];
+    let mut alts: Vec<(EngineId, Option<String>)> = f
+        .targets
+        .iter()
+        .filter(|(e, _)| installed.contains(e))
+        .map(|&(e, m)| (e, h.exact.clone().or_else(|| (!m.is_empty()).then(|| m.to_string()))))
+        .collect();
+    // 작업 모드는 API도 쓸 수 있지만, 같은 모델을 CLI로 쓸 수 있으면 CLI가 먼저다.
+    if work {
+        alts.sort_by_key(|(e, _)| e.is_api());
+    }
+    let name = h.exact.clone().unwrap_or_else(|| f.name.to_string());
+    match alts.first().cloned() {
+        Some((engine, model)) => Ok(ModelPick { engine, model, name, alts }),
+        None => Err(name),
+    }
+}
+
+/// 요청 글이 직접 정한 팀: 같은 모델의 워커 여럿과 (적었다면) 총괄 AI.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TeamAsk {
+    pub workers: ModelPick,
+    pub effort: Option<&'static str>,
+    pub count: usize,
+    pub lead: Option<ModelPick>,
+}
+
+const WORKER_WORDS: &[&str] = &["서브 에이전트", "서브에이전트", "하위 에이전트", "에이전트", "워커", "sub-agents", "sub-agent", "subagents", "subagent", "agents", "agent", "workers", "worker"];
+const LEAD_WORDS: &[&str] = &["총괄", "총관리", "관리자", "오케스트레이터", "리드", "감독", "orchestrator", "lead", "manager", "supervisor"];
+const EFFORTS: &[&str] = &["xhigh", "max", "high", "medium", "low"];
+
+fn skip_marks(s: &str) -> &str {
+    s.trim_start_matches([' ', '*'])
+}
+
+/// 모델 이름 뒤의 노력치("(high)", " high")와 그 길이
+fn effort_after(rest: &str) -> (Option<&'static str>, usize) {
+    let t = skip_marks(rest);
+    let inner = t.strip_prefix('(').unwrap_or(t);
+    for e in EFFORTS {
+        if let Some(after) = inner.strip_prefix(e).filter(|a| !a.starts_with(is_word)) {
+            let after = after.strip_prefix(')').unwrap_or(after);
+            return (Some(e), rest.len() - after.len());
+        }
+    }
+    (None, 0)
+}
+
+/// 모델 바로 뒤의 "× 4", "x4", "4개"
+fn bare_count(after: &str) -> Option<usize> {
+    let (marked, t) = match after.strip_prefix('×').or_else(|| after.strip_prefix('x')) {
+        Some(t) => (true, t.trim_start_matches(' ')),
+        None => (false, after),
+    };
+    let digits = t.len() - t.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    if digits == 0 {
+        return None;
+    }
+    let tail = t[digits..].trim_start_matches(' ');
+    (marked || tail.starts_with(['개', '명', '대'])).then(|| t[..digits].parse().ok()).flatten()
+}
+
+/// 이 모델 언급이 지시하는 워커 수와 노력치
+fn worker_count(low: &str, h: &Hit) -> Option<(usize, Option<&'static str>)> {
+    let (effort, used) = effort_after(&low[h.end..]);
+    let after = skip_marks(&low[h.end + used..]);
+    let n = match WORKER_WORDS.iter().find(|w| after.starts_with(**w)) {
+        Some(w) => count_after(&after[w.len()..]).map(|(n, _)| n).or_else(|| count_before(low[..h.start].trim_end_matches(['*', ' '])).map(|(n, _)| n)),
+        None => bare_count(after),
+    }?;
+    (n >= 2).then_some((n.min(MAX_AGENTS), effort))
+}
+
+/// 같은 줄에서 총괄·관리자로 지목된 모델인지
+fn names_lead(low: &str, h: &Hit) -> bool {
+    let line_start = low[..h.start].rfind('\n').map_or(0, |i| i + 1);
+    let before = &low[line_start..h.start];
+    let after: String = low[h.end..].lines().next().unwrap_or("").chars().take(12).collect();
+    LEAD_WORDS.iter().any(|w| before.contains(w) || after.contains(w))
+}
+
+/// "Opus가 총괄하고 Gemini 3.8 Flash (High) 워커 4개를 돌려" 꼴의 지시. 수와 모델이 함께 있을 때만 팀으로 본다.
+pub fn requested_team(text: &str, installed: &[EngineId], work: bool) -> Option<TeamAsk> {
+    let low = text.to_ascii_lowercase();
+    let hits = scan(text);
+    let (worker, (count, effort)) = hits.iter().filter(|h| h.strong).find_map(|h| worker_count(&low, h).map(|c| (h, c)))?;
+    let workers = pick_of(worker, installed, work).ok()?;
+    let lead = hits.iter().filter(|h| h.family != worker.family && names_lead(&low, h)).find_map(|h| pick_of(h, installed, work).ok());
+    Some(TeamAsk { workers, effort, count, lead })
 }
 
 const AGENT_WORDS: &[&str] = &["서브에이전트", "에이전트", "agents", "agent"];
@@ -349,6 +430,38 @@ mod tests {
     use super::*;
 
     const ALL: &[EngineId] = &[Claude, Codex, Antigravity, OpenCode, ClaudeApi, OpenAi, GeminiApi, Nvidia];
+
+    const PLEXUS_REQUEST: &str = "당신은 본 프로젝트의 **총괄 분할자 및 관리자(Orchestrator & Lead Manager)**인 **Opus 5.5**입니다.\n아래 과제를 나눈 뒤, **4개의 Gemini 3.8 Flash (High) 하위 에이전트(Worker)**를 병렬 구동하여 작업을 지시·감독하십시오.\n- **병렬 실행 워커**: Gemini 3.8 Flash (High) × 4\n";
+
+    #[test]
+    fn team_request_names_lead_workers_effort_and_count() {
+        let t = requested_team(PLEXUS_REQUEST, ALL, true).expect("팀 지시");
+        assert_eq!(t.count, 4);
+        assert_eq!(t.effort, Some("high"));
+        assert_eq!((t.workers.engine, t.workers.model.as_deref()), (Antigravity, Some("gemini-3.8-flash")));
+        let lead = t.lead.expect("총괄");
+        assert_eq!((lead.engine, lead.model.as_deref()), (Claude, Some("opus")));
+    }
+
+    #[test]
+    fn team_request_reads_other_wordings() {
+        let t = requested_team("Claude가 총관리자를 맡고 gemini 3.8 flash high 4개에게 작업하라고 지시해", ALL, true).expect("수 뒤에 붙은 지시");
+        assert_eq!((t.count, t.effort), (4, Some("high")));
+        assert_eq!(t.lead.map(|l| l.engine), Some(Claude));
+        let t = requested_team("워커: Gemini 3.8 Flash x 3 으로 고쳐", ALL, true).expect("x 3");
+        assert_eq!((t.count, t.effort, t.lead.is_none()), (3, None, true));
+        assert_eq!(requested_team("3개의 Gemini 에이전트로 나눠 줘", ALL, true).map(|t| t.count), Some(3));
+        assert_eq!(requested_team("gemini 워커 9개", ALL, true).map(|t| t.count), Some(MAX_AGENTS), "최대 5개");
+    }
+
+    #[test]
+    fn team_request_ignores_plain_mentions() {
+        assert!(requested_team("Gemini 3.8 Flash 에이전트가 뭐야?", ALL, true).is_none(), "수가 없으면 아님");
+        assert!(requested_team("gemini 워커 1개만", ALL, true).is_none(), "하나면 팀이 아님");
+        assert!(requested_team("에이전트 4개로 조사해 줘", ALL, true).is_none(), "모델을 고르지 않음");
+        assert!(requested_team("gemini 3.8 flash 버전이 4개 나왔다는데", ALL, true).is_none(), "수가 모델에 붙은 지시가 아님");
+        assert!(requested_team(PLEXUS_REQUEST, &[Claude], true).is_none(), "워커를 돌릴 엔진이 없음");
+    }
 
     #[test]
     fn opencode_is_asked_by_name_and_only_gets_free_models() {

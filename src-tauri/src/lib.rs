@@ -10,6 +10,8 @@ mod error;
 mod intent;
 mod attachments;
 mod jev;
+mod lead;
+mod leadrun;
 mod memory;
 mod orchestrator;
 mod pricing;
@@ -19,6 +21,7 @@ mod settings;
 mod skills;
 mod store;
 mod teamwork;
+mod testqueue;
 
 use orchestrator::AppState;
 use std::collections::HashMap;
@@ -46,6 +49,7 @@ pub fn run() {
                 .user_agent(concat!("Elysium/", env!("CARGO_PKG_VERSION")))
                 .build()?;
             let models = s.models.clone();
+            let slots = s.test_slots as usize;
             let state = Arc::new(AppState {
                 db,
                 http,
@@ -56,8 +60,15 @@ pub fn run() {
                 agents: Mutex::new(HashMap::new()),
                 steers: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),
+                tests: Arc::new(testqueue::TestQueue::new(slots)),
+                leads: Mutex::new(HashMap::new()),
+                agent_stops: Mutex::new(HashMap::new()),
+                agent_inboxes: Mutex::new(HashMap::new()),
+                questions: leadrun::QuestionBoard::default(),
             });
             app.manage(state.clone());
+            let handle = app.handle().clone();
+            state.tests.set_on_change(move |v| orchestrator::emit(&handle, "queue:changed", serde_json::to_value(v).unwrap_or_default()));
             // 지난 실행에서 끝내지 못한 병렬 작업 사본을 지운다(시작할 때는 도는 작업이 없다).
             let leftovers = state.data_dir.join("teamwork");
             std::thread::spawn(move || {
@@ -111,6 +122,13 @@ pub fn run() {
             commands::agent_cancel,
             commands::task_steer,
             commands::agent_message,
+            commands::worker_window_open,
+            commands::lead_send,
+            commands::lead_answer,
+            commands::lead_questions,
+            commands::lead_revoke,
+            commands::test_cancel,
+            commands::queue_get,
             commands::side_ask,
             commands::cancel_all,
             commands::approval_list,
@@ -135,6 +153,24 @@ pub fn run() {
             commands::remote_revoke,
             commands::data_delete_all,
         ])
+        .on_window_event(|window, event| {
+            // 메인 창을 닫으면 앱을 끝낸다. 도는 작업·테스트를 먼저 멈춰 프로세스 트리까지 끝나게 한다.
+            if let ("main", tauri::WindowEvent::CloseRequested { api, .. }) = (window.label(), event) {
+                api.prevent_close();
+                let app = window.app_handle().clone();
+                let st = app.state::<Arc<AppState>>().inner().clone();
+                st.tasks.lock().unwrap_or_else(|p| p.into_inner()).values().for_each(|t| t.cancel());
+                tauri::async_runtime::spawn(async move {
+                    for _ in 0..50 {
+                        if st.tasks.lock().unwrap_or_else(|p| p.into_inner()).is_empty() {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    app.exit(0);
+                });
+            }
+        })
         .run(tauri::generate_context!())
         .expect("Elysium 실행 실패");
 }

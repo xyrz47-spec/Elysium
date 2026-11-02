@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, RwLock};
 use std::time::Duration;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
@@ -34,6 +34,16 @@ pub struct AppState {
     /// 작업 중 메시지 칸(작업 번호 → 칸). 작업이 끝나면 지운다.
     pub steers: Mutex<HashMap<String, Steer>>,
     pub approvals: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+    /// 게임 창을 띄우는 테스트의 대기열(앱 전체에 하나)
+    pub tests: std::sync::Arc<crate::testqueue::TestQueue>,
+    /// 병렬 작업의 총괄(작업 번호 → 총괄). 작업이 끝나면 지운다.
+    pub leads: Mutex<HashMap<String, std::sync::Arc<crate::leadrun::TaskLead>>>,
+    /// 차례 사이에도 워커를 멈출 수 있게 둔다("작업 번호/실행 key" → 토큰).
+    pub agent_stops: Mutex<HashMap<String, CancellationToken>>,
+    /// 차례 사이에 온 메시지. 다음 차례에 전한다.
+    pub agent_inboxes: Mutex<HashMap<String, Vec<String>>>,
+    /// 사용자의 답을 기다리는 총괄 질문
+    pub questions: crate::leadrun::QuestionBoard,
 }
 
 /// 실행 중인 에이전트로 가는 선.
@@ -152,6 +162,10 @@ pub struct Team {
     pub agents: Vec<TeamAgent>,
     /// 답들을 하나로 종합하는 AI
     pub synth: EngineId,
+    /// 요청 글에서 정한 워커 노력치(없으면 노력 단계를 따른다)
+    pub agent_effort: Option<String>,
+    /// 요청 글에서 정한 팀이면 JEV가 AI를 다시 배정하지 않는다
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -859,8 +873,11 @@ pub fn plan_with(text: &str, choice: Option<EngineId>, work_requested: bool, ins
     for m in &wanted.missing {
         reasons.push(format!("요청하신 {m} 모델을 사용할 수 없어 사용 가능한 AI를 자동으로 선택했습니다"));
     }
+    // 요청 글에 적힌 팀(워커 모델·수·총괄)은 JEV 판단과 설정보다 먼저다.
+    let ask = intent::requested_team(text, installed, work);
+    let lead = ask.as_ref().and_then(|a| a.lead.as_ref());
     let mut models: Vec<(EngineId, String)> = vec![];
-    let picked = wanted.picks.first().map(|mp| match choice.and_then(|c| mp.alts.iter().find(|(e, _)| *e == c)) {
+    let picked = lead.or(wanted.picks.first()).map(|mp| match choice.and_then(|c| mp.alts.iter().find(|(e, _)| *e == c)) {
         Some((e, m)) => (*e, m.clone(), mp),
         None => (mp.engine, mp.model.clone(), mp),
     });
@@ -905,13 +922,15 @@ pub fn plan_with(text: &str, choice: Option<EngineId>, work_requested: bool, ins
     // agents 0: JEV가 정한다. 대화 답을 여럿 합치는 것은 효율이 나쁘므로 파일 작업을 나눌 수 있을 때만 병렬로 돈다.
     let jev_split = if agents == 0 && work && choice.is_none() { jev_parts(jev) } else { None };
     let setting = if agents == 0 { jev_split.unwrap_or(1) } else { agents };
-    let want = if wanted.picks.len() >= 2 { wanted.picks.len() } else { asked_agents.unwrap_or(setting as usize) }.min(intent::MAX_AGENTS);
+    let want = if let Some(a) = &ask { a.count } else if wanted.picks.len() >= 2 { wanted.picks.len() } else { asked_agents.unwrap_or(setting as usize) }.min(intent::MAX_AGENTS);
     let team_from = reasons.len();
     let team = if want < 2 {
         None
     } else {
         let mut list: Vec<TeamAgent> = vec![];
-        if wanted.picks.len() >= 2 {
+        if let Some(a) = &ask {
+            list = vec![TeamAgent { engine: a.workers.engine, model: a.workers.model.clone() }; a.count];
+        } else if wanted.picks.len() >= 2 {
             for mp in &wanted.picks {
                 list.push(TeamAgent { engine: mp.engine, model: mp.model.clone() });
             }
@@ -941,11 +960,11 @@ pub fn plan_with(text: &str, choice: Option<EngineId>, work_requested: bool, ins
         }
         // 종합은 쓸 수 있는 AI 중 가장 강한 AI가(같으면 먼저 오는 쪽). 작업 모드의 통합은 되도록 CLI가 맡는다.
         let synth_pool: Vec<EngineId> = order.iter().copied().filter(usable).filter(|e| !work || !e.is_api() || !available.iter().any(|x| !x.is_api())).collect();
-        let synth = synth_pool.iter().copied().enumerate().max_by_key(|(i, e)| (strength(*e), std::cmp::Reverse(*i))).map(|(_, e)| e).unwrap_or(primary);
+        let synth = lead.map(|l| l.engine).or_else(|| synth_pool.iter().copied().enumerate().max_by_key(|(i, e)| (strength(*e), std::cmp::Reverse(*i))).map(|(_, e)| e)).unwrap_or(primary);
         let n = list.len();
         let names = list.iter().map(|a| match &a.model { Some(m) => format!("{}({m})", a.engine.label()), None => a.engine.label().to_string() }).collect::<Vec<_>>().join(", ");
         let synth_label = synth.label();
-        if asked_agents.is_none() && wanted.picks.len() < 2 {
+        if ask.is_none() && asked_agents.is_none() && wanted.picks.len() < 2 {
             if jev_split.is_some() {
                 reasons.push(format!("JEV: {n}개 에이전트로 나눠 동시 진행"));
             } else {
@@ -957,7 +976,7 @@ pub fn plan_with(text: &str, choice: Option<EngineId>, work_requested: bool, ins
         } else {
             reasons.push(format!("{n}개 에이전트({names})의 개별 답변을 {synth_label}에서 하나로 종합하여 전달합니다."));
         }
-        Some(Team { agents: list, synth })
+        Some(Team { agents: list, synth, agent_effort: ask.as_ref().and_then(|a| a.effort).map(str::to_string), pinned: ask.is_some() })
     };
 
     // 회의로 바뀌면 동시 에이전트 이유를 지울 수 있게 따로 둔다.
@@ -1065,6 +1084,9 @@ pub fn plan_with(text: &str, choice: Option<EngineId>, work_requested: bool, ins
     Ok(Plan { primary, fallbacks, reviewer, skill, prompt, work, reasons, jev: jev.cloned(), budget, debate, models, team, council: None, team_reasons, free_model: None })
 }
 
+/// 여러 AI를 돌리는 일은 Elysium이 한다. AI가 셸로 다른 AI를 띄우면 시간 제한·중지·비용 집계에서 벗어난다.
+const NO_NESTED_AI: &str = "다른 AI는 Elysium이 직접 실행합니다. 명령 도구로 AI CLI(agy, gemini, codex, opencode, claude, just-code-claude, agy_call)를 실행하거나 백그라운드 워커를 띄우지 마세요. 요청이 하위 에이전트·워커를 말해도 지금 당신에게 그 일이 맡겨졌다면 Elysium이 한 AI로 돌리기로 한 것이니, 직접 처리하고 답에 그렇게 했다고 밝히세요.\n";
+
 pub fn system_prompt(work: bool, workspace: &str, skill: Option<&(SkillRef, String)>) -> String {
     let mut s = String::from(
         "당신은 데스크톱 AI 클라이언트 Elysium 안에서 일하는 AI입니다. 사용자는 한국어를 씁니다. 한국어로 답하세요.\n\
@@ -1076,6 +1098,7 @@ pub fn system_prompt(work: bool, workspace: &str, skill: Option<&(SkillRef, Stri
     } else {
         s.push_str("대화 모드: 파일을 읽을 수는 있지만 고치거나 명령을 실행하지 마세요. 파일을 바꿔야 하면 바꿀 내용을 보여 주고 '만들기' 버튼으로 다시 요청하라고 안내하세요.\n");
     }
+    s.push_str(NO_NESTED_AI);
     s.push_str(ATTACH_SYSTEM);
     if let Some((r, body)) = skill {
         s.push_str(&format!("\n[스킬: {}]\n{}\n", r.name, body));
@@ -1651,12 +1674,17 @@ const FOLLOW_UP_MIN: Duration = Duration::from_secs(120);
 /// 세션을 이어 쓸 수 없는 엔진에 다시 보내는 앞선 글의 최대 글자 수
 const FOLLOW_UP_PARTIAL: usize = 6000;
 
-fn agent_slot(task: &str, key: &str) -> String {
+pub(crate) fn agent_slot(task: &str, key: &str) -> String {
     format!("{task}/{key}")
 }
 
 /// 에이전트 하나만 멈춘다. 없거나 이미 끝났으면 false.
 pub fn cancel_agent(st: &AppState, task: &str, key: &str) -> bool {
+    // 차례 사이(검토·대기열·질문 대기)에도 멈추도록 워커 토큰을 먼저 본다.
+    if let Some(t) = st.agent_stops.lock().unwrap_or_else(|p| p.into_inner()).get(&agent_slot(task, key)) {
+        t.cancel();
+        return true;
+    }
     match st.agents.lock().unwrap_or_else(|p| p.into_inner()).get(&agent_slot(task, key)) {
         Some(l) => {
             l.stop.cancel();
@@ -1677,7 +1705,14 @@ pub fn message_agent(app: &AppHandle, st: &AppState, task: &str, key: &str, text
             l.deliver(text.to_string());
             true
         }
-        None => false,
+        // 차례 사이면 다음 차례에 전한다.
+        None => match st.agent_inboxes.lock().unwrap_or_else(|p| p.into_inner()).get_mut(&agent_slot(task, key)) {
+            Some(mail) => {
+                mail.push(text.to_string());
+                true
+            }
+            None => false,
+        },
     };
     if delivered {
         agent_said(app, task, key, text);
@@ -1688,7 +1723,7 @@ pub fn message_agent(app: &AppHandle, st: &AppState, task: &str, key: &str, text
 /// 이 작업에서 지금 실행 중인 에이전트 모두에게 말을 건다. 받은 에이전트 수를 돌려준다.
 pub fn message_task(app: &AppHandle, st: &AppState, task: &str, text: &str) -> usize {
     let prefix = format!("{task}/");
-    let keys: Vec<String> = {
+    let mut keys: Vec<String> = {
         let mut g = st.agents.lock().unwrap_or_else(|p| p.into_inner());
         g.iter_mut()
             .filter(|(k, _)| k.starts_with(&prefix))
@@ -1698,6 +1733,14 @@ pub fn message_task(app: &AppHandle, st: &AppState, task: &str, text: &str) -> u
             })
             .collect()
     };
+    // 차례 사이의 워커는 다음 차례에 받는다.
+    for (k, mail) in st.agent_inboxes.lock().unwrap_or_else(|p| p.into_inner()).iter_mut().filter(|(k, _)| k.starts_with(&prefix)) {
+        let key = k[prefix.len()..].to_string();
+        if !keys.contains(&key) {
+            mail.push(text.to_string());
+            keys.push(key);
+        }
+    }
     for k in &keys {
         agent_said(app, task, k, text);
     }
@@ -1740,7 +1783,7 @@ async fn run_engine(app: &AppHandle, st: &AppState, conv: &str, task: &str, mid:
 /// stream=false: 토론·동시 에이전트처럼 여러 AI가 동시에 쓸 때. 글자를 흘리지 않고 시작·끝만 알린다(task:debate).
 /// key: 이 실행을 가리키는 이름(오른쪽 "에이전트" 탭이 실행마다 상태·활동을 보여 준다). 같은 엔진이 여럿이면 key로 구분한다.
 #[allow(clippy::too_many_arguments)]
-async fn run_engine_as(app: &AppHandle, st: &AppState, conv: &str, task: &str, mid: &str, role: &'static str, spec: RunSpec, timeout: Duration, cancel: &CancellationToken, stream: bool, key: &str) -> Outcome {
+pub(crate) async fn run_engine_as(app: &AppHandle, st: &AppState, conv: &str, task: &str, mid: &str, role: &'static str, spec: RunSpec, timeout: Duration, cancel: &CancellationToken, stream: bool, key: &str) -> Outcome {
     emit(app, "task:agent", json!({ "taskId": task, "conversationId": conv, "key": key, "engine": spec.engine, "label": spec.engine.label(), "role": role, "model": spec.model, "effort": spec.effort, "work": spec.work, "state": "run", "at": crate::db::now() }));
     if stream {
         emit(app, "task:phase", json!({ "taskId": task, "conversationId": conv, "messageId": mid, "phase": role, "engine": spec.engine, "label": spec.engine.label(), "effort": spec.effort, "model": spec.model }));
@@ -2227,6 +2270,9 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
             if a.model.is_some() {
                 spec.model = a.model.clone();
             }
+            if team.agent_effort.is_some() {
+                spec.effort = team.agent_effort.clone();
+            }
             let (key, mid, cancel) = (format!("agent:{i}"), &mid, &cancel);
             async move { run_engine_as(app, st, conv, task, mid, "agent", spec, timeout, cancel, false, &key).await }
         });
@@ -2595,12 +2641,41 @@ struct TeamWork<'a> {
 
 /// 나누는 AI 한 번에 기다리는 최대 시간
 const SPLIT_TIMEOUT: Duration = Duration::from_secs(300);
+/// 워커 하나를 기다리는 최소 시간. 큰 저장소의 하위 작업은 2026-11-02 실측 17~49분이 걸렸다.
+const TEAM_AGENT_TIMEOUT: Duration = Duration::from_secs(3600);
 
-fn remove_dir_quietly(dir: PathBuf) {
-    let _ = std::fs::remove_dir_all(dir);
+fn remove_agent_dirs(root: PathBuf, tmp: PathBuf) {
+    tokio::task::spawn_blocking(move || teamwork::remove_dirs(&root, &tmp));
 }
 
 /// 병렬 작업. Some이면 끝난 답(내용, 기록), None이면 나눌 수 없어 한 에이전트로 돌아간다(이유는 p에 남기고 p.team을 지운다).
+/// 요청문에 적힌 그룹을 나눈 결과가 지켰을 확률
+async fn groups_kept(http: &reqwest::Client, key: &str, request: &str, parts: &[teamwork::Part]) -> Result<(f64, u64, f64), String> {
+    let plan: Vec<Value> = parts.iter().map(|x| json!({ "title": x.title, "members": x.members })).collect();
+    let state = json!({ "request": cut(request, 6000), "plan": plan });
+    let mut q = serde_json::Map::new();
+    q.insert("groups".into(), json!({"type": "choice", "instructions": "`request` may name groups of workers, for example \"workers 1 and 2 are one group\". `plan` is how the work was split; members above 1 means a group of that size. Did the plan keep the groups the user wrote?", "criteria": {
+        "kept": "The user wrote no groups, left grouping to the lead, or the plan has the group sizes the user wrote.",
+        "broken": "The user wrote specific groups and the plan has different group sizes or none."
+    }}));
+    let r = jev::ask(http, key, "jev-latest", state, q, 1, Duration::from_secs(12)).await.map_err(|e| secrets::redact(&e.to_string()))?;
+    let p = jev::prob(&r.response.answers, "groups", "kept").ok_or("JEV returned no groups")?;
+    Ok((p, r.latency_ms, r.response.usage.input_tokens as f64 * JEV_PRICE / 1e6))
+}
+
+/// 총괄 등록. 작업이 끝나면 지우고 남은 질문과 대기를 끝낸다.
+struct LeadEntry {
+    st: std::sync::Arc<AppState>,
+    lead: std::sync::Arc<crate::leadrun::TaskLead>,
+}
+
+impl Drop for LeadEntry {
+    fn drop(&mut self) {
+        self.lead.cancel.cancel();
+        self.st.leads.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.lead.task);
+    }
+}
+
 async fn run_team_work(tw: &TeamWork<'_>, p: &mut Plan, team: &Team, ctx: &(dyn Fn(Option<&str>, &str) -> String + Sync), steps: &mut Vec<Step>) -> Option<(String, Value)> {
     let (app, st, conv, task, mid, s) = (tw.app, tw.st, tw.conv, tw.task, tw.mid, tw.settings);
     let act = |text: String| emit(app, "task:activity", json!({ "taskId": task, "conversationId": conv, "phase": "agents", "text": text }));
@@ -2633,7 +2708,7 @@ async fn run_team_work(tw: &TeamWork<'_>, p: &mut Plan, team: &Team, ctx: &(dyn 
 
     // 2) 나누기: 가장 강한 AI가 대화 모드로 하위 작업 목록(JSON)을 만든다.
     act(format!("{who}이(가) 요청을 하위 작업으로 분할 중", who = team.synth.label()));
-    let split = RunSpec {
+    let mut split = RunSpec {
         engine: team.synth,
         prompt: ctx(None, &teamwork::split_prompt(&p.prompt, &teamwork::listing(&base), n)),
         system: system_prompt(false, &ws, p.skill.as_ref()),
@@ -2648,37 +2723,53 @@ async fn run_team_work(tw: &TeamWork<'_>, p: &mut Plan, team: &Team, ctx: &(dyn 
         steer: None,
         attachments: tw.files.to_vec(),
     };
-    let o = run_engine_as(app, st, conv, task, mid, "plan", split, SPLIT_TIMEOUT, tw.cancel, false, "plan").await;
-    steps.push(step(team.synth, "plan", &o, &Some("medium".into()), spec_model(p, team.synth, s)));
-    if tw.cancel.is_cancelled() {
-        return stopped(steps, p, Value::Null);
+    let jev_on_groups = if s.jev_enabled { secrets::get(SecretName::TypeSafe) } else { None };
+    let (mut o, mut parts) = (Outcome::default(), None);
+    for attempt in 0..2 {
+        o = run_engine_as(app, st, conv, task, mid, "plan", split.clone(), SPLIT_TIMEOUT, tw.cancel, false, "plan").await;
+        steps.push(step(team.synth, "plan", &o, &Some("medium".into()), spec_model(p, team.synth, s)));
+        if tw.cancel.is_cancelled() {
+            return stopped(steps, p, Value::Null);
+        }
+        parts = o.ok.then(|| teamwork::parse_parts(&o.text, n)).flatten();
+        let (Some(found), Some(key), 0) = (&parts, &jev_on_groups, attempt) else { break };
+        match groups_kept(&st.http, key, &p.prompt, found).await {
+            Ok((kept, ms, cost)) => {
+                let _ = store::record_usage(&st.db, &store::Usage { engine: "jev", role: "groups", ok: true, latency_ms: ms, input_tokens: None, output_tokens: None, cost_usd: Some(cost) });
+                if kept >= 0.4 {
+                    break;
+                }
+                split.prompt = format!("{}\n\n앞서 나눈 결과가 요청문에 적힌 그룹과 다릅니다. 적힌 그룹 그대로 다시 나누세요.", split.prompt);
+            }
+            Err(_) => break,
+        }
     }
-    let Some(parts) = o.ok.then(|| teamwork::parse_parts(&o.text, n)).flatten() else {
+    let Some(parts) = parts else {
         single(p, "독립된 하위 작업으로 분할할 수 없어 단일 에이전트가 전체 파일 수정을 진행합니다.".to_string());
         return None;
     };
 
     // 3) 에이전트마다 폴더 사본
     let tmp = st.data_dir.join("teamwork").join(task);
-    let dirs: Vec<PathBuf> = (0..parts.len()).map(|i| tmp.join(format!("agent-{}", i + 1))).collect();
-    let copied = {
-        let (r, d, b) = (root.clone(), dirs.clone(), base.clone());
-        tokio::task::spawn_blocking(move || d.iter().try_for_each(|x| teamwork::copy_tree(&r, x, &b))).await.map_err(|e| e.to_string()).and_then(|r| r)
+    let prepared = {
+        let (r, t, b, count) = (root.clone(), tmp.clone(), base.clone(), parts.len());
+        tokio::task::spawn_blocking(move || teamwork::prepare_dirs(&r, &t, count, &b)).await.map_err(|e| e.to_string()).and_then(|r| r)
     };
-    if let Err(e) = copied {
-        tokio::task::spawn_blocking({
-            let t = tmp.clone();
-            move || remove_dir_quietly(t)
-        });
-        no_copy(p, e);
-        return None;
-    }
+    let (dirs, how) = match prepared {
+        Ok(w) => (w.dirs, w.how),
+        Err(e) => {
+            remove_agent_dirs(root.clone(), tmp.clone());
+            no_copy(p, e);
+            return None;
+        }
+    };
+    let space_note = format!("{}{}", if base.scope == teamwork::Scope::GitIgnore { teamwork::GITIGNORE_NOTE } else { "" }, if how == teamwork::Prepared::Worktree { teamwork::WORKTREE_NOTE } else { "" });
 
     // 4) 하위 작업을 동시에
     // 하위 작업마다 맡을 AI와 노력 단계: JEV가 정하고, 못 정한 칸은 처음 계획을 따른다. 요청 글에서 모델을 고른 팀은 그대로 둔다.
     let mut assigned: Vec<TeamAgent> = team.agents.iter().take(parts.len()).cloned().collect();
     let mut tiers: Vec<Option<Budget>> = vec![None; parts.len()];
-    if let Some(key) = tw.assign_key.filter(|_| assigned.iter().all(|a| a.model.is_none())) {
+    if let Some(key) = tw.assign_key.filter(|_| !team.pinned && assigned.iter().all(|a| a.model.is_none())) {
         act("JEV가 AI 배정 중".to_string());
         let all = st.installed();
         let clis: Vec<EngineId> = all.iter().copied().filter(|e| !e.is_api()).collect();
@@ -2706,38 +2797,74 @@ async fn run_team_work(tw: &TeamWork<'_>, p: &mut Plan, team: &Team, ctx: &(dyn 
         }
     }
     let agents: Vec<&TeamAgent> = assigned.iter().collect();
+    // 총괄: 요청 검토·사용자 소통을 맡는다. 첫 그룹원은 배정된 AI, 나머지는 팀 목록에서 차례로 쓴다.
+    let shared: std::sync::Arc<AppState> = app.state::<std::sync::Arc<AppState>>().inner().clone();
+    let lead = std::sync::Arc::new(crate::leadrun::TaskLead::new(conv, task, mid, &p.prompt, team.synth, model_for(p, team.synth, s), root.clone(), jev_on_groups.clone(), tw.cancel.child_token(), o.session_id.clone()));
+    let mut spare = team.agents.iter().cycle().skip(parts.len());
+    let units: Vec<Vec<TeamAgent>> = parts.iter().zip(&assigned).map(|(x, first)| std::iter::once(first.clone()).chain(spare.by_ref().take(x.members.saturating_sub(1)).cloned()).collect()).collect();
+    let member_key = |i: usize, m: usize, unit: &[TeamAgent]| if unit.len() > 1 { format!("agent:{i}.{m}") } else { format!("agent:{i}") };
+    {
+        let mut workers = lead.workers.lock().unwrap_or_else(|e| e.into_inner());
+        for (i, unit) in units.iter().enumerate() {
+            for m in 0..unit.len() {
+                workers.push(crate::leadrun::WorkerInfo { key: member_key(i, m, unit), title: parts[i].title.clone(), group: (unit.len() > 1).then_some(i) });
+            }
+        }
+    }
+    st.leads.lock().unwrap_or_else(|e| e.into_inner()).insert(task.to_string(), lead.clone());
+    let _lead_entry = LeadEntry { st: shared.clone(), lead: lead.clone() };
+    let lead_ctx = crate::leadrun::Ctx { app: app.clone(), st: shared, lead: lead.clone() };
+    emit(app, "lead:started", json!({ "taskId": task, "conversationId": conv, "engine": team.synth, "label": team.synth.label(), "model": lead.model }));
+    let groups: Vec<Value> = units.iter().enumerate().filter(|(_, u)| u.len() > 1).map(|(i, u)| json!({ "index": i, "title": parts[i].title, "keys": (0..u.len()).map(|m| member_key(i, m, u)).collect::<Vec<_>>() })).collect();
+    if !groups.is_empty() {
+        emit(app, "task:groups", json!({ "taskId": task, "conversationId": conv, "groups": groups }));
+    }
     let who = |a: &TeamAgent| match &a.model {
         Some(m) => format!("{} · {m}", a.engine.label()),
         None => a.engine.label().to_string(),
     };
-    emit(app, "task:parts", json!({ "taskId": task, "conversationId": conv, "parts": parts.iter().enumerate().map(|(i, x)| json!({ "key": format!("agent:{i}"), "title": x.title, "files": x.files })).collect::<Vec<_>>() }));
+    emit(app, "task:parts", json!({ "taskId": task, "conversationId": conv, "parts": parts.iter().enumerate().flat_map(|(i, x)| (0..units[i].len()).map(|m| json!({ "key": member_key(i, m, &units[i]), "title": x.title, "files": x.files })).collect::<Vec<_>>()).collect::<Vec<_>>() }));
     act(format!("{n}개의 에이전트가 개별 작업 공간에서 동시 작업 중", n = parts.len()));
     let effort = p.budget.as_ref().map(|b| b.effort.to_string());
     let max_tokens = p.budget.as_ref().map(|b| b.max_tokens);
     let outs: Vec<Outcome> = {
         let pr: &Plan = p;
         let runs = parts.iter().enumerate().map(|(i, part)| {
-            let a = agents[i];
-            let spec = RunSpec {
-                engine: a.engine,
-                prompt: ctx(None, &teamwork::part_prompt(&pr.prompt, part)),
-                system: format!("{}{}", tw.system, teamwork::part_system(i, &parts)),
-                cwd: dirs[i].clone(),
-                work: true,
-                resume: None,
-                plugin_dirs: if a.engine == EngineId::Claude { tw.plugin_dirs.to_vec() } else { vec![] },
-                model: a.model.clone().or_else(|| match (&tiers[i], a.engine) {
-                    (Some(b), EngineId::Claude) => b.claude_model.map(str::to_string),
-                    _ => model_for(pr, a.engine, s),
-                }),
-                effort: tiers[i].as_ref().map(|b| b.effort.to_string()).or_else(|| effort.clone()),
-                max_tokens: tiers[i].as_ref().map(|b| b.max_tokens).or(max_tokens),
-                extra_dirs: tw.extra_dirs.to_vec(),
-                steer: None,
-                attachments: tw.files.to_vec(),
-            };
-            let key = format!("agent:{i}");
-            async move { run_engine_as(app, st, conv, task, mid, "agent", spec, tw.timeout, tw.cancel, false, &key).await }
+            let unit = &units[i];
+            let specs: Vec<(String, RunSpec)> = unit
+                .iter()
+                .enumerate()
+                .map(|(m, a)| {
+                    let spec = RunSpec {
+                        engine: a.engine,
+                        prompt: ctx(None, &teamwork::part_prompt(&pr.prompt, part)),
+                        system: format!("{}{}{space_note}{}{}", tw.system, teamwork::part_system(i, &parts), crate::leadrun::worker_note(a.engine), if unit.len() > 1 { crate::lead::GROUP_SYSTEM } else { "" }),
+                        cwd: dirs[i].clone(),
+                        work: true,
+                        resume: None,
+                        plugin_dirs: if a.engine == EngineId::Claude { tw.plugin_dirs.to_vec() } else { vec![] },
+                        model: a.model.clone().or_else(|| match (&tiers[i], a.engine) {
+                            (Some(b), EngineId::Claude) => b.claude_model.map(str::to_string),
+                            _ => model_for(pr, a.engine, s),
+                        }),
+                        effort: team.agent_effort.clone().or_else(|| tiers[i].as_ref().map(|b| b.effort.to_string())).or_else(|| effort.clone()),
+                        max_tokens: tiers[i].as_ref().map(|b| b.max_tokens).or(max_tokens),
+                        extra_dirs: tw.extra_dirs.to_vec(),
+                        steer: None,
+                        attachments: tw.files.to_vec(),
+                    };
+                    (member_key(i, m, unit), spec)
+                })
+                .collect();
+            let (title, budget, lead_ctx) = (part.title.as_str(), tw.timeout.max(TEAM_AGENT_TIMEOUT), &lead_ctx);
+            async move {
+                if specs.len() > 1 {
+                    crate::leadrun::run_group(lead_ctx, i, title, specs, budget).await
+                } else {
+                    let (key, spec) = specs.into_iter().next().expect("하위 작업에는 워커가 있다");
+                    crate::leadrun::run_part_worker(lead_ctx, spec, &key, title, budget, true).await
+                }
+            }
         });
         futures_util::future::join_all(runs).await
     };
@@ -2748,13 +2875,13 @@ async fn run_team_work(tw: &TeamWork<'_>, p: &mut Plan, team: &Team, ctx: &(dyn 
             (Some(b), _) => (Some(b.effort.to_string()), spec_model(p, a.engine, s)),
             (None, _) => (spec_effort(p), spec_model(p, a.engine, s)),
         };
-        steps.push(step(a.engine, "agent", o, &effort, a.model.clone().or(model)));
+        steps.push(step(a.engine, "agent", o, &team.agent_effort.clone().or(effort), a.model.clone().or(model)));
     }
 
     // 5) 바뀐 파일 찾기(실패·중지한 에이전트는 합치지 않는다)
     let changes: Vec<Option<teamwork::Changes>> = {
         let (d, b, ok): (Vec<PathBuf>, teamwork::Snapshot, Vec<bool>) = (dirs.clone(), base.clone(), outs.iter().map(good).collect());
-        tokio::task::spawn_blocking(move || d.iter().zip(ok).map(|(x, ok)| if ok { teamwork::snapshot(x).ok().map(|a| teamwork::diff(&b, &a)) } else { None }).collect()).await.unwrap_or_default()
+        tokio::task::spawn_blocking(move || d.iter().zip(ok).map(|(x, ok)| if ok { teamwork::snapshot_like(x, b.scope).ok().map(|a| teamwork::diff(&b, &a)) } else { None }).collect()).await.unwrap_or_default()
     };
     let changes: Vec<Option<teamwork::Changes>> = (0..parts.len()).map(|i| changes.get(i).cloned().flatten()).collect();
     let team_json = |synth: Option<EngineId>, conflicts: &[String]| {
@@ -2763,10 +2890,12 @@ async fn run_team_work(tw: &TeamWork<'_>, p: &mut Plan, team: &Team, ctx: &(dyn 
             "synth": synth,
             "work": true,
             "conflicts": conflicts,
+            "decisions": *lead.decisions.lock().unwrap_or_else(|e| e.into_inner()),
+            "groupLog": *lead.group_log.lock().unwrap_or_else(|e| e.into_inner()),
         })
     };
     if tw.cancel.is_cancelled() {
-        tokio::task::spawn_blocking(move || remove_dir_quietly(tmp));
+        remove_agent_dirs(root, tmp);
         return stopped(steps, p, team_json(None, &[]));
     }
 
@@ -2806,7 +2935,7 @@ async fn run_team_work(tw: &TeamWork<'_>, p: &mut Plan, team: &Team, ctx: &(dyn 
         })
         .collect();
     if results.iter().all(|r| !r.ok) {
-        tokio::task::spawn_blocking(move || remove_dir_quietly(tmp));
+        remove_agent_dirs(root, tmp);
         let why = outs.iter().find_map(|o| o.error.clone()).unwrap_or_else(|| "답을 받지 못했습니다".into());
         return Some((format!("⚠ {why}"), message_data(steps, p, json!({ "error": why, "team": team_json(None, &conflicts) }))));
     }
@@ -2817,7 +2946,7 @@ async fn run_team_work(tw: &TeamWork<'_>, p: &mut Plan, team: &Team, ctx: &(dyn 
     let spec = RunSpec {
         engine: team.synth,
         prompt: ctx(None, &teamwork::integrate_prompt(&p.prompt, &results, &conflict_views)),
-        system: format!("{}{}", tw.system, teamwork::INTEGRATE_SYSTEM),
+        system: format!("{}{}{}", tw.system, teamwork::INTEGRATE_SYSTEM, crate::leadrun::worker_note(team.synth)),
         cwd: root.clone(),
         work: true,
         resume: None,
@@ -2829,9 +2958,15 @@ async fn run_team_work(tw: &TeamWork<'_>, p: &mut Plan, team: &Team, ctx: &(dyn 
         steer: None,
         attachments: tw.files.to_vec(),
     };
-    let j = run_engine(app, st, conv, task, mid, "synth", spec, tw.timeout, tw.cancel).await;
+    lead.integrating.store(true, std::sync::atomic::Ordering::Relaxed);
+    let j = if team.synth.resumable() {
+        let key = format!("synth:{}", team.synth.as_str());
+        crate::leadrun::run_worker(&lead_ctx, spec, crate::leadrun::WorkerOpts { key: &key, title: "통합", role: "synth", stream: true, budget: tw.timeout, reviewed: crate::leadrun::needs_review(team.synth), check_drift: false }).await
+    } else {
+        run_engine(app, st, conv, task, mid, "synth", spec, tw.timeout, tw.cancel).await
+    };
     steps.push(step(team.synth, "synth", &j, &spec_effort(p), spec_model(p, team.synth, s)));
-    tokio::task::spawn_blocking(move || remove_dir_quietly(tmp));
+    remove_agent_dirs(root, tmp);
     let first_ok = agents.iter().zip(&outs).find(|(_, o)| good(o)).map(|(a, _)| a.engine);
     if good(&j) {
         return Some((j.text.clone(), message_data(steps, p, json!({ "synthBy": team.synth, "draftedBy": first_ok, "team": team_json(Some(team.synth), &conflicts) }))));
@@ -3156,7 +3291,7 @@ mod tests {
     #[test]
     fn assign_request_covers_every_part() {
         use EngineId::*;
-        let parts = vec![teamwork::Part { title: "화면".into(), task: "만들기".into(), files: vec!["src".into()] }, teamwork::Part { title: "서버".into(), task: "만들기".into(), files: vec![] }];
+        let parts = vec![teamwork::Part { title: "화면".into(), task: "만들기".into(), files: vec!["src".into()], members: 1 }, teamwork::Part { title: "서버".into(), task: "만들기".into(), files: vec![], members: 1 }];
         let (s, q) = assign_request(&parts, &[Claude, Codex]);
         assert_eq!(s["parts"]["p1"]["title"], "서버");
         assert!(q.contains_key("e0") && q.contains_key("e1") && q.contains_key("d0") && q.contains_key("d1"));
@@ -3359,6 +3494,30 @@ mod tests {
         assert!(body.contains("[이 스킬의 참고 파일]") && body.contains("accessibility.md") && body.contains("필요한 파일만"));
         let p = plan("/summarize 이 글", None, false, &[EngineId::Claude], &c, ReviewMode::Auto, None).unwrap();
         assert!(p.skill.unwrap().0.dir.is_none(), "참고 파일 없는 스킬은 폴더를 넘기지 않음");
+    }
+
+    #[test]
+    fn team_named_in_the_request_beats_jev_and_settings() {
+        use EngineId::*;
+        let c = Catalog::default();
+        let all = [Claude, Antigravity, OpenCode, Nvidia];
+        let text = "**총괄 분할자 및 관리자**인 **Opus 5.5**입니다. **4개의 Gemini 3.8 Flash (High) 하위 에이전트(Worker)**를 병렬 구동하십시오.";
+        let p = plan_with(text, None, true, &all, &c, ReviewMode::Auto, None, 2).unwrap();
+        let t = p.team.expect("요청 글의 팀");
+        assert_eq!(t.agents, vec![TeamAgent { engine: Antigravity, model: Some("gemini-3.8-flash".into()) }; 4]);
+        assert_eq!(t.agent_effort.as_deref(), Some("high"));
+        assert_eq!(t.synth, Claude);
+        assert_eq!(p.primary, Claude);
+        assert!(p.models.contains(&(Claude, "opus".to_string())), "{:?}", p.models);
+        assert!(p.prompt.contains("Gemini 3.8 Flash"), "지시문은 그대로 넘긴다");
+    }
+
+    #[test]
+    fn every_agent_is_told_elysium_runs_the_other_ais() {
+        for work in [true, false] {
+            let sys = system_prompt(work, "C:\\w", None);
+            assert!(["agy", "just-code-claude", "gemini"].iter().all(|n| sys.contains(n)), "{sys}");
+        }
     }
 
     #[test]
