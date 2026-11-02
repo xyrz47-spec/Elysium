@@ -150,3 +150,17 @@ button:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2p
 .confirm-actions .btn { border: 1px solid var(--line-2); background: var(--surface-2); border-radius: 14px; padding: 12px; font-size: 15px; font-weight: 700; }
 .confirm-actions .btn.primary { background: var(--grad); color: var(--on-grad); border-color: transparent; }
 .confirm-actions .btn.danger.solid { background: var(--err); color: #fff; border-color: transparent; }
+
+/* 첨부 파일 */
+.files { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.file-chip { display: flex; align-items: center; gap: 7px; width: 100%; min-height: 40px; padding: 7px 10px; border: 1px solid var(--line-2); border-radius: 11px; background: var(--surface-2); color: var(--muted); font-size: 13px; text-align: left; }
+.file-chip b { flex: 1; min-width: 0; overflow: hidden; color: var(--ink); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.file-chip span { flex: none; color: var(--dim); font-size: 12px; font-variant-numeric: tabular-nums; }
+.file-image { display: block; width: 100%; margin-top: 6px; border-radius: 11px; }
+.file-text { max-height: 40vh; margin: 6px 0 0; padding: 10px; overflow: auto; border-radius: 11px; background: var(--surface-2); font-size: 12.5px; white-space: pre-wrap; word-break: break-word; }
+.draft-files { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 7px; }
+.draft-file { display: inline-flex; align-items: center; gap: 2px; max-width: 100%; min-height: 32px; padding: 2px 3px 2px 10px; border: 1px solid var(--line-2); border-radius: 10px; background: var(--surface-2); font-size: 12.5px; }
+.draft-file b { overflow: hidden; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.draft-file button { width: 28px; height: 28px; border: 0; background: transparent; color: var(--dim); font-size: 17px; line-height: 1; }
+.draft-file.busy { padding-right: 10px; color: var(--muted); }
+.icon-btn.attach { flex: none; }

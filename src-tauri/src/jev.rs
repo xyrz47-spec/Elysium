@@ -96,6 +96,13 @@ pub fn prob(answers: &HashMap<String, Answer>, key: &str, label: &str) -> Option
     }
 }
 
+pub fn noul(answers: &HashMap<String, Answer>, key: &str) -> Option<f64> {
+    match answers.get(key)? {
+        Answer::Noul { noul } => Some(*noul),
+        _ => None,
+    }
+}
+
 pub fn score(answers: &HashMap<String, Answer>, key: &str) -> Option<(f64, f64)> {
     match answers.get(key)? {
         Answer::Score { score, confidence, .. } => Some((*score, *confidence)),

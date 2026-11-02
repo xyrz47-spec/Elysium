@@ -29,11 +29,15 @@ pub struct Settings {
     pub models: BTreeMap<String, String>,
     /// 대화 요청마다 동시에 돌릴 에이전트 수(1이면 끔, 최대 5). 요청 글에서 따로 정하면 그 수를 쓴다.
     pub agents: u8,
+    /// true면 JEV가 요청을 보고 동시 에이전트 수를 정한다(JEV를 못 쓰면 1개). false면 agents를 그대로 쓴다.
+    pub agents_auto: bool,
+    /// 입력하는 동안 JEV가 모드·스킬을 추천한다(보내기 전의 글이 TypeSafe로 전송됨). JEV가 켜져 있을 때만 돈다.
+    pub jev_suggest: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { workspace_dir: None, review: ReviewMode::Auto, jev_enabled: false, models: BTreeMap::new(), agents: 1 }
+        Settings { workspace_dir: None, review: ReviewMode::Auto, jev_enabled: false, models: BTreeMap::new(), agents: 1, agents_auto: true, jev_suggest: true }
     }
 }
 
@@ -49,6 +53,10 @@ impl Settings {
         self.workspace_dir = self.workspace_dir.map(|d| d.trim().to_string()).filter(|d| !d.is_empty());
         self.models = self.models.into_iter().map(|(k, v)| (k, v.trim().to_string())).filter(|(_, v)| !v.is_empty()).collect();
         self.agents = self.agents.clamp(1, crate::intent::MAX_AGENTS as u8);
+        // OpenCode는 무료 모델만: 다른 값은 저장하지 않는다.
+        if self.models.get("opencode").is_some_and(|m| !crate::engines::is_free_model(m)) {
+            self.models.remove("opencode");
+        }
         self
     }
 }
@@ -93,7 +101,11 @@ mod tests {
         // 예전 설정(에이전트 수 없음)은 1개로, 범위 밖은 1~5로
         let old: Settings = serde_json::from_str(r#"{"review":"auto","jevEnabled":false,"models":{}}"#).unwrap();
         assert_eq!(old.agents, 1);
+        assert!(old.agents_auto, "예전 설정도 JEV 자동 분배로 시작");
         assert_eq!(Settings { agents: 9, ..Default::default() }.sanitized().agents, 5);
         assert_eq!(Settings { agents: 0, ..Default::default() }.sanitized().agents, 1);
+        let mut models = BTreeMap::new();
+        models.insert("opencode".to_string(), "anthropic/claude-opus-5-5".to_string());
+        assert!(Settings { models, ..Default::default() }.sanitized().models.is_empty(), "유료 모델은 저장하지 않는다");
     }
 }

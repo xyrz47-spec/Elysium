@@ -31,8 +31,8 @@ pub const SUMMARY_CHARS: usize = 1400;
 
 /// JEV에게 물어볼 요약 줄 수 상한(넘는 줄은 거르지 않고 그대로 둔다)
 const FILTER_MAX_LINES: usize = 24;
-/// 거를 기억이 이보다 짧으면 JEV를 부르지 않는다(기다리는 시간이 아끼는 토큰보다 크다).
-pub const FILTER_MIN_CHARS: usize = 600;
+/// 거를 기억이 이보다 짧으면 JEV를 부르지 않는다(인사 한 줄처럼 고를 것이 없는 경우만).
+pub const FILTER_MIN_CHARS: usize = 40;
 /// JEV가 "필요"라고 본 확률이 이 값 이상이면 남긴다.
 const KEEP: f64 = 0.5;
 /// 바로 앞 차례(가장 최근 요청·답)는 이어지는 요청이 많아 더 너그럽게 남긴다.
@@ -61,7 +61,15 @@ pub fn turns(msgs: &[Message]) -> Vec<Turn> {
             Turn {
                 role: m.role.clone(),
                 by: if m.role == "assistant" { pick("judgedBy").or_else(|| pick("reviewedBy")).or_else(|| pick("draftedBy")) } else { None },
-                content: m.content.clone(),
+                // 첨부 파일은 내용 대신 이름만 남긴다(필요하면 JEV가 고른 파일을 요청에 다시 붙인다).
+                content: {
+                    let files = crate::attachments::of_data(d);
+                    if files.is_empty() {
+                        m.content.clone()
+                    } else {
+                        format!("{}\n[첨부: {}]", m.content, files.iter().map(|f| f.name.as_str()).collect::<Vec<_>>().join(", "))
+                    }
+                },
                 at: m.created_at.clone(),
             }
         })
@@ -424,7 +432,7 @@ mod tests {
         assert_eq!(c.lines.len(), 4, "들여 쓴 이어지는 줄은 앞 항목에 붙는다");
         assert!(c.lines[1].contains("(Rust + React)"));
         assert_eq!(c.turns, vec![4, 5, 6, 7, 8, 9], "context가 붙일 수 있는 마지막 RECENT개");
-        assert!(candidates(Some("- 짧음"), &h[..1]).is_none(), "짧으면 거르지 않는다");
+        assert!(candidates(Some("- 짧음"), &[]).is_none(), "고를 것이 없으면 거르지 않는다");
         assert!(candidates(None, &[]).is_none());
         let many: String = (0..30).map(|i| format!("- 항목 {i} {}\n", "가".repeat(30))).collect();
         let c = candidates(Some(&many), &[]).unwrap();

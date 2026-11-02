@@ -1,6 +1,7 @@
 //! API 키로 쓰는 AI(Claude API·OpenAI·Gemini API·NVIDIA). 스트리밍으로 받아 CLI 엔진과 같은 이벤트로 넘긴다.
 //! 작업 모드에서는 api_agent가 도구 호출(파일·PowerShell)을 이 PC에서 실행해 준다.
 
+use crate::attachments::{self, AttachedFile};
 use crate::engines::{EngineId, Event, Outcome, RunSpec};
 use crate::secrets::{self, SecretName};
 use futures_util::StreamExt;
@@ -219,6 +220,42 @@ pub(crate) fn user_content(wire: Wire, prompt: &str) -> Value {
     }
 }
 
+/// 이 엔진이 본문으로 받을 수 있는 이미지·PDF. Claude는 둘 다, OpenAI 호환 공급자는 이미지만 받는다.
+pub(crate) fn can_send_binary(e: EngineId) -> impl Fn(&AttachedFile) -> bool {
+    let anthropic = api(e).is_some_and(|a| a.wire == Wire::Anthropic);
+    move |f| attachments::fits_api(f) && (anthropic || f.kind == "image")
+}
+
+/// 사용자 메시지 내용에 이미지·PDF를 붙인다. 글 파일은 engines::run이 이미 본문에 넣었다.
+pub(crate) fn add_files(wire: Wire, content: Value, engine: EngineId, files: &[AttachedFile]) -> Value {
+    let ok = can_send_binary(engine);
+    let mut blocks: Vec<Value> = vec![];
+    for f in files.iter().filter(|f| ok(f)) {
+        let Ok(bytes) = std::fs::read(&f.path) else { continue };
+        let data = attachments::b64_encode(&bytes);
+        blocks.push(match (wire, f.kind.as_str()) {
+            (Wire::Anthropic, "pdf") => json!({ "type": "document", "source": { "type": "base64", "media_type": f.mime, "data": data } }),
+            (Wire::Anthropic, _) => json!({ "type": "image", "source": { "type": "base64", "media_type": f.mime, "data": data } }),
+            (Wire::OpenAiCompat, _) => json!({ "type": "image_url", "image_url": { "url": format!("data:{};base64,{data}", f.mime) } }),
+        });
+    }
+    if blocks.is_empty() {
+        return content;
+    }
+    match content {
+        Value::Array(mut existing) => {
+            existing.extend(blocks);
+            Value::Array(existing)
+        }
+        other => {
+            let text = other.as_str().unwrap_or("").to_string();
+            let mut all = vec![json!({ "type": "text", "text": text })];
+            all.extend(blocks);
+            Value::Array(all)
+        }
+    }
+}
+
 /// 문자열의 안정적인 해시(FNV-1a). 실행·빌드가 바뀌어도 같은 글자면 같은 값.
 fn fnv(s: &str) -> u64 {
     s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3))
@@ -267,8 +304,12 @@ pub(crate) fn body(a: &Api, model: &str, system: &str, prompt: &str, max_tokens:
 }
 
 #[allow(clippy::too_many_arguments)]
-fn request(http: &reqwest::Client, a: &Api, key: &str, model: &str, system: &str, prompt: &str, max_tokens: u32, stream: bool, effort: Option<&str>) -> reqwest::RequestBuilder {
-    let b = body(a, model, system, prompt, max_tokens, stream, effort);
+fn request(http: &reqwest::Client, a: &Api, key: &str, model: &str, system: &str, prompt: &str, max_tokens: u32, stream: bool, effort: Option<&str>, files: Option<(EngineId, &[AttachedFile])>) -> reqwest::RequestBuilder {
+    let mut b = body(a, model, system, prompt, max_tokens, stream, effort);
+    if let (Some((engine, list)), Some(m)) = (files, b["messages"].as_array_mut().and_then(|m| m.last_mut())) {
+        let content = m["content"].take();
+        m["content"] = add_files(a.wire, content, engine, list);
+    }
     match a.wire {
         Wire::OpenAiCompat => http.post(format!("{}/chat/completions", a.base_url)).bearer_auth(key).json(&b),
         Wire::Anthropic => http.post(format!("{}/v1/messages", a.base_url)).header("x-api-key", key).header("anthropic-version", "2023-06-01").json(&b),
@@ -307,7 +348,7 @@ pub async fn run(http: &reqwest::Client, spec: &RunSpec, model: &str, timeout: D
         loop {
             attempt += 1;
             let one = async {
-                let resp = request(http, &a, &key, model, &spec.system, &spec.prompt, spec.max_tokens.unwrap_or(8192), true, spec.effort.as_deref())
+                let resp = request(http, &a, &key, model, &spec.system, &spec.prompt, spec.max_tokens.unwrap_or(8192), true, spec.effort.as_deref(), Some((spec.engine, &spec.attachments)))
                     .send()
                     .await
                     .map_err(|e| if e.is_timeout() { "응답 시간 초과".to_string() } else { format!("{}에 연결할 수 없습니다", spec.engine.label()) })?;
@@ -379,7 +420,7 @@ pub async fn test(http: &reqwest::Client, engine: EngineId, model: &str) -> Resu
     let a = api(engine).ok_or("API 엔진이 아닙니다")?;
     let key = secrets::get(a.secret).ok_or("키가 없습니다")?;
     let started = Instant::now();
-    let r = request(http, &a, &key, model, "Reply with one word.", "안녕", 1, false, None)
+    let r = request(http, &a, &key, model, "Reply with one word.", "안녕", 1, false, None, None)
         .timeout(Duration::from_secs(30))
         .send()
         .await
@@ -394,6 +435,27 @@ pub async fn test(http: &reqwest::Client, engine: EngineId, model: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn files_become_content_blocks_for_each_wire() {
+        let d = tempfile::tempdir().unwrap();
+        let img = d.path().join("a.png");
+        std::fs::write(&img, [0x89u8, b'P', b'N', b'G']).unwrap();
+        let pdf = d.path().join("b.pdf");
+        std::fs::write(&pdf, b"%PDF-1.7").unwrap();
+        let files = vec![
+            AttachedFile { name: "a.png".into(), path: img, kind: "image".into(), mime: "image/png".into(), size: 4 },
+            AttachedFile { name: "b.pdf".into(), path: pdf, kind: "pdf".into(), mime: "application/pdf".into(), size: 8 },
+        ];
+        let c = add_files(Wire::Anthropic, json!("안녕"), EngineId::ClaudeApi, &files);
+        assert_eq!(c[0]["text"], "안녕");
+        assert_eq!(c[1]["type"], "image");
+        assert_eq!(c[2]["type"], "document");
+        let o = add_files(Wire::OpenAiCompat, json!("안녕"), EngineId::OpenAi, &files);
+        assert_eq!(o.as_array().unwrap().len(), 2, "OpenAI 호환은 PDF를 받지 않는다");
+        assert!(o[1]["image_url"]["url"].as_str().unwrap().starts_with("data:image/png;base64,"));
+        assert_eq!(add_files(Wire::OpenAiCompat, json!("안녕"), EngineId::OpenAi, &[]), json!("안녕"), "파일이 없으면 그대로");
+    }
 
     #[test]
     fn stream_errors_are_readable_and_retried() {

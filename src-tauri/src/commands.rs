@@ -1,6 +1,7 @@
 //! 프런트엔드에서 부르는 명령.
 
 use crate::apis;
+use crate::attachments;
 use crate::audit;
 use crate::remote;
 use crate::secrets::{self, SecretName, SecretStatus};
@@ -134,7 +135,11 @@ pub fn conversation_rename(st: S, conversation_id: String, title: String) -> App
 
 #[tauri::command]
 pub fn conversation_delete(st: S, conversation_id: String) -> AppResult<()> {
+    let files: Vec<attachments::Attachment> = store::list_messages(&st.db, &conversation_id)?.iter().flat_map(|m| attachments::of_data(m.data.as_ref())).collect();
     store::delete_conversation(&st.db, &conversation_id)?;
+    for f in &files {
+        attachments::remove(&st.data_dir, &f.id);
+    }
     audit::record(&st.db, "user", "conversation.deleted", "ok", json!({}));
     Ok(())
 }
@@ -144,10 +149,108 @@ pub fn conversation_delete(st: S, conversation_id: String) -> AppResult<()> {
 /// council: '회의' 버튼. 여러 AI가 라운드마다 서로의 발언을 읽고 대화하며 푼다(대화 모드).
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-pub fn chat_send(app: AppHandle, st: S, conversation_id: Option<String>, text: String, engine: Option<String>, work: Option<bool>, build: Option<bool>, workspace: Option<String>, council: Option<bool>) -> AppResult<SendResult> {
+pub fn chat_send(app: AppHandle, st: S, conversation_id: Option<String>, text: String, engine: Option<String>, work: Option<bool>, build: Option<bool>, workspace: Option<String>, council: Option<bool>, attachments: Option<Vec<String>>) -> AppResult<SendResult> {
     let choice = engine.as_deref().filter(|e| *e != "auto").map(|e| EngineId::parse(e).ok_or_else(|| AppError::msg(format!("알 수 없는 엔진: {e}")))).transpose()?;
     let workspace = workspace.filter(|w| !w.trim().is_empty()).map(|w| checked_dir(&w)).transpose()?;
-    orchestrator::send(&app, st.inner(), conversation_id, text, choice, work.unwrap_or(false), build.unwrap_or(false), workspace, council.unwrap_or(false)).map_err(AppError::msg)
+    orchestrator::send(&app, st.inner(), conversation_id, text, choice, work.unwrap_or(false), build.unwrap_or(false), workspace, council.unwrap_or(false), attachments.unwrap_or_default()).map_err(AppError::msg)
+}
+
+// ---------------------------------------------------------------------------
+// 첨부 파일
+
+fn attachment_of(st: &AppState, id: &str) -> AppResult<attachments::Attachment> {
+    attachments::load(&st.data_dir, id).ok_or_else(|| AppError::msg("파일을 찾을 수 없습니다."))
+}
+
+fn add_many(st: &AppState, paths: Vec<std::path::PathBuf>) -> AppResult<Vec<attachments::Attachment>> {
+    let mut out = vec![];
+    let mut first_error = None;
+    for p in paths {
+        match attachments::add_path(&st.data_dir, &p, "user") {
+            Ok(a) => out.push(a),
+            Err(e) => first_error = first_error.or(Some(e)),
+        }
+    }
+    match (out.is_empty(), first_error) {
+        (true, Some(e)) => Err(AppError::msg(e)),
+        _ => Ok(out),
+    }
+}
+
+/// 파일 선택 창을 열어 고른 파일을 첨부로 올린다. 취소하면 빈 목록.
+#[tauri::command]
+pub async fn attachment_pick(app: AppHandle, st: S<'_>) -> AppResult<Vec<attachments::Attachment>> {
+    use tauri_plugin_dialog::DialogExt;
+    let picked = tauri::async_runtime::spawn_blocking(move || app.dialog().file().set_title("첨부할 파일 선택").blocking_pick_files()).await.ok().flatten().unwrap_or_default();
+    add_many(&st, picked.into_iter().filter_map(|p| p.into_path().ok()).collect())
+}
+
+/// 창에 끌어다 놓은 파일을 첨부로 올린다.
+#[tauri::command]
+pub fn attachment_add_paths(st: S, paths: Vec<String>) -> AppResult<Vec<attachments::Attachment>> {
+    add_many(&st, paths.into_iter().map(std::path::PathBuf::from).collect())
+}
+
+/// 붙여 넣은 이미지처럼 경로가 없는 내용을 첨부로 올린다.
+#[tauri::command]
+pub fn attachment_add_bytes(st: S, name: String, data_base64: String) -> AppResult<attachments::Attachment> {
+    let bytes = attachments::b64_decode(&data_base64).ok_or_else(|| AppError::msg("invalid base64"))?;
+    attachments::add_bytes(&st.data_dir, &name, &bytes, "user").map_err(AppError::msg)
+}
+
+/// 보내기 전에 입력창에서 뺀 첨부를 지운다.
+#[tauri::command]
+pub fn attachment_remove(st: S, id: String) {
+    attachments::remove(&st.data_dir, &id);
+}
+
+#[tauri::command]
+pub fn attachment_preview(st: S, id: String) -> AppResult<Option<String>> {
+    Ok(attachments::preview_url(&st.data_dir, &attachment_of(&st, &id)?))
+}
+
+/// 기본 프로그램으로 연다. 실행되는 형식은 열지 않고 탐색기에서 보여 준다(true를 돌려준다).
+#[tauri::command]
+pub fn attachment_open(app: AppHandle, st: S, id: String) -> AppResult<bool> {
+    let a = attachment_of(&st, &id)?;
+    let path = attachments::path_of(&st.data_dir, &a);
+    if attachments::risky_to_open(&a.name) || attachments::risky_to_open(&a.file) {
+        app.opener().reveal_item_in_dir(&path).map_err(|e| AppError::msg(e.to_string()))?;
+        return Ok(true);
+    }
+    app.opener().open_path(path.to_string_lossy(), None::<&str>).map_err(|e| AppError::msg(e.to_string()))?;
+    Ok(false)
+}
+
+#[tauri::command]
+pub fn attachment_reveal(app: AppHandle, st: S, id: String) -> AppResult<()> {
+    let a = attachment_of(&st, &id)?;
+    app.opener().reveal_item_in_dir(attachments::path_of(&st.data_dir, &a)).map_err(|e| AppError::msg(e.to_string()))
+}
+
+/// 저장 위치를 물어 복사한다. 취소하면 None.
+#[tauri::command]
+pub async fn attachment_save_as(app: AppHandle, st: S<'_>, id: String) -> AppResult<Option<String>> {
+    use tauri_plugin_dialog::DialogExt;
+    let a = attachment_of(&st, &id)?;
+    let src = attachments::path_of(&st.data_dir, &a);
+    let name = a.name.clone();
+    let picked = tauri::async_runtime::spawn_blocking(move || app.dialog().file().set_file_name(&name).blocking_save_file()).await.ok().flatten();
+    let Some(dest) = picked.and_then(|p| p.into_path().ok()) else { return Ok(None) };
+    std::fs::copy(&src, &dest)?;
+    Ok(Some(dest.to_string_lossy().to_string()))
+}
+
+/// 입력하는 동안 JEV가 추천하는 모드·스킬. 꺼져 있으면 None.
+#[tauri::command]
+pub async fn jev_suggest(st: S<'_>, text: String, has_files: bool) -> AppResult<Option<orchestrator::Suggestion>> {
+    let s = st.settings();
+    let Some(key) = secrets::get(SecretName::TypeSafe).filter(|_| s.jev_enabled && s.jev_suggest) else { return Ok(None) };
+    let catalog = st.catalog();
+    let skills: Vec<&Skill> = catalog.enabled_skills().collect();
+    let r = orchestrator::suggest(&st.http, &key, text.trim(), &skills, has_files).await.map_err(AppError::msg)?;
+    let _ = store::record_usage(&st.db, &store::Usage { engine: "jev", role: "suggest", ok: true, latency_ms: r.ms, input_tokens: None, output_tokens: None, cost_usd: Some(r.cost_usd) });
+    Ok(Some(r))
 }
 
 /// 있는 폴더만 작업 폴더로 쓸 수 있다.
@@ -193,22 +296,41 @@ pub fn agent_cancel(st: S, task_id: String, key: String) -> bool {
     orchestrator::cancel_agent(&st, &task_id, &key)
 }
 
-/// 작업 중에 보내는 메시지. API 작업 모드가 다음 차례에 읽는다. 받지 않는 AI면 오류를 돌려준다.
+/// 실행 중인 에이전트 하나에게 말을 건다. API 작업 모드는 다음 차례에 읽고, 나머지는 잠시 끊고 메시지를 반영해 이어 간다.
+#[tauri::command]
+pub fn agent_message(app: AppHandle, st: S, task_id: String, key: String, text: String) -> AppResult<()> {
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err(AppError::msg("보낼 내용이 없습니다"));
+    }
+    if !orchestrator::message_agent(&app, &st, &task_id, &key, &text) {
+        return Err(AppError::msg("이미 끝난 작업입니다"));
+    }
+    Ok(())
+}
+
+/// 입력창에서 작업 중에 보내는 메시지: 지금 실행 중인 에이전트 모두에게 전한다.
 #[tauri::command]
 pub fn task_steer(app: AppHandle, st: S, task_id: String, text: String) -> AppResult<()> {
     let text = text.trim().to_string();
     if text.is_empty() {
         return Err(AppError::msg("보낼 내용이 없습니다"));
     }
-    let steer = st.steers.lock().unwrap_or_else(|p| p.into_inner()).get(&task_id).cloned().ok_or_else(|| AppError::msg("이미 끝난 작업입니다"))?;
-    let mut slot = steer.lock().unwrap_or_else(|p| p.into_inner());
-    match slot.as_mut() {
-        Some(v) => v.push(text.clone()),
-        None => return Err(AppError::msg("지금 AI는 작업 중 메시지를 받지 않습니다(API 작업 모드만 받습니다)")),
+    if !st.tasks.lock().unwrap_or_else(|p| p.into_inner()).contains_key(&task_id) {
+        return Err(AppError::msg("이미 끝난 작업입니다"));
     }
-    drop(slot);
-    orchestrator::emit(&app, "task:activity", json!({ "taskId": task_id, "text": format!("메시지 전달: {}", text.chars().take(60).collect::<String>()) }));
+    if orchestrator::message_task(&app, &st, &task_id, &text) == 0 {
+        return Err(AppError::msg("에이전트가 시작된 후 다시 보내 주십시오"));
+    }
     Ok(())
+}
+
+/// 곁질문: 대화 기록·세션 메모리·CLI 세션을 건드리지 않고 지금 진행 상황이나 프로젝트에 대해 묻는다. 답은 side:* 이벤트로 온다.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub fn side_ask(app: AppHandle, st: S, side_id: String, conversation_id: Option<String>, workspace: Option<String>, question: String, progress: Option<String>, thread: Vec<orchestrator::SideTurn>) -> AppResult<()> {
+    let workspace = workspace.filter(|w| !w.trim().is_empty()).map(|w| checked_dir(&w)).transpose()?;
+    orchestrator::side_ask(&app, st.inner(), side_id, conversation_id, workspace, question, progress, thread).map_err(AppError::msg)
 }
 
 #[tauri::command]
@@ -452,6 +574,7 @@ pub fn pricing_list() -> Vec<crate::pricing::ModelPrice> { crate::pricing::all_p
         return Err(AppError::Policy("확인 문구가 맞지 않습니다".into()));
     }
     store::delete_all(&st.db)?;
+    attachments::remove_all(&st.data_dir);
     let _ = app.emit("data:cleared", ());
     Ok(())
 }

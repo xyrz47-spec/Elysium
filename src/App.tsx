@@ -68,7 +68,7 @@ export default function App() {
       return !p;
     });
   }, []);
-  // 오른쪽 도구 패널(세션 정보·목차·찾기·빠른 문구·내보내기·단축키)
+  // 오른쪽 도구 패널(세션 정보·에이전트·곁질문·목차·찾기·내보내기)
   const [tool, setTool] = useState<ToolTab | null>(null);
   const [findKey, setFindKey] = useState(0);
   const lastTool = useRef<ToolTab>("info");
@@ -94,7 +94,7 @@ export default function App() {
         setTool((t) => (t ? null : lastTool.current));
       } else if ((e.ctrlKey || e.metaKey) && e.key === "/") {
         e.preventDefault();
-        setTool((t) => (t === "keys" ? null : "keys"));
+        setDialog(dialog === "keys" ? null : "keys");
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "b") {
         e.preventDefault();
         togglePanel();
@@ -120,22 +120,13 @@ export default function App() {
         }}
       />
       <ToolDock tab={tool} onTab={setTool} />
-      <ToolPanel
-        tab={tool}
-        onTab={setTool}
-        focusKey={findKey}
-        onPick={(t) => {
-          setDraft(t);
-          // 좁은 창에서는 문구를 넣으면 패널을 닫아 입력창을 가리지 않는다.
-          if (window.innerWidth < WIDE) setTool(null);
-        }}
-      />
+      <ToolPanel tab={tool} onTab={setTool} focusKey={findKey} />
       <main className="main">
         <SessionHead />
         <Thread onPick={setDraft} />
         <Composer draft={draft} onDraftUsed={clearDraft} />
       </main>
-      {dialog === "settings" && <SettingsDialog />}
+      {(dialog === "settings" || dialog === "keys") && <SettingsDialog focusKeys={dialog === "keys"} />}
       {dialog === "skills" && <SkillsDialog />}
       {dialog === "usage" && <UsageDialog />}
       <ConfirmDialog />

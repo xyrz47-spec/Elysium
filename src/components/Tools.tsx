@@ -1,13 +1,13 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
-import { api, baseName, ENGINE_LABEL, errorText, type EngineId, type MemoryView, type Message } from "../lib/api";
-import { ask } from "../lib/confirm";
+import { api, baseName, ENGINE_LABEL, errorText, type EngineId, type MemoryView, type Message, type Settings } from "../lib/api";
 import { useTauriEvent } from "../lib/events";
 import { useApp, type AgentRun, type Live } from "../store";
 import Segmented from "./Segmented";
-import { AgentsIcon, ArrowDownIcon, ArrowUpIcon, BookmarkIcon, ChevronIcon, CloseIcon, DownloadIcon, FolderIcon, InfoIcon, KeyboardIcon, ListIcon, PlusIcon, SearchIcon, StopIcon, TrashIcon } from "./Icons";
+import { AgentsIcon, ArrowDownIcon, ArrowUpIcon, ChatIcon, ChevronIcon, CloseIcon, DownloadIcon, FolderIcon, InfoIcon, ListIcon, SearchIcon, SendIcon, StopIcon, TrashIcon } from "./Icons";
+import Markdown from "./Markdown";
 import { INTEGRATE, pair, ROLE_LABEL } from "./Thread";
 
-export type ToolTab = "info" | "agents" | "outline" | "find" | "snippets" | "export" | "keys";
+export type ToolTab = "info" | "agents" | "side" | "outline" | "find" | "export";
 
 /** 에이전트 탭 문구(설정 창도 같이 쓴다) */
 export const A = {
@@ -19,11 +19,16 @@ export const A = {
   preset: "동시 실행 수",
   presetHelp: "2개 이상 설정 시 질문 답변과 파일 작업이 여러 에이전트에 분할되어 병렬 진행 후 통합되며, 토큰 소모량이 증가합니다. 메시지에 '에이전트 3개로'나 'opus랑 gpt-5로'처럼 입력하여 바로 지정할 수도 있습니다.",
   off: "꺼짐",
+  auto: "자동",
+  autoHelp: "JEV가 요청마다 판단해, 독립된 부분으로 나뉘는 파일 작업일 때만 여러 에이전트를 실행하고 각 부분의 AI와 강도를 정합니다. 숫자는 개수를 고정합니다.",
   open: "이동",
   stop: "중지",
-  stopTask: "작업 중지",
-  stopAgent: "이 에이전트만 중지",
-  stopAll: "전체 중지",
+  stopTask: "강제 종료",
+  stopAgent: "이 에이전트 강제 종료",
+  stopAll: "모두 강제 종료",
+  talk: "에이전트에게 메시지 입력 후 Enter",
+  talkSend: "이 에이전트에 보내기",
+  sent: "보낸 메시지",
   stopped: "중지됨",
   output: "생성 내용",
   noOutput: "아직 생성된 내용이 없습니다.",
@@ -42,6 +47,29 @@ export const A = {
   newSession: "새 대화",
 };
 
+/** 곁질문 탭 문구 */
+const S = {
+  title: "곁질문",
+  tip: "대화에 영향 없이 진행 상황이나 프로젝트를 질문합니다",
+  empty: "진행 상황이나 프로젝트를 물어보십시오. 대화에 저장되지 않으며 진행 중인 작업을 방해하지 않습니다.",
+  placeholder: "진행 상황이나 프로젝트 질문",
+  send: "질문 보내기",
+  stop: "답변 중지",
+  clear: "질문 지우기",
+  thinking: "답변 준비 중",
+  stopped: "답변 중지됨",
+  note: "저장되지 않으며 대화에 영향 없음",
+};
+
+const AGENT_AUTO = "auto";
+/** 동시 실행 수 고르기(도구 패널·설정 창이 같이 쓴다) */
+export const agentChoice = {
+  value: (s: Settings) => (s.agentsAuto ? AGENT_AUTO : String(s.agents ?? 1)),
+  options: [AGENT_AUTO, "1", "2", "3", "4", "5"].map((v) => ({ value: v, label: v === AGENT_AUTO ? A.auto : v === "1" ? A.off : v })),
+  apply: (s: Settings, v: string): Settings => (v === AGENT_AUTO ? { ...s, agentsAuto: true } : { ...s, agentsAuto: false, agents: Number(v) }),
+  help: (s: Settings) => (s.agentsAuto ? A.autoHelp : A.presetHelp),
+};
+
 const STATE_LABEL: Record<AgentRun["state"], string> = {
   run: "실행 중",
   ok: "완료",
@@ -57,8 +85,18 @@ const progressText = (done: number, total: number) => A.progress.replace("{done}
 
 /** 에이전트 한 줄: 누르면 맡은 파일·최근 활동·지금까지 쓴 글을 펼친다. 실행 중이면 이 에이전트만 멈출 수 있다. */
 function AgentRow({ l, a, now }: { l: Live; a: AgentRun; now: number }) {
-  const { cancelAgent } = useApp();
+  const { cancelAgent, toast } = useApp();
   const [open, setOpen] = useState(false);
+  const [msg, setMsg] = useState("");
+  const talk = async () => {
+    const t = msg.trim();
+    if (!t) return;
+    setMsg("");
+    await api.agentMessage(l.taskId, a.key, t).catch((e) => {
+      setMsg(t);
+      toast(errorText(e), "error");
+    });
+  };
   const part = l.parts[a.key];
   // 동시에 쓰는 실행은 key별 글을, 한 줄로 흘리는 실행(초안·검토·종합)은 지금 단계의 글을 보여 준다.
   const text = l.streams[a.key] ?? (a.role === l.phase ? l.text : "");
@@ -125,6 +163,24 @@ function AgentRow({ l, a, now }: { l: Live; a: AgentRun; now: number }) {
             )}
           </div>
           {a.state === "fail" && a.error && !a.stopped && <div className="agent-err">{a.error}</div>}
+          {a.sent.length > 0 && (
+            <div className="agent-block">
+              <h5>{A.sent}</h5>
+              {a.sent.map((x, i) => (
+                <div key={i} className="agent-sent">
+                  {x}
+                </div>
+              ))}
+            </div>
+          )}
+          {a.state === "run" && (
+            <div className="agent-talk">
+              <input type="text" value={msg} onChange={(e) => setMsg(e.target.value)} onKeyDown={(e) => e.key === "Enter" && !e.nativeEvent.isComposing && (e.preventDefault(), talk())} placeholder={A.talk} aria-label={`${A.talkSend} · ${name}`} />
+              <button className="icon" onClick={talk} disabled={!msg.trim()} aria-label={A.talkSend} title={A.talkSend}>
+                <SendIcon />
+              </button>
+            </div>
+          )}
         </div>
       )}
     </li>
@@ -234,11 +290,11 @@ function AgentsTab({ onClose }: { onClose: () => void }) {
           <Segmented
             label={A.preset}
             className="wide"
-            value={String(settings.agents ?? 1)}
-            options={["1", "2", "3", "4", "5"].map((v) => ({ value: v, label: v === "1" ? A.off : v }))}
-            onChange={(v) => saveSettings({ ...settings, agents: Number(v) })}
+            value={agentChoice.value(settings)}
+            options={agentChoice.options}
+            onChange={(v) => saveSettings(agentChoice.apply(settings, v))}
           />
-          <p className="tool-help">{A.presetHelp}</p>
+          <p className="tool-help">{agentChoice.help(settings)}</p>
         </section>
       )}
     </div>
@@ -248,11 +304,10 @@ function AgentsTab({ onClose }: { onClose: () => void }) {
 const TABS: { id: ToolTab; label: string; icon: ReactNode; tip: string }[] = [
   { id: "info", label: "세션 정보", icon: <InfoIcon />, tip: "세션 정보: 폴더·AI·토큰·비용·기억" },
   { id: "agents", label: A.title, icon: <AgentsIcon />, tip: A.tip },
+  { id: "side", label: S.title, icon: <ChatIcon />, tip: S.tip },
   { id: "outline", label: "목차", icon: <ListIcon />, tip: "목차: 질문으로 바로 이동" },
   { id: "find", label: "찾기", icon: <SearchIcon />, tip: "세션에서 찾기 (Ctrl+F)" },
-  { id: "snippets", label: "빠른 문구", icon: <BookmarkIcon />, tip: "빠른 문구: 자주 쓰는 요청 넣기" },
   { id: "export", label: "내보내기", icon: <DownloadIcon />, tip: "마크다운으로 복사·저장" },
-  { id: "keys", label: "단축키", icon: <KeyboardIcon />, tip: "단축키 (Ctrl+/)" },
 ];
 
 const label = (id: unknown) => (typeof id === "string" ? (ENGINE_LABEL[id as EngineId] ?? id) : null);
@@ -457,79 +512,76 @@ function FindTab({ focusKey }: { focusKey: number }) {
   );
 }
 
-interface Snippet {
-  id: string;
-  title: string;
-  text: string;
-}
-
-const SNIP_KEY = "elysium.snippets";
-const SNIP_DEFAULT: Snippet[] = [
-  { id: "d1", title: "핵심만 요약", text: "위 내용을 핵심만 짧게 요약해 줘." },
-  { id: "d2", title: "사실 확인", text: "/fact-check " },
-  { id: "d3", title: "원인 찾기", text: "/root-cause " },
-  { id: "d4", title: "성능 개선", text: "/perf-tune " },
-  { id: "d5", title: "화면 만들기", text: "/ui-craft " },
-];
-
-function loadSnippets(): Snippet[] {
-  try {
-    const v = localStorage.getItem(SNIP_KEY);
-    return v ? (JSON.parse(v) as Snippet[]) : SNIP_DEFAULT;
-  } catch {
-    return SNIP_DEFAULT;
-  }
-}
-
-function SnippetsTab({ onPick }: { onPick: (t: string) => void }) {
-  const [list, setList] = useState<Snippet[]>(loadSnippets);
-  const [title, setTitle] = useState("");
-  const [text, setText] = useState("");
-  const save = (l: Snippet[]) => {
-    setList(l);
-    try {
-      localStorage.setItem(SNIP_KEY, JSON.stringify(l));
-    } catch {
-      /* 저장 못 해도 이번 실행에서는 쓸 수 있다 */
-    }
+function SideTab() {
+  const { side, askSide, stopSide, clearSide, engines, toast } = useApp();
+  const [q, setQ] = useState("");
+  const list = useRef<HTMLDivElement>(null);
+  const input = useRef<HTMLTextAreaElement>(null);
+  const running = side.some((t) => t.state === "run");
+  useEffect(() => input.current?.focus(), []);
+  useEffect(() => {
+    const el = list.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [side]);
+  const submit = () => {
+    const t = q.trim();
+    if (!t || running) return;
+    if (!engines.some((e) => e.installed)) return toast(A.none, "error");
+    setQ("");
+    void askSide(t);
   };
   return (
-    <div className="tool-body">
-      <ul className="tool-snips">
-        {list.map((s, i) => (
-          <li key={s.id} style={{ "--i": i } as CSSProperties}>
-            <button className="tool-snip-use" onClick={() => onPick(s.text)} title="입력창에 넣기">
-              <b>{s.title}</b>
-              <span>{s.text}</span>
-            </button>
-            <button
-              className="tool-x"
-              aria-label={`'${s.title}' 지우기`}
-              onClick={async () => {
-                if (await ask({ title: `'${s.title}' 문구를 지울까요?`, body: "빠른 문구 목록에서만 지워집니다.", confirmLabel: "지우기", danger: true })) save(list.filter((x) => x.id !== s.id));
-              }}
-            >
-              <TrashIcon />
-            </button>
-          </li>
-        ))}
-      </ul>
-      <form
-        className="tool-add"
-        onSubmit={(e) => {
-          e.preventDefault();
-          if (!text.trim()) return;
-          save([...list, { id: `${Date.now()}`, title: title.trim() || text.trim().slice(0, 16), text: text.trim() + (text.trim().startsWith("/") ? " " : "") }]);
-          setTitle("");
-          setText("");
-        }}
-      >
-        <input type="text" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="이름(선택)" aria-label="문구 이름" />
-        <textarea value={text} onChange={(e) => setText(e.target.value)} placeholder="자주 쓰는 요청 (예: /report 또는 문장)" rows={2} aria-label="문구 내용" />
-        <button className="btn sm" type="submit" disabled={!text.trim()}>
-          <PlusIcon /> 문구 추가
-        </button>
-      </form>
+    <div className="tool-body side">
+      <div className="side-list" ref={list}>
+        {side.length === 0 && <Empty>{S.empty}</Empty>}
+        {side.map((t) =>
+          t.role === "user" ? (
+            <div key={t.id} className="side-q">
+              {t.text}
+            </div>
+          ) : (
+            <div key={t.id} className={`side-a ${t.state ?? ""}`}>
+              {t.engine && <div className="side-by">{label(t.engine)}</div>}
+              {t.text && <Markdown text={t.text} />}
+              {t.state === "run" && <div className="side-act">{t.activity ?? S.thinking}</div>}
+              {t.state === "fail" && <div className={t.stopped ? "side-act" : "agent-err"}>{t.stopped ? S.stopped : t.error}</div>}
+            </div>
+          ),
+        )}
+      </div>
+      <div className="side-box">
+        <textarea
+          ref={input}
+          rows={2}
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+              e.preventDefault();
+              submit();
+            }
+          }}
+          placeholder={S.placeholder}
+          aria-label={S.placeholder}
+        />
+        {running ? (
+          <button className="icon" onClick={stopSide} aria-label={S.stop} title={S.stop}>
+            <StopIcon />
+          </button>
+        ) : (
+          <button className="icon" onClick={submit} disabled={!q.trim()} aria-label={S.send} title={S.send}>
+            <SendIcon />
+          </button>
+        )}
+      </div>
+      <div className="side-foot">
+        <span>{S.note}</span>
+        {side.length > 0 && (
+          <button className="btn sm ghost" onClick={clearSide}>
+            <TrashIcon /> {S.clear}
+          </button>
+        )}
+      </div>
     </div>
   );
 }
@@ -581,43 +633,6 @@ function ExportTab() {
   );
 }
 
-const KEYS: [string, string][] = [
-  ["Ctrl + N", "새 세션"],
-  ["Ctrl + B", "세션 목록 펼치기·접기"],
-  ["Ctrl + J", "도구 패널 열기·닫기"],
-  ["Ctrl + F", "세션에서 찾기"],
-  ["Ctrl + /", "단축키 보기"],
-  ["Ctrl + ,", "설정"],
-  ["Enter", "보내기(대화 모드: 질문 · 작업 모드: 허락 후 파일 수정)"],
-  ["← / →", "대화·작업 모드 바꾸기(모드 스위치에서)"],
-  ["Ctrl + Enter", "만들기(폴더 안에서 끝까지 완성)"],
-  ["Shift + Enter", "줄 바꿈"],
-  ["/", "스킬 고르기(입력창 맨 앞)"],
-  ["Esc", "창·패널 닫기"],
-];
-
-function KeysTab() {
-  return (
-    <div className="tool-body">
-      <dl className="tool-keys">
-        {KEYS.map(([k, v]) => (
-          <div key={k}>
-            <dt>
-              {k.split(" + ").map((p, i) => (
-                <span key={p}>
-                  {i > 0 && " + "}
-                  <kbd>{p}</kbd>
-                </span>
-              ))}
-            </dt>
-            <dd>{v}</dd>
-          </div>
-        ))}
-      </dl>
-    </div>
-  );
-}
-
 // ---------------------------------------------------------------------------
 
 /** 오른쪽 도구 도크(왼쪽 도크와 대칭) */
@@ -638,7 +653,7 @@ export function ToolDock({ tab, onTab }: { tab: ToolTab | null; onTab: (t: ToolT
 }
 
 /** 오른쪽 도구 패널: 본문을 밀지 않고 위에 떠 있다. */
-export function ToolPanel({ tab, onTab, onPick, focusKey }: { tab: ToolTab | null; onTab: (t: ToolTab | null) => void; onPick: (t: string) => void; focusKey: number }) {
+export function ToolPanel({ tab, onTab, focusKey }: { tab: ToolTab | null; onTab: (t: ToolTab | null) => void; focusKey: number }) {
   const [shown, setShown] = useState<ToolTab>(tab ?? "info");
   useEffect(() => {
     if (tab) setShown(tab);
@@ -657,11 +672,10 @@ export function ToolPanel({ tab, onTab, onPick, focusKey }: { tab: ToolTab | nul
         </div>
         {shown === "info" && <InfoTab />}
         {shown === "agents" && <AgentsTab onClose={() => onTab(null)} />}
+        {shown === "side" && <SideTab />}
         {shown === "outline" && <OutlineTab />}
         {shown === "find" && <FindTab focusKey={focusKey} />}
-        {shown === "snippets" && <SnippetsTab onPick={onPick} />}
         {shown === "export" && <ExportTab />}
-        {shown === "keys" && <KeysTab />}
       </div>
     </aside>
   );

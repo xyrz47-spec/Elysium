@@ -3,7 +3,7 @@
 //! - 플러그인: `<데이터>/plugins/<이름>/.claude-plugin/plugin.json` + `skills/<이름>/SKILL.md` (+ commands·agents 등)
 //!
 //! Elysium이 쓰는 추가 머리말(선택): `engine`(claude·codex·antigravity), `review`(true/false),
-//! `mode`(chat·work), `triggers`(이 낱말이 들어간 요청에 자동 적용, 쉼표 구분).
+//! `mode`(chat·work). 자동 적용은 켜진 스킬 중에서 JEV가 고른다(orchestrator).
 
 use serde::Serialize;
 use std::collections::HashMap;
@@ -28,7 +28,6 @@ pub struct Skill {
     /// 노력 단계를 고정한다: light · standard · deep
     pub tier: Option<String>,
     pub mode: Option<String>,
-    pub triggers: Vec<String>,
     /// "user"(직접 만든 스킬) 또는 플러그인 이름
     pub source: String,
     pub path: String,
@@ -72,15 +71,6 @@ impl Catalog {
         Some((s, tail.trim()))
     }
 
-    /// 머리말 triggers의 낱말이 요청에 들어 있으면 그 스킬을 고른다(가장 긴 낱말 우선).
-    pub fn triggered(&self, text: &str) -> Option<&Skill> {
-        let low = text.to_lowercase();
-        self.enabled_skills()
-            .filter_map(|s| s.triggers.iter().filter(|t| !t.is_empty() && low.contains(&t.to_lowercase())).map(|t| t.chars().count()).max().map(|n| (n, s)))
-            .max_by_key(|(n, _)| *n)
-            .map(|(_, s)| s)
-    }
-
     pub fn enabled_plugin_dirs(&self) -> Vec<String> {
         self.plugins.iter().filter(|p| p.enabled && p.error.is_none()).map(|p| p.path.clone()).collect()
     }
@@ -109,11 +99,6 @@ pub fn parse_skill_md(text: &str) -> (HashMap<String, String>, String) {
     (meta, body)
 }
 
-fn list_value(v: Option<&String>) -> Vec<String> {
-    v.map(|v| v.trim_matches(|c| c == '[' || c == ']').split(',').map(|x| x.trim().trim_matches(|c| c == '"' || c == '\'').to_string()).filter(|x| !x.is_empty()).collect())
-        .unwrap_or_default()
-}
-
 fn read_skill(dir: &Path, id: String, source: &str, toggles: &HashMap<String, bool>) -> Option<Skill> {
     let path = dir.join("SKILL.md");
     let text = std::fs::read_to_string(&path).ok()?;
@@ -130,7 +115,6 @@ fn read_skill(dir: &Path, id: String, source: &str, toggles: &HashMap<String, bo
         debate: meta.get("debate").map(|v| v.eq_ignore_ascii_case("true")),
         tier: meta.get("tier").map(|t| t.to_lowercase()).filter(|t| matches!(t.as_str(), "light" | "standard" | "deep")),
         mode: meta.get("mode").map(|m| m.to_lowercase()).filter(|m| m == "chat" || m == "work"),
-        triggers: list_value(meta.get("triggers")),
         source: source.to_string(),
         path: path.to_string_lossy().to_string(),
         id,
@@ -218,7 +202,7 @@ pub fn create_skill(root: &Path, name: &str) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
     let path = d.join("SKILL.md");
     let text = format!(
-        "---\nname: {id}\ndescription: 이 스킬이 하는 일을 한 줄로 적으세요\n# engine: claude\n# review: true\n# triggers: 낱말1, 낱말2\n---\n\n여기에 AI에게 줄 지시문을 적으세요.\n"
+        "---\nname: {id}\ndescription: 이 스킬이 하는 일을 한 줄로 적으세요\n# engine: claude\n# review: true\n---\n\n여기에 AI에게 줄 지시문을 적으세요.\n"
     );
     std::fs::write(&path, text).map_err(|e| e.to_string())?;
     Ok(path)
@@ -380,19 +364,19 @@ pub fn references(skill_md: &str) -> Vec<(String, String)> {
 const SEED_SKILLS: [(&str, &str); 4] = [
     (
         "summarize",
-        "---\nname: summarize\ndescription: 긴 글·문서·대화를 핵심만 짧게 요약\ntriggers: 요약해, 요약 좀, 정리해 줘\n---\n\n사용자가 준 내용을 한국어로 요약하세요.\n- 맨 위에 한 문장 결론\n- 그 아래 핵심 3~5개를 글머리표로\n- 숫자·날짜·이름은 원문 그대로 유지\n- 원문에 없는 내용은 덧붙이지 않기\n",
+        "---\nname: summarize\ndescription: 긴 글·문서·대화를 핵심만 짧게 요약\n---\n\n사용자가 준 내용을 한국어로 요약하세요.\n- 맨 위에 한 문장 결론\n- 그 아래 핵심 3~5개를 글머리표로\n- 숫자·날짜·이름은 원문 그대로 유지\n- 원문에 없는 내용은 덧붙이지 않기\n",
     ),
     (
         "code-review",
-        "---\nname: code-review\ndescription: 코드나 변경 사항을 버그·보안·가독성 관점에서 검토\nengine: claude\nreview: false\ntriggers: 코드 리뷰, 코드리뷰\n---\n\n코드를 검토하세요. 작업 폴더의 파일을 읽어도 되지만 고치지는 마세요.\n1. 실제로 문제를 일으킬 버그와 보안 문제를 심각한 순서로\n2. 각 항목마다 파일·줄, 왜 문제인지, 고치는 방법\n3. 마지막에 사소한 개선점은 짧게\n확실하지 않은 것은 추측이라고 밝히세요.\n",
+        "---\nname: code-review\ndescription: 코드나 변경 사항을 버그·보안·가독성 관점에서 검토\nengine: claude\nreview: false\n---\n\n코드를 검토하세요. 작업 폴더의 파일을 읽어도 되지만 고치지는 마세요.\n1. 실제로 문제를 일으킬 버그와 보안 문제를 심각한 순서로\n2. 각 항목마다 파일·줄, 왜 문제인지, 고치는 방법\n3. 마지막에 사소한 개선점은 짧게\n확실하지 않은 것은 추측이라고 밝히세요.\n",
     ),
     (
         "report",
-        "---\nname: report\ndescription: 주제를 조사해 구조가 잡힌 보고서로 작성\nreview: true\ntriggers: 보고서\n---\n\n요청한 주제로 한국어 보고서를 쓰세요.\n구성: 요약 → 배경 → 본문(소제목) → 결론과 다음 단계.\n근거가 필요한 주장은 출처를 밝히고, 모르는 것은 모른다고 쓰세요.\n",
+        "---\nname: report\ndescription: 주제를 조사해 구조가 잡힌 보고서로 작성\nreview: true\n---\n\n요청한 주제로 한국어 보고서를 쓰세요.\n구성: 요약 → 배경 → 본문(소제목) → 결론과 다음 단계.\n근거가 필요한 주장은 출처를 밝히고, 모르는 것은 모른다고 쓰세요.\n",
     ),
     (
         "translate",
-        "---\nname: translate\ndescription: 자연스러운 번역(한↔영 등)\ntriggers: 번역해, 번역 좀\n---\n\n뜻을 지키면서 목표 언어로 자연스럽게 번역하세요. 목표 언어를 말하지 않았으면 한국어는 영어로, 다른 언어는 한국어로 옮기세요. 번역문만 출력하세요.\n",
+        "---\nname: translate\ndescription: 자연스러운 번역(한↔영 등)\n---\n\n뜻을 지키면서 목표 언어로 자연스럽게 번역하세요. 목표 언어를 말하지 않았으면 한국어는 영어로, 다른 언어는 한국어로 옮기세요. 번역문만 출력하세요.\n",
     ),
 ];
 
@@ -403,7 +387,7 @@ const STARTER_MANIFEST: &str = r#"{
 }
 "#;
 
-const STARTER_SKILL: &str = "---\nname: brainstorm\ndescription: 아이디어를 여러 방향으로 넓게 낸 뒤 좋은 것을 골라 줌\ntriggers: 아이디어, 브레인스토밍\n---\n\n서로 다른 방향의 아이디어를 8개 내고, 그중 실행하기 쉽고 효과가 큰 3개를 골라 이유와 첫 단계를 적으세요.\n";
+const STARTER_SKILL: &str = "---\nname: brainstorm\ndescription: 아이디어를 여러 방향으로 넓게 낸 뒤 좋은 것을 골라 줌\n---\n\n서로 다른 방향의 아이디어를 8개 내고, 그중 실행하기 쉽고 효과가 큰 3개를 골라 이유와 첫 단계를 적으세요.\n";
 
 #[cfg(test)]
 mod tests {
@@ -414,7 +398,7 @@ mod tests {
         let (m, body) = parse_skill_md("\u{feff}---\nname: \"My Skill\"\ndescription: 설명: 콜론 포함\ntriggers: [요약, '정리']\nreview: true\n---\n\n본문\n둘째 줄");
         assert_eq!(m["name"], "My Skill");
         assert_eq!(m["description"], "설명: 콜론 포함");
-        assert_eq!(list_value(m.get("triggers")), vec!["요약", "정리"]);
+        assert_eq!(m["review"], "true");
         assert_eq!(body, "본문\n둘째 줄");
         let (m2, b2) = parse_skill_md("머리말 없음");
         assert!(m2.is_empty() && b2 == "머리말 없음");
@@ -426,17 +410,17 @@ mod tests {
         seed(tmp.path()).unwrap();
         let cat = load(tmp.path(), &HashMap::new());
         assert_eq!(cat.skills.len(), 10, "예시 스킬 4 + 기본 스킬 5 + 플러그인 스킬 1");
-        assert_eq!(cat.triggered("로그인하면 크래시가 나는데 원인 찾아줘").unwrap().id, "root-cause");
+        assert!(cat.skills.iter().any(|s| s.id == "root-cause"));
         let ui = cat.skills.iter().find(|s| s.id == "ui-craft").unwrap();
         let refs = references(&ui.path);
         assert_eq!(refs.len(), 8, "ui-craft 참고 파일 8개");
         assert!(refs.iter().any(|(p, t)| p.ends_with("accessibility.md") && t.contains("접근성")));
         assert!(std::fs::read_to_string(tmp.path().join("skills/.seeded")).unwrap().contains("ui-craft@2"));
-        assert_eq!(cat.triggered("설정 화면 디자인 시스템 좀 잡아줘").unwrap().id, "ui-craft");
-        let fc = cat.triggered("이 통계가 정확한지 팩트체크 해줘").unwrap();
+        let by_id = |id: &str| cat.skills.iter().find(|s| s.id == id).unwrap();
+        let fc = by_id("fact-check");
         assert_eq!((fc.id.as_str(), fc.debate), ("fact-check", Some(true)));
-        assert_eq!(cat.triggered("핵심만 짧게 알려줘").unwrap().tier.as_deref(), Some("light"));
-        assert_eq!(cat.triggered("API가 너무 느려 최적화 해줘").unwrap().tier.as_deref(), Some("deep"));
+        assert_eq!(by_id("token-saver").tier.as_deref(), Some("light"));
+        assert_eq!(by_id("perf-tune").tier.as_deref(), Some("deep"));
         // 새 판: 고친 스킬은 그대로 둔다
         std::fs::write(tmp.path().join("skills/perf-tune/SKILL.md"), "---\nname: perf-tune\n---\n내가 고침").unwrap();
         std::fs::write(tmp.path().join("skills/.seeded"), "ui-craft\nperf-tune\nfact-check\ntoken-saver\nroot-cause@2\n").unwrap();
@@ -453,17 +437,14 @@ mod tests {
         let (s, rest) = cat.explicit("/summarize 이 글을 줄여줘").unwrap();
         assert_eq!((s.name.as_str(), rest), ("summarize", "이 글을 줄여줘"));
         assert!(cat.explicit("/없는스킬 hi").is_none());
-        // 낱말로 자동 적용
-        assert_eq!(cat.triggered("이 코드 리뷰 부탁해").unwrap().name, "code-review");
-        assert_eq!(cat.triggered("새 앱 아이디어 줘").unwrap().id, "elysium-starter:brainstorm");
-        assert!(cat.triggered("안녕").is_none());
+        assert!(cat.explicit("이 코드 리뷰 부탁해").is_none(), "낱말만으로는 고르지 않는다");
         // 스킬 끄기, 플러그인 끄면 그 스킬도 꺼짐
         let mut t = HashMap::new();
         t.insert("skill:summarize".to_string(), false);
         t.insert("plugin:elysium-starter".to_string(), false);
         let cat = load(tmp.path(), &t);
         assert!(cat.explicit("/summarize x").is_none());
-        assert!(cat.triggered("아이디어").is_none());
+        assert!(!cat.enabled_skills().any(|s| s.id == "elysium-starter:brainstorm"));
         assert!(cat.enabled_plugin_dirs().is_empty());
         // 다시 seed해도 덮어쓰지 않음
         std::fs::write(tmp.path().join("skills/summarize/SKILL.md"), "---\nname: summarize\n---\n바꿈").unwrap();

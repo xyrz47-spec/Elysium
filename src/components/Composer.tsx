@@ -1,13 +1,25 @@
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
-import { api, baseName, errorText, type EngineChoice } from "../lib/api";
+import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type KeyboardEvent } from "react";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { api, baseName, errorText, toBase64, type Attachment, type EngineChoice, type Suggestion } from "../lib/api";
 import { useApp } from "../store";
-import { ChatIcon, ChevronIcon, CloseIcon, CouncilIcon, FolderIcon, SendIcon, SparkIcon, StopIcon, WrenchIcon } from "./Icons";
+import { DraftAttachments } from "./Attachments";
+import { ChatIcon, ChevronIcon, ClipIcon, CloseIcon, CouncilIcon, FolderIcon, SendIcon, SparkIcon, StopIcon, WrenchIcon } from "./Icons";
 import Segmented from "./Segmented";
+
+/** 한 메시지에 붙일 수 있는 파일 수(백엔드 attachments::MAX_PER_MESSAGE와 같다) */
+const MAX_FILES = 10;
+/** 이 확신도 이상일 때만 입력창 추천을 보여 준다 */
+const SUGGEST_MIN = 0.6;
+const SUGGEST_DELAY_MS = 700;
+const SUGGEST_MIN_CHARS = 8;
 
 /** 대화창 아래 입력 상자: 대화/작업 모드 · 보내기 · 만들기(폴더 안에서 끝까지 완성) · 엔진 고르기 · /스킬 자동 완성 */
 export default function Composer({ draft, onDraftUsed }: { draft?: string | null; onDraftUsed?: () => void }) {
-  const { send, engines, live, conversationId, cancel, skills, conversations, newFolder, chooseFolder, resetFolder, toast } = useApp();
+  const { send, engines, live, conversationId, cancel, skills, conversations, newFolder, chooseFolder, resetFolder, toast, settings } = useApp();
   const [text, setText] = useState("");
+  const [files, setFiles] = useState<Attachment[]>([]);
+  const [dropping, setDropping] = useState(false);
+  const [suggestion, setSuggestion] = useState<Suggestion | null>(null);
   const [engine, setEngine] = useState<EngineChoice>("auto");
   // 작업 모드: 보내기(Enter)로도 파일을 고칠 수 있다(실행 전에 허락을 받는다).
   const [work, setWork] = useState(false);
@@ -51,6 +63,70 @@ export default function Composer({ draft, onDraftUsed }: { draft?: string | null
   }, [slash, skills]);
   useEffect(() => setPick(0), [slash]);
 
+  const addFiles = (added: Attachment[]) => {
+    setFiles((cur) => {
+      const room = Math.max(0, MAX_FILES - cur.length);
+      for (const extra of added.slice(room)) api.attachmentRemove(extra.id).catch(() => {});
+      if (added.length > room) toast("파일은 메시지당 최대 10개까지 첨부할 수 있습니다.", "error");
+      return [...cur, ...added.slice(0, room)];
+    });
+  };
+  const guardAdd = (p: Promise<Attachment[]>) => p.then(addFiles).catch((e) => toast(errorText(e), "error"));
+  const removeFile = (id: string) => {
+    setFiles((cur) => cur.filter((f) => f.id !== id));
+    api.attachmentRemove(id).catch(() => {});
+  };
+
+  // 창에 끌어다 놓은 파일. Tauri가 드롭을 가로채므로 HTML 드롭 대신 이 이벤트를 쓴다.
+  useEffect(() => {
+    let off: (() => void) | undefined;
+    let gone = false;
+    getCurrentWebview()
+      .onDragDropEvent((e) => {
+        const t = e.payload.type;
+        if (t === "enter" || t === "over") setDropping(true);
+        else setDropping(false);
+        if (e.payload.type === "drop" && e.payload.paths.length) guardAdd(api.attachmentAddPaths(e.payload.paths));
+      })
+      .then((f) => (gone ? f() : (off = f)))
+      .catch(() => {});
+    return () => {
+      gone = true;
+      off?.();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 붙여 넣은 파일(스크린샷 등). 글만 붙여 넣으면 그대로 둔다.
+  function onPaste(e: ClipboardEvent<HTMLTextAreaElement>) {
+    const pasted = Array.from(e.clipboardData.files);
+    if (pasted.length === 0) return;
+    e.preventDefault();
+    for (const f of pasted) {
+      const stamp = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
+      const name = f.name && f.name !== "image.png" ? f.name : `screenshot-${stamp}.png`;
+      f.arrayBuffer()
+        .then((b) => api.attachmentAddBytes(name, toBase64(b)))
+        .then((a) => addFiles([a]))
+        .catch((err) => toast(errorText(err), "error"));
+    }
+  }
+
+  // 입력하는 동안 JEV가 모드·스킬을 추천한다. 늦게 온 답은 버린다.
+  useEffect(() => {
+    setSuggestion(null);
+    const t = text.trim();
+    if (!settings?.jevEnabled || !settings.jevSuggest || running || t.startsWith("/") || t.length < SUGGEST_MIN_CHARS) return;
+    let stale = false;
+    const timer = setTimeout(() => {
+      api.jevSuggest(t, files.length > 0).then((s) => !stale && setSuggestion(s)).catch(() => {});
+    }, SUGGEST_DELAY_MS);
+    return () => {
+      stale = true;
+      clearTimeout(timer);
+    };
+  }, [text, files.length, settings?.jevEnabled, settings?.jevSuggest, !!running]);
+
   // 만들기는 CLI든 API든 쓸 수 있다(API는 엘리시움이 파일·PowerShell 도구를 대신 실행한다).
   const canBuild = installed.length > 0;
   const buildHint = !canBuild
@@ -62,10 +138,10 @@ export default function Composer({ draft, onDraftUsed }: { draft?: string | null
 
   async function submit(build: boolean, council = false) {
     const t = text.trim();
-    if (!t || (build && !canBuild)) return;
-    // 작업 중이면 보내기는 작업 중 메시지가 된다(API 작업 모드가 다음 차례에 읽는다). 만들기는 끝난 뒤에 한다.
+    if ((!t && files.length === 0) || (build && !canBuild)) return;
+    // 작업 중이면 보내기는 실행 중인 에이전트에게 보내는 메시지가 된다. 만들기는 끝난 뒤에 한다.
     if (running) {
-      if (build) return;
+      if (build || !t) return;
       setText("");
       await api.taskSteer(running.taskId, t).catch((e) => {
         setText(t);
@@ -73,9 +149,20 @@ export default function Composer({ draft, onDraftUsed }: { draft?: string | null
       });
       return;
     }
+    const sending = files;
     setText("");
-    await send(t, engine, !council && (work || build), build && !council, council);
+    setFiles([]);
+    const ok = await send(t, engine, !council && (work || build), build && !council, council, sending.map((f) => f.id));
+    // 보내지 못했으면 쓴 글과 파일을 되돌린다.
+    if (!ok) {
+      setText((cur) => cur || t);
+      setFiles((cur) => [...sending, ...cur]);
+    }
   }
+
+  const modeHint = suggestion && (suggestion.modeConfidence ?? 0) >= SUGGEST_MIN && !running ? suggestion.mode : null;
+  const skillHint = suggestion && (suggestion.skillFit ?? 0) >= SUGGEST_MIN && !running ? skills?.skills.find((s) => s.id === suggestion.skill && s.enabled) : undefined;
+  const showMode = (modeHint === "work" && !work) || modeHint === "build" || modeHint === "council";
 
   function onKey(e: KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.nativeEvent.isComposing) {
@@ -120,18 +207,83 @@ export default function Composer({ draft, onDraftUsed }: { draft?: string | null
           ))}
         </div>
       )}
-      <div className={`composer ${work ? "work" : ""}`}>
+      {/* .composer가 backdrop-filter의 경계라 그 안에 두면 유리가 뒤 화면을 보지 못한다: slash-menu처럼 밖에 둔다 */}
+      {menu && (
+        <div className="menu" role="menu" onMouseLeave={() => setMenu(false)}>
+          <button role="menuitemradio" aria-checked={engine === "auto"} className={engine === "auto" ? "on" : ""} onClick={() => (setEngine("auto"), setMenu(false))}>
+            <b>자동</b>
+            <span>{"JEV가 가장 효율적인 AI와 작업 분담을 고릅니다"}</span>
+          </button>
+          {(["cli", "api"] as const).map((k) => (
+            <div key={k} className="menu-group">
+              <div className="menu-title">{k === "cli" ? "CLI" : "API 키 · 엘리시움 도구로 파일 작업"}</div>
+              {engines
+                .filter((e) => e.kind === k)
+                .map((e) => (
+                  <button
+                    key={e.id}
+                    role="menuitemradio"
+                    aria-checked={engine === e.id}
+                    disabled={!e.installed}
+                    className={engine === e.id ? "on" : ""}
+                    onClick={() => (setEngine(e.id), setMenu(false))}
+                  >
+                    <b>{e.label}</b>
+                    <span>{e.installed ? `${e.version ?? "사용 가능"}${e.verified ? "" : " · 미검증"}` : k === "cli" ? "설치 안 됨" : "키 없음"}</span>
+                  </button>
+                ))}
+            </div>
+          ))}
+        </div>
+      )}
+      {(showMode || skillHint) && (
+        <div className="jev-suggest" role="status">
+          <SparkIcon size={13} />
+          <span className="jev-suggest-tag">JEV</span>
+          {showMode && (
+            <button
+              onClick={() => {
+                if (modeHint === "work") setWork(true);
+                else if (modeHint === "build") submit(true);
+                else submit(false, true);
+                setSuggestion(null);
+              }}
+            >
+              {modeHint === "work"
+                ? "작업 모드로 전환"
+                : modeHint === "build"
+                  ? "새 앱 바로 만들기"
+                  : "AI 회의로 바로 전송"}
+            </button>
+          )}
+          {skillHint && (
+            <button
+              onClick={() => {
+                setText((cur) => `/${skillHint.name} ${cur.trim()}`);
+                setSuggestion(null);
+                ref.current?.focus();
+              }}
+              title={skillHint.description}
+            >
+              /{skillHint.name}
+            </button>
+          )}
+        </div>
+      )}
+      <div className={`composer ${work ? "work" : ""} ${dropping ? "dropping" : ""}`}>
+        <DraftAttachments items={files} onRemove={removeFile} />
         <textarea
           ref={ref}
           value={text}
           rows={1}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={onKey}
+          onPaste={onPaste}
           placeholder={
             !installed.length
               ? "먼저 설정에서 AI CLI 연결을 확인하세요"
               : running
-                ? "작업 중입니다. Enter로 보내면 API 작업 AI가 다음 단계에서 읽습니다"
+                ? "Enter를 누르면 실행 중인 에이전트에 전달되어 이어서 반영됩니다"
               : work
                 ? "고칠 내용을 적고 Enter로 보내세요. 파일을 고치기 전에 허락을 받습니다"
                 : "만들 것을 적고 만들기를 누르세요. 질문은 Enter로 보냅니다"
@@ -139,38 +291,18 @@ export default function Composer({ draft, onDraftUsed }: { draft?: string | null
           aria-label="메시지 입력"
         />
         <div className="composer-bar">
+          <button
+            className="pill attach-btn"
+            onClick={() => guardAdd(api.attachmentPick())}
+            aria-label={"파일 첨부"}
+            title={"클릭, 드래그 또는 붙여넣기로 파일(개당 최대 50MB, 최대 10개)을 첨부할 수 있습니다."}
+          >
+            <ClipIcon />
+          </button>
           <div className="pill-menu">
             <button className="pill" onClick={() => setMenu((m) => !m)} aria-haspopup="menu" aria-expanded={menu} title="답할 AI">
               <span className="pill-text">{engineLabel}</span> <ChevronIcon open={menu} />
             </button>
-            {menu && (
-              <div className="menu" role="menu" onMouseLeave={() => setMenu(false)}>
-                <button role="menuitemradio" aria-checked={engine === "auto"} className={engine === "auto" ? "on" : ""} onClick={() => (setEngine("auto"), setMenu(false))}>
-                  <b>자동</b>
-                  <span>요청에 맞는 AI가 답하고, 복잡하면 다른 AI가 검토</span>
-                </button>
-                {(["cli", "api"] as const).map((k) => (
-                  <div key={k} className="menu-group">
-                    <div className="menu-title">{k === "cli" ? "CLI" : "API 키 · 엘리시움 도구로 파일 작업"}</div>
-                    {engines
-                      .filter((e) => e.kind === k)
-                      .map((e) => (
-                        <button
-                          key={e.id}
-                          role="menuitemradio"
-                          aria-checked={engine === e.id}
-                          disabled={!e.installed}
-                          className={engine === e.id ? "on" : ""}
-                          onClick={() => (setEngine(e.id), setMenu(false))}
-                        >
-                          <b>{e.label}</b>
-                          <span>{e.installed ? `${e.version ?? "사용 가능"}${e.verified ? "" : " · 미검증"}` : k === "cli" ? "설치 안 됨" : "키 없음"}</span>
-                        </button>
-                      ))}
-                  </div>
-                ))}
-              </div>
-            )}
           </div>
           <Segmented
             label="모드"
@@ -211,16 +343,16 @@ export default function Composer({ draft, onDraftUsed }: { draft?: string | null
               <button
                 className="send quiet"
                 onClick={() => submit(false)}
-                disabled={!text.trim() || installed.length === 0}
+                disabled={(!text.trim() && files.length === 0) || installed.length === 0}
                 aria-label={work ? "작업 보내기" : "질문 보내기"}
                 title={work ? "작업 보내기: 허락을 받은 뒤 폴더 안의 파일을 고칩니다 (Enter)" : "질문 보내기: 파일은 고치지 않습니다 (Enter)"}
               >
                 <SendIcon />
               </button>
-              <button className="council-btn" onClick={() => submit(false, true)} disabled={!text.trim() || installed.length === 0} title={councilHint} aria-label="AI 회의 시작">
+              <button className="council-btn" onClick={() => submit(false, true)} disabled={(!text.trim() && files.length === 0) || installed.length === 0} title={councilHint} aria-label="AI 회의 시작">
                 <CouncilIcon /> 회의
               </button>
-              <button className="build-btn" onClick={() => submit(true)} disabled={!text.trim() || !canBuild} title={buildHint}>
+              <button className="build-btn" onClick={() => submit(true)} disabled={(!text.trim() && files.length === 0) || !canBuild} title={buildHint}>
                 <WrenchIcon /> 만들기
               </button>
             </>

@@ -8,6 +8,7 @@ mod db;
 mod engines;
 mod error;
 mod intent;
+mod attachments;
 mod jev;
 mod memory;
 mod orchestrator;
@@ -95,11 +96,22 @@ pub fn run() {
             commands::conversation_rename,
             commands::conversation_delete,
             commands::conversation_set_workspace,
+            commands::attachment_pick,
+            commands::attachment_add_paths,
+            commands::attachment_add_bytes,
+            commands::attachment_remove,
+            commands::attachment_preview,
+            commands::attachment_open,
+            commands::attachment_reveal,
+            commands::attachment_save_as,
+            commands::jev_suggest,
             commands::pick_folder,
             commands::chat_send,
             commands::task_cancel,
             commands::agent_cancel,
             commands::task_steer,
+            commands::agent_message,
+            commands::side_ask,
             commands::cancel_all,
             commands::approval_list,
             commands::approval_decide,

@@ -1,10 +1,10 @@
-import { useEffect, useState, type CSSProperties } from "react";
+import { useEffect, useRef, useState, type CSSProperties, type RefObject } from "react";
 import { API_SECRET, api, errorText, type ApiId, type AppInfo, type EngineInfo, type Judgment, type ReviewMode, type SecretStatus } from "../lib/api";
 import { useApp } from "../store";
 import { CloseIcon, FolderIcon, RefreshIcon } from "./Icons";
 import Segmented from "./Segmented";
 import RemoteSection from "./RemoteSection";
-import { A as AGENT_TEXT } from "./Tools";
+import { A as AGENT_TEXT, agentChoice } from "./Tools";
 
 const REVIEW: { id: ReviewMode; label: string; help: string }[] = [
   { id: "auto", label: "자동", help: "어려운 요청은 다른 AI가 검토하고, 정확도가 중요한 요청은 두 AI가 토론한 뒤 판정 AI가 정리합니다(JEV를 켜면 JEV가 판단)" },
@@ -38,9 +38,25 @@ function modelPriceHint(engine: string, model: string): string {
   return "";
 }
 
-function Section({ title, i, children, extra }: { title: string; i: number; children: React.ReactNode; extra?: React.ReactNode }) {
+const KEYS: [string, string][] = [
+  ["Ctrl + N", "새 세션"],
+  ["Ctrl + B", "세션 목록 펼치기·접기"],
+  ["Ctrl + J", "도구 패널 열기·닫기"],
+  ["Ctrl + F", "세션에서 찾기"],
+  ["Ctrl + /", "단축키 보기"],
+  ["Ctrl + ,", "설정"],
+  ["Enter", "보내기(대화 모드: 질문 · 작업 모드: 허락 후 파일 수정)"],
+  ["← / →", "대화·작업 모드 바꾸기(모드 스위치에서)"],
+  ["Ctrl + Enter", "만들기(폴더 안에서 끝까지 완성)"],
+  ["Ctrl + Shift + Enter", "회의"],
+  ["Shift + Enter", "줄 바꿈"],
+  ["/", "스킬 고르기(입력창 맨 앞)"],
+  ["Esc", "창·패널 닫기"],
+];
+
+function Section({ title, i, children, extra, sectionRef }: { title: string; i: number; children: React.ReactNode; extra?: React.ReactNode; sectionRef?: RefObject<HTMLElement | null> }) {
   return (
-    <section style={{ "--i": i } as CSSProperties}>
+    <section ref={sectionRef} style={{ "--i": i } as CSSProperties}>
       <div className="sec-head">
         <h3>{title}</h3>
         {extra}
@@ -123,8 +139,8 @@ function ApiRow({ e, status, onEngines }: { e: EngineInfo; status?: SecretStatus
   );
 }
 
-/** 설정: 연결된 AI(CLI·API 키), JEV, 기본 작업 폴더, 검토, 데이터. */
-export default function SettingsDialog() {
+/** 설정: 연결된 AI(CLI·API 키), JEV, 기본 작업 폴더, 검토, 단축키, 데이터. focusKeys면 단축키 칸으로 옮긴다. */
+export default function SettingsDialog({ focusKeys = false }: { focusKeys?: boolean }) {
   const { settings, saveSettings, engines, setEngines, refreshEngines, setDialog, toast } = useApp();
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [usage, setUsage] = useState<{ calls: number; costUsd: number } | null>(null);
@@ -133,6 +149,10 @@ export default function SettingsDialog() {
   const [scanning, setScanning] = useState(false);
   const [tsKey, setTsKey] = useState("");
   const [jev, setJev] = useState<{ ok: boolean; text: string } | null>(null);
+  const keysRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (focusKeys) keysRef.current?.scrollIntoView({ block: "start" });
+  }, [focusKeys]);
 
   const loadSecrets = () => api.secretsStatus().then(setSecrets).catch(() => {});
   useEffect(() => {
@@ -224,7 +244,28 @@ export default function SettingsDialog() {
                     {e.id === "claude" && "Sonnet $3/$15 · Haiku $0.80/$4 · Opus $15/$75 (1M 토큰)"}
                     {e.id === "codex" && "GPT-5/4o $2.50/$10 · Mini $0.15/$0.60 · o1 $15/$60 (1M 토큰)"}
                     {e.id === "antigravity" && "Flash $0.10/$0.40 · Argon/Pro $1.25/$5.00 · Claude $3/$15 (1M 토큰)"}
+                    {e.id === "opencode" && "무료 모델 전용 ($0)"}
                   </small>
+                  {e.id === "opencode" && e.installed && (
+                    <div className="opencode-model">
+                      <select
+                        value={settings.models.opencode ?? ""}
+                        aria-label={"OpenCode 무료 모델 선택"}
+                        onChange={(ev) => {
+                          const { opencode: _, ...rest } = settings.models;
+                          saveSettings({ ...settings, models: ev.target.value ? { ...rest, opencode: ev.target.value } : rest });
+                        }}
+                      >
+                        <option value="">{"자동 (JEV 선택)"}</option>
+                        {e.models.map((m) => (
+                          <option key={m} value={m}>
+                            {m.replace("opencode/", "")}
+                          </option>
+                        ))}
+                      </select>
+                      <small>{"요청은 OpenCode Zen으로 전송되며, DeepSeek 및 GLM 외 일부 무료 모델은 프롬프트를 보관하거나 모델 학습에 활용할 수 있습니다. 민감한 정보가 감지되면 프롬프트를 저장하지 않는 DeepSeek과 GLM만 사용됩니다."}</small>
+                    </div>
+                  )}
                 </div>
               </div>
             ))}
@@ -245,9 +286,16 @@ export default function SettingsDialog() {
           <label className="toggle-row">
             <span>
               JEV로 판단하기
-              <small>질문 난이도와 필요한 도구를 미리 판단해 최적의 모델을 선택하고 작업 과정을 조율합니다. 불필요한 검토 단계와 세션 메모리를 생략하여 토큰 소모를 크게 절약합니다. (1M 입력 토큰당 $0.042)</small>
+              <small>{"JEV가 요청마다 스킬, AI와 모델, 에이전트 분담을 정하고 불필요한 검토와 기억을 생략해 토큰을 아낍니다. (1M 입력 토큰당 $0.042)"}</small>
             </span>
             <input type="checkbox" className="switch" role="switch" checked={settings.jevEnabled} onChange={(e) => saveSettings({ ...settings, jevEnabled: e.target.checked })} />
+          </label>
+          <label className="toggle-row">
+            <span>
+              {"JEV 모드 및 스킬 추천"}
+              <small>{"메시지를 입력하는 동안 적합한 모드와 스킬을 실시간으로 추천합니다. 이를 위해 아직 전송되지 않은 입력 텍스트가 TypeSafe로 전송됩니다."}</small>
+            </span>
+            <input type="checkbox" className="switch" role="switch" checked={settings.jevSuggest} disabled={!settings.jevEnabled} onChange={(e) => saveSettings({ ...settings, jevSuggest: e.target.checked })} />
           </label>
           <div className="row">
             <span className={`tag ${ts?.present ? "ok" : ""}`}>{ts?.present ? (ts.source === "env" ? "TypeSafe 키: 환경 변수" : "TypeSafe 키 저장됨") : "TypeSafe 키 없음"}</span>
@@ -288,14 +336,32 @@ export default function SettingsDialog() {
           <Segmented
             label={AGENT_TEXT.preset}
             className="wide"
-            value={String(settings.agents ?? 1)}
-            options={["1", "2", "3", "4", "5"].map((v) => ({ value: v, label: v === "1" ? AGENT_TEXT.off : v }))}
-            onChange={(v) => saveSettings({ ...settings, agents: Number(v) })}
+            value={agentChoice.value(settings)}
+            options={agentChoice.options}
+            onChange={(v) => saveSettings(agentChoice.apply(settings, v))}
           />
-          <p className="help">{AGENT_TEXT.presetHelp}</p>
+          <p className="help">{agentChoice.help(settings)}</p>
         </Section>
 
-        <Section title="데이터" i={5}>
+        <Section title="단축키" i={5} sectionRef={keysRef}>
+          <dl className="tool-keys">
+            {KEYS.map(([k, v]) => (
+              <div key={k}>
+                <dt>
+                  {k.split(" + ").map((p, i) => (
+                    <span key={p}>
+                      {i > 0 && " + "}
+                      <kbd>{p}</kbd>
+                    </span>
+                  ))}
+                </dt>
+                <dd>{v}</dd>
+              </div>
+            ))}
+          </dl>
+        </Section>
+
+        <Section title="데이터" i={6}>
           <div className="row">
             <input type="text" value={confirmText} onChange={(e) => setConfirmText(e.target.value)} placeholder="DELETE 입력" style={{ maxWidth: 160 }} />
             <button className="btn danger sm" disabled={confirmText !== "DELETE"} onClick={wipe}>

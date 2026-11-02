@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
-import { ENGINE_LABEL, TIER_LABEL, type Approval, type Budget, type CouncilTurn, type EngineId, type Judgment, type Message, type MessageData, type Step } from "../lib/api";
+import { ENGINE_LABEL, TIER_LABEL, stripFileMarkers, type Approval, type Budget, type CouncilTurn, type EngineId, type Judgment, type Message, type MessageData, type Step } from "../lib/api";
 import { useApp, type Live } from "../store";
 import Markdown from "./Markdown";
+import { MessageAttachments } from "./Attachments";
 import { ChevronIcon, CopyIcon, CouncilIcon, FolderIcon, SparkIcon, WrenchIcon } from "./Icons";
 
 /** 첫 화면 예시: 눌러서 입력창에 넣고, 만들기(또는 Enter)로 보낸다 */
@@ -24,7 +25,7 @@ interface RibbonNode {
   title: string;
   sub: string;
   state: NodeState;
-  kind: "jev" | "draft" | "review" | "debate" | "rebuttal" | "judge" | "agent" | "synth" | "council" | "plan";
+  kind: "jev" | "draft" | "review" | "debate" | "rebuttal" | "judge" | "agent" | "synth" | "council" | "plan" | "finish";
 }
 
 export const ROLE_LABEL: Record<Step["role"], string> = {
@@ -37,6 +38,7 @@ export const ROLE_LABEL: Record<Step["role"], string> = {
   agent: "답변",
   synth: "종합",
   plan: "분할자",
+  finish: "보완",
 };
 
 /** 병렬 작업의 이름과 통합 단계 이름 */
@@ -108,7 +110,8 @@ function stepNodes(steps: Step[], council?: MessageData["council"], work = false
   }
   steps.forEach((s, i) => {
     if (s.role === "agent" || s.role === "council") return;
-    const t = tune(s.engine === "claude" || s.engine === "antigravity" ? s.model : null, s.effort);
+    // OpenCode는 노력치를 쓰지 않으므로 모델 이름만 보여 준다.
+    const t = s.engine === "opencode" ? tune(s.model?.replace("opencode/", ""), null) : tune(s.engine === "claude" || s.engine === "antigravity" ? s.model : null, s.effort);
     const prev = out[out.length - 1];
     if (prev && (s.role === "debate" || s.role === "rebuttal") && prev.kind === s.role && !prev.title.includes(" · ")) {
       prev.title = `${prev.title} · ${s.label}`;
@@ -266,7 +269,7 @@ function savedSeats(c: NonNullable<MessageData["council"]>): CouncilSeat[] {
 function liveNodes(l: Live): RibbonNode[] {
   const out: RibbonNode[] = [];
   const j = jevNode(l.jev, l.budget);
-  const t = tune(l.primary === "claude" || l.primary === "antigravity" ? l.model : null, l.effort);
+  const t = l.primary === "opencode" ? tune(l.model?.replace("opencode/", ""), null) : tune(l.primary === "claude" || l.primary === "antigravity" ? l.model : null, l.effort);
   if (j) out.push(j);
   if (l.council) return [...out, ...councilNodes(l)];
   if (l.team) return [...out, ...teamNodes(l)];
@@ -424,6 +427,7 @@ function Card({ ex, live, approvals, index }: { ex: Exchange; live?: Live; appro
       {ex.user && (
         <header className="card-ask">
           <div className="ask-text">{ex.user.content}</div>
+          <MessageAttachments items={ex.user.data?.attachments} />
           <div className="ask-tags">
             {skill && (
               <span className="tag skill">
@@ -459,7 +463,7 @@ function Card({ ex, live, approvals, index }: { ex: Exchange; live?: Live; appro
       <div className="card-body">
         {live ? (
           <>
-            {live.text ? <Markdown text={live.text} /> : <div className="typing" aria-label="준비 중"><i /><i /><i /></div>}
+            {live.text ? <Markdown text={stripFileMarkers(live.text)} /> : <div className="typing" aria-label="준비 중"><i /><i /><i /></div>}
             {live.activities.length > 0 && (
               <div className="live-acts">
                 {live.activities.slice(-4).map((t, i) => (
@@ -469,7 +473,10 @@ function Card({ ex, live, approvals, index }: { ex: Exchange; live?: Live; appro
             )}
           </>
         ) : a ? (
-          <Markdown text={a.content} />
+          <>
+            <Markdown text={a.content} />
+            <MessageAttachments items={data?.attachments} fromAgent />
+          </>
         ) : null}
       </div>
       {a && !live && (

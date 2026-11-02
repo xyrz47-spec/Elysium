@@ -112,6 +112,13 @@ pub fn insert_message_as(db: &Db, id: &str, conversation_id: &str, role: &str, c
     Ok(id)
 }
 
+/// 저장한 메시지의 기록(data)을 바꾼다(답 뒤에 고른 첨부 파일을 넣을 때).
+pub fn set_message_data(db: &Db, id: &str, data: &Value) -> AppResult<()> {
+    let raw = data.to_string();
+    db.with(|c| c.execute("UPDATE messages SET data_json = ?2 WHERE id = ?1", rusqlite::params![id, raw]))?;
+    Ok(())
+}
+
 pub fn list_messages(db: &Db, conversation_id: &str) -> AppResult<Vec<Message>> {
     db.with(|c| {
         let mut st = c.prepare("SELECT id, conversation_id, role, content, data_json, created_at FROM messages WHERE conversation_id = ?1 ORDER BY created_at, rowid")?;

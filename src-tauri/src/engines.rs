@@ -1,4 +1,4 @@
-//! AI 엔진: CLI(Claude Code·Codex·Antigravity)와 API(Claude API·OpenAI·Gemini API·NVIDIA, `apis.rs`).
+//! AI 엔진: CLI(Claude Code·Codex·Antigravity·OpenCode)와 API(Claude API·OpenAI·Gemini API·NVIDIA, `apis.rs`).
 //! CLI를 찾아 실행하고, 출력 스트림을 글자·활동·결과로 바꾼다.
 //!
 //! 안전 원칙
@@ -6,6 +6,7 @@
 //! - 대화 모드는 읽기 전용 도구만 허용한다. 파일을 고치는 작업 모드는 사용자가 승인한 뒤에만 켠다.
 //! - CLI는 작업 폴더(current_dir)에서 실행한다.
 
+use crate::attachments::AttachedFile;
 use serde::Serialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -22,6 +23,8 @@ pub enum EngineId {
     Codex,
     #[serde(rename = "antigravity")]
     Antigravity,
+    #[serde(rename = "opencode")]
+    OpenCode,
     #[serde(rename = "claude-api")]
     ClaudeApi,
     #[serde(rename = "openai")]
@@ -32,7 +35,7 @@ pub enum EngineId {
     Nvidia,
 }
 
-pub const ALL: [EngineId; 7] = [EngineId::Claude, EngineId::Codex, EngineId::Antigravity, EngineId::ClaudeApi, EngineId::OpenAi, EngineId::GeminiApi, EngineId::Nvidia];
+pub const ALL: [EngineId; 8] = [EngineId::Claude, EngineId::Codex, EngineId::Antigravity, EngineId::OpenCode, EngineId::ClaudeApi, EngineId::OpenAi, EngineId::GeminiApi, EngineId::Nvidia];
 
 impl EngineId {
     pub fn as_str(self) -> &'static str {
@@ -40,6 +43,7 @@ impl EngineId {
             EngineId::Claude => "claude",
             EngineId::Codex => "codex",
             EngineId::Antigravity => "antigravity",
+            EngineId::OpenCode => "opencode",
             EngineId::ClaudeApi => "claude-api",
             EngineId::OpenAi => "openai",
             EngineId::GeminiApi => "gemini-api",
@@ -51,6 +55,7 @@ impl EngineId {
             EngineId::Claude => "Claude Code",
             EngineId::Codex => "Codex",
             EngineId::Antigravity => "Antigravity",
+            EngineId::OpenCode => "OpenCode",
             EngineId::ClaudeApi => "Claude API",
             EngineId::OpenAi => "OpenAI API",
             EngineId::GeminiApi => "Gemini API",
@@ -68,6 +73,7 @@ impl EngineId {
             EngineId::Codex | EngineId::OpenAi => "openai",
             EngineId::Antigravity | EngineId::GeminiApi => "google",
             EngineId::Nvidia => "nvidia",
+            EngineId::OpenCode => "opencode",
         }
     }
     /// 예전 기록의 "gemini"(Gemini CLI)는 Antigravity로 읽는다.
@@ -77,13 +83,13 @@ impl EngineId {
             _ => ALL.into_iter().find(|e| e.as_str() == s),
         }
     }
-    /// 이 PC에서 실제 출력으로 확인한 어댑터인지(Claude Code 2026-10-17, Antigravity agy 1.4.10 2026-10-30).
+    /// 이 PC에서 실제 출력으로 확인한 어댑터인지(Claude Code 2026-10-17, Antigravity agy 1.4.10 2026-10-30, OpenCode 2.2.5 2026-11-02).
     pub fn verified(self) -> bool {
-        matches!(self, EngineId::Claude | EngineId::Antigravity)
+        matches!(self, EngineId::Claude | EngineId::Antigravity | EngineId::OpenCode)
     }
-    /// 자기 대화 세션을 이어 쓰는 CLI(Claude Code `--resume`, Antigravity `--conversation`).
+    /// 자기 대화 세션을 이어 쓰는 CLI(Claude Code `--resume`, Antigravity `--conversation`, OpenCode `--session`).
     pub fn resumable(self) -> bool {
-        matches!(self, EngineId::Claude | EngineId::Antigravity)
+        matches!(self, EngineId::Claude | EngineId::Antigravity | EngineId::OpenCode)
     }
     fn exe_name(self) -> &'static str {
         match self {
@@ -96,6 +102,7 @@ impl EngineId {
             EngineId::Claude => "https://claude.com/claude-code 에서 설치 후 터미널에서 claude 로 로그인",
             EngineId::Codex => "npm i -g @openai/codex 설치 후 codex 로 로그인",
             EngineId::Antigravity => "Antigravity 설치 후 터미널에서 agy 로 로그인",
+            EngineId::OpenCode => "npm i -g opencode-ai 명령으로 설치하세요. 무료 모델은 로그인 없이 이용할 수 있습니다.",
             e => crate::apis::api(e).map(|a| a.key_hint).unwrap_or(""),
         }
     }
@@ -114,6 +121,65 @@ pub struct EngineInfo {
     pub version: Option<String>,
     pub verified: bool,
     pub install_hint: &'static str,
+    /// 고를 수 있는 모델(OpenCode: 무료 모델만)
+    pub models: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// OpenCode: 무료 모델만 쓴다.
+
+/// 모델을 고르지 않았을 때 쓰는 무료 모델(공급자가 데이터를 보관·학습하지 않고 이미지도 읽는다).
+pub const OPENCODE_DEFAULT: &str = "opencode/deepseek-v4.1-flash-free";
+/// 공급자가 입력을 보관·학습하지 않는 무료 모델(https://opencode.ai/docs/zen, 2026-11-02 확인). 민감한 요청은 이것만 쓴다.
+pub const OPENCODE_ZERO_RETENTION: &[&str] = &["opencode/deepseek-v4.1-flash-free", "opencode/glm-5.3-flash-free"];
+/// 이미지 입력을 받는 무료 모델(models.dev attachment 값, 2026-11-02 확인)
+pub const OPENCODE_VISION: &[&str] = &["opencode/deepseek-v4.1-flash-free", "opencode/glm-5.3-flash-free", "opencode/mimo-v2.6-flash-free", "opencode/nemotron-3.5-super-vl-free"];
+/// 이미지가 있을 때 먼저 쓰는 무료 모델. 2026-11-02 빨간 이미지로 시험: 이 모델은 색을 맞혔고, 기본 모델은 "흰 화면"이라고 답한 적이 있다.
+pub const OPENCODE_IMAGE_FIRST: &str = "opencode/nemotron-3.5-super-vl-free";
+
+/// 무료 모델인지. Zen 공급자의 `-free` 모델과 Big Pickle만 인정한다(다른 공급자는 사용자 키로 과금된다).
+pub fn is_free_model(m: &str) -> bool {
+    m == "opencode/big-pickle" || (m.starts_with("opencode/") && m.ends_with("-free") && !m.contains(char::is_whitespace))
+}
+
+/// `opencode models` 출력에서 무료 모델만 고른다.
+pub fn free_models(listing: &str) -> Vec<String> {
+    let mut out: Vec<String> = listing.lines().map(str::trim).filter(|l| is_free_model(l)).map(str::to_string).collect();
+    out.dedup();
+    out
+}
+
+/// 실제로 줄 모델: 무료가 아니면 절대 넘기지 않고 기본 무료 모델로 바꾼다.
+pub fn opencode_model(requested: Option<&str>) -> String {
+    requested.filter(|m| is_free_model(m)).unwrap_or(OPENCODE_DEFAULT).to_string()
+}
+
+/// `OPENCODE_CONFIG_CONTENT`: 권한과 보조 모델을 실행마다 고정한다. 제목 생성 같은 보조 호출도 유료 모델로 가지 않게 한다.
+/// 대화 모드는 편집·명령을 막고, 하위 에이전트는 다른 모델을 쓸 수 있어 언제나 막는다. 작업 폴더 밖은 넘겨받은 폴더만 읽는다.
+pub fn opencode_config(spec: &RunSpec) -> String {
+    let model = opencode_model(spec.model.as_deref());
+    let mut external = serde_json::Map::new();
+    external.insert("*".into(), Value::String("deny".into()));
+    for d in &spec.extra_dirs {
+        external.insert(format!("{}/**", d.replace('\\', "/")), Value::String("allow".into()));
+    }
+    let act = if spec.work { "allow" } else { "deny" };
+    // 대화 모드는 허용 목록이다: OpenCode에는 세션·워크트리를 다루는 내장 도구도 있어 이름을 하나씩 막으면 빠진다.
+    // 규칙은 나중 것이 이기고 serde_json은 키를 정렬하므로 "*"가 맨 앞에 온다.
+    serde_json::json!({
+        "model": model,
+        "small_model": model,
+        "share": "disabled",
+        "autoupdate": false,
+        "permission": {
+            "*": if spec.work { "allow" } else { "deny" },
+            "read": "allow", "glob": "allow", "grep": "allow", "list": "allow", "webfetch": "allow", "websearch": "allow",
+            "edit": act, "bash": act, "shell": act,
+            "task": "deny", "question": "deny", "doom_loop": "deny",
+            "external_directory": external,
+        },
+    })
+    .to_string()
 }
 
 const NO_WINDOW: u32 = 0x0800_0000;
@@ -132,6 +198,24 @@ pub(crate) fn command(program: &Path) -> tokio::process::Command {
     c.creation_flags(NO_WINDOW);
     c.kill_on_drop(true);
     c
+}
+
+/// 프로세스와 그 자식까지 강제로 끝낸다. .cmd 래퍼를 거치면 cmd만 죽고 실제 CLI(node)는 살아남아 토큰을 쓰고 파이프를 붙잡는다.
+pub(crate) fn kill_tree_blocking(pid: u32) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("taskkill").args(["/T", "/F", "/PID", &pid.to_string()]).creation_flags(NO_WINDOW).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    }
+    #[cfg(not(windows))]
+    let _ = pid;
+}
+
+async fn kill_tree(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        let _ = tokio::task::spawn_blocking(move || kill_tree_blocking(pid)).await;
+    }
+    let _ = child.kill().await;
 }
 
 /// PATH에서 실행 파일을 찾는다(Windows는 .exe를 .cmd보다 먼저).
@@ -169,6 +253,7 @@ pub async fn detect(models: &std::collections::BTreeMap<String, String>) -> Vec<
                 version: Some(models.get(id.as_str()).cloned().unwrap_or_else(|| a.default_model.to_string())),
                 verified: false,
                 install_hint: id.install_hint(),
+                models: vec![],
             });
             continue;
         }
@@ -181,6 +266,17 @@ pub async fn detect(models: &std::collections::BTreeMap<String, String>) -> Vec<
                 version = String::from_utf8_lossy(&o.stdout).lines().next().map(|l| l.trim().to_string()).filter(|l| !l.is_empty());
             }
         }
+        let mut list = vec![];
+        if let (EngineId::OpenCode, Some(p)) = (id, &path) {
+            let mut c = command(p);
+            c.arg("models").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+            if let Ok(Ok(o)) = tokio::time::timeout(Duration::from_secs(20), c.output()).await {
+                list = free_models(&String::from_utf8_lossy(&o.stdout));
+            }
+            if list.is_empty() {
+                list.push(OPENCODE_DEFAULT.to_string());
+            }
+        }
         out.push(EngineInfo {
             id,
             label: id.label(),
@@ -190,6 +286,7 @@ pub async fn detect(models: &std::collections::BTreeMap<String, String>) -> Vec<
             version,
             verified: id.verified(),
             install_hint: id.install_hint(),
+            models: list,
         });
     }
     out
@@ -222,6 +319,8 @@ pub struct RunSpec {
     pub extra_dirs: Vec<String>,
     /// 작업 중 메시지 칸(API 작업 모드만 읽는다)
     pub steer: Option<Steer>,
+    /// 이번 요청에 붙은 파일
+    pub attachments: Vec<AttachedFile>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -347,17 +446,46 @@ pub fn args(spec: &RunSpec) -> Vec<String> {
             }
             a
         }
+        EngineId::OpenCode => {
+            // --standalone: 떠 있는 백그라운드 서비스는 이 실행의 권한 설정(OPENCODE_CONFIG_CONTENT)을 읽지 않는다.
+            let mut a = vec![s("run"), s("--standalone"), s("--format"), s("json"), s("--model"), opencode_model(spec.model.as_deref())];
+            if let Some(r) = &spec.resume {
+                a.push(s("--session"));
+                a.push(r.clone());
+            }
+            // cmd를 거치므로 attachments::disk_name을 거친 이름만 인자로 넘긴다. 나머지는 본문의 경로 안내로 읽는다.
+            for f in spec.attachments.iter().filter(|f| opencode_inlines(f)) {
+                a.push(s("--file"));
+                a.push(f.path.to_string_lossy().to_string());
+            }
+            a
+        }
         // API 엔진은 프로세스를 띄우지 않는다.
         _ => vec![],
     }
 }
 
+/// OpenCode `--file`로 넘기는 파일(글·이미지). 나머지 형식은 모델이 받지 못하면 실행 자체가 실패하므로 경로만 알려 준다.
+fn opencode_inlines(f: &AttachedFile) -> bool {
+    f.kind == "text" || f.kind == "image"
+}
+
+/// 요청 + 첨부 안내. OpenCode가 메시지에 넣은 파일도 목록에 올려야 모델이 그 내용을 끼어든 글로 오해하지 않는다.
+fn prompt_with_files(spec: &RunSpec) -> String {
+    if spec.attachments.is_empty() {
+        return spec.prompt.clone();
+    }
+    let inlined = |f: &AttachedFile| spec.engine == EngineId::OpenCode && opencode_inlines(f);
+    format!("{}{}", spec.prompt, crate::attachments::refer_block(&spec.attachments, &inlined))
+}
+
 /// 표준 입력으로 보낼 본문. Claude는 지시문을 따로 받으므로 요청만, 나머지는 지시문을 앞에 붙인다.
 pub fn stdin_text(spec: &RunSpec) -> String {
+    let prompt = prompt_with_files(spec);
     let body = match spec.engine {
-        EngineId::Claude => return spec.prompt.clone(),
-        _ if spec.system.is_empty() => spec.prompt.clone(),
-        _ => format!("{}\n\n---\n\n{}", spec.system, spec.prompt),
+        EngineId::Claude => return prompt,
+        _ if spec.system.is_empty() => prompt,
+        _ => format!("{}\n\n---\n\n{}", spec.system, prompt),
     };
     match spec.engine {
         // agy --input-format stream-json: 한 줄에 메시지 하나
@@ -577,9 +705,72 @@ impl AgyParser {
     }
 }
 
+/// OpenCode `run --format json` 해석기(2026-11-02 opencode 2.2.5 실제 출력으로 확인).
+/// 줄마다 `step_start` · `text` · `tool_use` · `step_finish` · `error`. 마지막에 따로 오는 결과 줄은 없다.
+#[derive(Default)]
+pub struct OpenCodeParser {
+    session: bool,
+    has_text: bool,
+    usage: Finish,
+    finished: bool,
+    /// 과금이 잡힌 비용(무료 모델만 쓰므로 0보다 크면 멈춘다)
+    pub charged: f64,
+}
+
+impl OpenCodeParser {
+    pub fn feed(&mut self, line: &str) -> Vec<Event> {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { return vec![] };
+        let mut out = vec![];
+        if !self.session {
+            if let Some(id) = v["sessionID"].as_str() {
+                self.session = true;
+                out.push(Event::Session(id.to_string()));
+            }
+        }
+        let part = &v["part"];
+        match v["type"].as_str() {
+            Some("text") => {
+                if let Some(t) = part["text"].as_str().filter(|t| !t.trim().is_empty()) {
+                    if self.has_text {
+                        out.push(Event::Text("\n\n".into()));
+                    }
+                    self.has_text = true;
+                    out.push(Event::Text(t.to_string()));
+                }
+            }
+            Some("tool_use") => out.push(Event::Activity(tool_activity(part["tool"].as_str().unwrap_or("도구"), &part["state"]["input"]))),
+            Some("step_finish") => {
+                let t = &part["tokens"];
+                let input = t["input"].as_u64().unwrap_or(0) + t["cache"]["read"].as_u64().unwrap_or(0) + t["cache"]["write"].as_u64().unwrap_or(0);
+                self.usage.input_tokens = Some(self.usage.input_tokens.unwrap_or(0) + input);
+                self.usage.output_tokens = Some(self.usage.output_tokens.unwrap_or(0) + t["output"].as_u64().unwrap_or(0));
+                self.charged += part["cost"].as_f64().unwrap_or(0.0);
+                self.finished = true;
+            }
+            Some("error") => {
+                let e = &v["error"];
+                // 무료 한도 오류는 유료 연결을 권한다. 무료 모델만 쓰므로 그 안내는 보여 주지 않는다.
+                let msg = if e["type"] == "provider.free-limit" {
+                    "무료 사용 한도를 모두 소진했으니 잠시 후 다시 시도하거나 다른 AI를 선택해 주세요.".to_string()
+                } else {
+                    e["message"].as_str().or(e["data"]["message"].as_str()).or(e["name"].as_str()).or(e["type"].as_str()).unwrap_or("OpenCode error").to_string()
+                };
+                out.push(Event::Done(Finish { ok: false, error: Some(msg), ..self.usage.clone() }));
+            }
+            _ => {}
+        }
+        out
+    }
+
+    pub fn finish(&self) -> Finish {
+        Finish { ok: self.finished, error: (!self.finished).then(|| "결과 없이 끝났습니다".to_string()), cost_usd: Some(self.charged), ..self.usage.clone() }
+    }
+}
+
 enum Parser {
     Claude(ClaudeParser),
     Agy(AgyParser),
+    OpenCode(OpenCodeParser),
     Generic(GenericParser),
 }
 
@@ -588,6 +779,7 @@ impl Parser {
         match self {
             Parser::Claude(p) => p.feed(line),
             Parser::Agy(p) => p.feed(line),
+            Parser::OpenCode(p) => p.feed(line),
             Parser::Generic(p) => p.feed(line),
         }
     }
@@ -596,6 +788,14 @@ impl Parser {
 /// 엔진을 실행하고 끝날 때까지 이벤트를 넘긴다. 취소하면 프로세스·요청을 끝낸다.
 pub async fn run(http: &reqwest::Client, spec: &RunSpec, timeout: Duration, cancel: &CancellationToken, mut on_event: impl FnMut(&Event)) -> Outcome {
     if spec.engine.is_api() {
+        // 파일을 읽을 도구가 없는 대화 모드도 답할 수 있게 글 파일은 본문에 넣는다.
+        let inlined;
+        let spec = if spec.attachments.is_empty() {
+            spec
+        } else {
+            inlined = RunSpec { prompt: format!("{}{}", spec.prompt, crate::attachments::inline_block(&spec.attachments, &crate::apis::can_send_binary(spec.engine))), ..spec.clone() };
+            &inlined
+        };
         let model = spec.model.clone().or_else(|| crate::apis::api(spec.engine).map(|a| a.default_model.to_string())).unwrap_or_default();
         return crate::apis::run(http, spec, &model, timeout, cancel, &mut on_event).await;
     }
@@ -618,6 +818,11 @@ pub async fn run(http: &reqwest::Client, spec: &RunSpec, timeout: Duration, canc
     if spec.engine == EngineId::Claude && spec.work {
         // Claude Code의 PowerShell 도구는 이 환경 변수로 켠다(Windows는 단계적 배포라 꺼져 있을 수 있음).
         cmd.env("CLAUDE_CODE_USE_POWERSHELL_TOOL", "1");
+    }
+    if spec.engine == EngineId::OpenCode {
+        cmd.env("OPENCODE_CONFIG_CONTENT", opencode_config(spec));
+        // OpenCode는 current_dir보다 상속한 PWD를 먼저 믿는다(터미널에서 앱을 켜면 엉뚱한 폴더를 고친다).
+        cmd.env("PWD", &spec.cwd);
     }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -645,6 +850,7 @@ pub async fn run(http: &reqwest::Client, spec: &RunSpec, timeout: Duration, canc
     let mut parser = match spec.engine {
         EngineId::Claude => Parser::Claude(ClaudeParser::default()),
         EngineId::Antigravity => Parser::Agy(AgyParser::default()),
+        EngineId::OpenCode => Parser::OpenCode(OpenCodeParser::default()),
         _ => Parser::Generic(GenericParser::default()),
     };
     let mut finish: Option<Finish> = None;
@@ -666,22 +872,31 @@ pub async fn run(http: &reqwest::Client, spec: &RunSpec, timeout: Duration, canc
                         }
                         on_event(&ev);
                     }
+                    // 무료 모델만 쓰기로 했으므로 비용이 잡히는 순간 멈춘다.
+                    if let Parser::OpenCode(p) = &parser {
+                        if p.charged > 0.0 {
+                            stopped = Some("무료 모델에서 비용 청구가 감지되어 실행이 중단되었습니다.".to_string());
+                            break;
+                        }
+                    }
                 }
                 _ => break,
             }
         }
     }
     if stopped.is_some() {
-        let _ = child.kill().await;
+        kill_tree(&mut child).await;
     }
     let status = child.wait().await.ok();
-    let stderr_tail = err_task.await.unwrap_or_default();
+    // 끝낸 뒤에는 stderr를 오래 기다리지 않는다(잡을 수 없는 손자 프로세스가 파이프를 쥐고 있어도 중지가 멈추지 않게).
+    let stderr_tail = if stopped.is_some() { tokio::time::timeout(Duration::from_secs(2), err_task).await.ok().and_then(|r| r.ok()).unwrap_or_default() } else { err_task.await.unwrap_or_default() };
     out.latency_ms = started.elapsed().as_millis() as u64;
     if let Some(msg) = stopped {
         return fail(out, msg);
     }
     let f = finish.unwrap_or_else(|| match &parser {
         Parser::Generic(p) => p.finish(),
+        Parser::OpenCode(p) => p.finish(),
         Parser::Claude(_) | Parser::Agy(_) => Finish { ok: false, error: Some("결과 없이 끝났습니다".into()), ..Default::default() },
     });
     if let Some(r) = f.result.as_ref().filter(|r| !r.trim().is_empty()) {
@@ -723,7 +938,164 @@ mod tests {
             max_tokens: None,
             extra_dirs: vec!["C:\\s".into()],
             steer: None,
+            attachments: vec![],
         }
+    }
+
+    /// 실제 무료 모델로 끝까지 돌려 본다(네트워크 필요): cargo test --lib live_opencode -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn live_opencode_run_attach_permissions_and_resume() {
+        let http = reqwest::Client::new();
+        let cancel = CancellationToken::new();
+        let w = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let a = crate::attachments::add_bytes(store.path(), "내 메모 & 정리 (최종).txt", "secret-word: walrus-77".as_bytes(), "user").unwrap();
+        let z = crate::attachments::add_bytes(store.path(), "data 2.bin", &[1, 0, 2, 3], "user").unwrap();
+        let base = RunSpec {
+            engine: EngineId::OpenCode,
+            prompt: String::new(),
+            system: String::new(),
+            cwd: w.path().to_path_buf(),
+            work: false,
+            resume: None,
+            plugin_dirs: vec![],
+            model: None,
+            effort: None,
+            max_tokens: None,
+            extra_dirs: vec![crate::attachments::path_of(store.path(), &z).parent().unwrap().to_string_lossy().to_string()],
+            steer: None,
+            attachments: vec![crate::attachments::to_file(store.path(), &a), crate::attachments::to_file(store.path(), &z)],
+        };
+        let t = Duration::from_secs(120);
+        let chat = RunSpec { prompt: "내가 첨부한 메모 파일에 적힌 secret-word 값을 알려 줘. 그리고 hello.txt 파일을 만들고 dir 명령도 실행해 봐.".into(), ..base.clone() };
+        let o = run(&http, &chat, t, &cancel, |_| {}).await;
+        println!("chat ok={} err={:?} text={} acts={:?} tokens={:?}", o.ok, o.error, o.text, o.activities, o.input_tokens);
+        assert!(o.ok, "{:?}", o.error);
+        assert!(o.text.contains("walrus-77"), "첨부를 읽어야 한다: {}", o.text);
+        assert!(!w.path().join("hello.txt").exists(), "대화 모드는 파일을 만들 수 없다");
+        assert_eq!(o.cost_usd, Some(0.0));
+        let sid = o.session_id.clone().unwrap();
+        let again = RunSpec { prompt: "방금 답한 secret-word를 다시 한 줄로 답해. 파일을 다시 열지 마.".into(), attachments: vec![], resume: Some(sid), ..base.clone() };
+        let o = run(&http, &again, t, &cancel, |_| {}).await;
+        println!("resume ok={} text={}", o.ok, o.text);
+        assert!(o.text.contains("walrus-77"), "세션을 이어 써야 한다: {}", o.text);
+        let work = RunSpec { prompt: "작업 폴더에 hello.txt 파일을 만들고 내용으로 hi 만 적어. 다른 일은 하지 마.".into(), work: true, attachments: vec![], ..base.clone() };
+        let o = run(&http, &work, t, &cancel, |_| {}).await;
+        println!("work ok={} text={} acts={:?}", o.ok, o.text, o.activities);
+        assert!(w.path().join("hello.txt").exists(), "작업 모드는 파일을 만든다");
+        let bad = RunSpec { model: Some("anthropic/claude-opus-5-5".into()), prompt: "한 단어로 인사해.".into(), attachments: vec![], ..base };
+        assert!(args(&bad).iter().any(|x| x == OPENCODE_DEFAULT), "유료 모델은 넘기지 않는다");
+    }
+
+    fn file(name: &str, kind: &str) -> AttachedFile {
+        AttachedFile { name: name.into(), path: PathBuf::from(format!("C:\\att\\{name}")), kind: kind.into(), mime: "text/plain".into(), size: 2048 }
+    }
+
+    // 2026-11-02 opencode 2.2.5 실제 출력에서 줄인 표본
+    const OPENCODE_SAMPLE: &[&str] = &[
+        r#"{"type":"step_start","sessionID":"ses_1","part":{"type":"step-start"}}"#,
+        r#"{"type":"tool_use","sessionID":"ses_1","part":{"type":"tool","tool":"read","state":{"status":"completed","input":{"path":"C:\\w\\note.txt"},"output":"zebra"}}}"#,
+        r#"{"type":"step_finish","sessionID":"ses_1","part":{"type":"step-finish","reason":"tool-calls","cost":0,"tokens":{"input":10370,"output":98,"reasoning":33,"cache":{"read":1664,"write":0}}}}"#,
+        r#"{"type":"text","sessionID":"ses_1","part":{"type":"text","text":"zebra-42"}}"#,
+        r#"{"type":"step_finish","sessionID":"ses_1","part":{"type":"step-finish","reason":"stop","cost":0,"tokens":{"input":222,"output":5,"reasoning":0,"cache":{"read":12032,"write":0}}}}"#,
+    ];
+
+    #[test]
+    fn parses_opencode_stream() {
+        let mut p = OpenCodeParser::default();
+        let evs: Vec<Event> = OPENCODE_SAMPLE.iter().flat_map(|l| p.feed(l)).collect();
+        assert_eq!(evs[0], Event::Session("ses_1".into()));
+        assert_eq!(evs.iter().filter(|e| matches!(e, Event::Session(_))).count(), 1);
+        assert_eq!(evs[1], Event::Activity("read · C:\\w\\note.txt".into()));
+        assert_eq!(evs[2], Event::Text("zebra-42".into()));
+        let f = p.finish();
+        assert!(f.ok && f.input_tokens == Some(10370 + 1664 + 222 + 12032) && f.output_tokens == Some(103) && p.charged == 0.0);
+        let mut bad = OpenCodeParser::default();
+        let e = bad.feed(r#"{"type":"error","sessionID":"s","error":{"type":"provider.no-route","message":"Model unavailable: x"}}"#);
+        assert!(matches!(&e[1], Event::Done(f) if !f.ok && f.error.as_deref() == Some("Model unavailable: x")));
+        let limit = OpenCodeParser::default().feed(r#"{"type":"error","sessionID":"s","error":{"type":"provider.free-limit","message":"Connect a provider or subscribe to keep going"}}"#);
+        assert!(matches!(&limit[1], Event::Done(f) if !f.ok && !f.error.as_deref().unwrap().contains("subscribe")), "유료 연결 안내를 보여 주지 않는다");
+        assert!(!crate::apis::transient(match &limit[1] { Event::Done(f) => f.error.as_deref().unwrap(), _ => "" }), "한도 소진은 바로 다시 시도하지 않는다");
+        assert!(!OpenCodeParser::default().finish().ok, "아무 단계도 끝나지 않으면 실패");
+        let mut paid = OpenCodeParser::default();
+        paid.feed(r#"{"type":"step_finish","part":{"cost":0.01,"tokens":{}}}"#);
+        assert!(paid.charged > 0.0);
+    }
+
+    #[test]
+    fn opencode_never_receives_a_paid_model() {
+        for free in ["opencode/beam-free", "opencode/big-pickle", OPENCODE_DEFAULT] {
+            assert!(is_free_model(free), "{free}");
+        }
+        for paid in ["anthropic/claude-opus-5-5", "opencode/claude-opus-5-5", "openai/gpt-5-free", "opencode/a b-free", ""] {
+            assert!(!is_free_model(paid), "{paid}");
+            assert_eq!(opencode_model(Some(paid)), OPENCODE_DEFAULT);
+        }
+        assert_eq!(opencode_model(None), OPENCODE_DEFAULT);
+        let list = "anthropic/claude-opus-5-5\nopencode/big-pickle\nopencode/beam-free\nopencode/gpt-5\n";
+        assert_eq!(free_models(list), ["opencode/big-pickle", "opencode/beam-free"]);
+        let mut sp = spec(EngineId::OpenCode, false);
+        sp.model = Some("anthropic/claude-opus-5-5".into());
+        let a = args(&sp);
+        let i = a.iter().position(|x| x == "--model").unwrap();
+        assert_eq!(a[i + 1], OPENCODE_DEFAULT);
+        assert!(a.iter().any(|x| x == "--standalone"), "권한 설정을 읽게 private 서버로 돈다");
+        assert!(a.windows(2).any(|w| w[0] == "--session" && w[1] == "abc"));
+        let c: Value = serde_json::from_str(&opencode_config(&sp)).unwrap();
+        assert_eq!(c["model"], OPENCODE_DEFAULT);
+        assert_eq!(c["small_model"], OPENCODE_DEFAULT, "제목 생성도 무료 모델로");
+    }
+
+    #[test]
+    fn opencode_chat_mode_cannot_write_or_run_commands() {
+        let chat: Value = serde_json::from_str(&opencode_config(&spec(EngineId::OpenCode, false))).unwrap();
+        for k in ["*", "edit", "bash", "shell", "task"] {
+            assert_eq!(chat["permission"][k], "deny", "{k}");
+        }
+        assert_eq!(chat["permission"]["read"], "allow");
+        assert!(serde_json::to_string(&chat["permission"]).unwrap().starts_with(r#"{"*":"#), "\"*\"가 먼저 와야 나머지 규칙이 이긴다");
+        let work: Value = serde_json::from_str(&opencode_config(&spec(EngineId::OpenCode, true))).unwrap();
+        assert_eq!(work["permission"]["edit"], "allow");
+        assert_eq!(work["permission"]["task"], "deny", "하위 에이전트는 다른 모델을 쓸 수 있다");
+        assert_eq!(work["permission"]["external_directory"]["*"], "deny");
+        assert_eq!(work["permission"]["external_directory"]["C:/s/**"], "allow");
+    }
+
+    #[test]
+    fn attachments_reach_each_engine_its_own_way() {
+        let files = vec![file("a.txt", "text"), file("b.png", "image"), file("c.zip", "file")];
+        let mut oc = spec(EngineId::OpenCode, false);
+        oc.attachments = files.clone();
+        let a = args(&oc);
+        assert_eq!(a.iter().filter(|x| *x == "--file").count(), 2, "글·이미지만 --file");
+        let body = stdin_text(&oc);
+        assert!(body.contains("c.zip") && body.contains("C:\\att\\c.zip"), "나머지는 경로 안내");
+        assert!(body.contains("a.txt") && !body.contains("C:\\att\\a.txt"), "메시지에 넣은 파일은 이름만");
+        let mut cl = spec(EngineId::Claude, false);
+        cl.attachments = files;
+        let body = stdin_text(&cl);
+        assert!(body.contains("a.txt") && body.contains("b.png") && body.contains("c.zip") && body.contains("[첨부 파일]"));
+        assert!(!args(&cl).iter().any(|x| x.contains("a.txt")));
+        assert_eq!(stdin_text(&spec(EngineId::Claude, false)), "요청 & del /q *", "첨부가 없으면 그대로");
+    }
+
+    /// 손자 프로세스가 stdout을 쥐고 있으므로, 트리째 끝나야만 EOF가 온다.
+    #[cfg(windows)]
+    #[test]
+    fn kill_tree_ends_grandchildren_holding_the_pipe() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let mut c = tokio::process::Command::new("cmd");
+            c.args(["/D", "/C", "ping -n 60 127.0.0.1"]).stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null()).creation_flags(NO_WINDOW);
+            let mut child = c.spawn().unwrap();
+            let mut out = child.stdout.take().unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            kill_tree(&mut child).await;
+            let mut buf = Vec::new();
+            let r = tokio::time::timeout(Duration::from_secs(10), out.read_to_end(&mut buf)).await;
+            assert!(r.is_ok(), "손자 프로세스가 남아 파이프가 닫히지 않았다");
+        });
     }
 
     #[test]

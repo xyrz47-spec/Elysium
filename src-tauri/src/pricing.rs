@@ -185,7 +185,7 @@ pub fn rate_on(engine: EngineId, model: Option<&str>, on: NaiveDate) -> Rate {
         EngineId::Claude | EngineId::ClaudeApi => claude(&m),
         EngineId::Codex | EngineId::OpenAi => openai(&m),
         EngineId::Antigravity | EngineId::GeminiApi => gemini(&m, on),
-        EngineId::Nvidia => FREE,
+        EngineId::Nvidia | EngineId::OpenCode => FREE,
     }
 }
 
@@ -235,6 +235,8 @@ const LISTED: &[(EngineId, &str, &str, &str)] = &[
     (EngineId::GeminiApi, "Gemini 2.5 Flash (API)", "gemini-2.5-flash", "Gemini API 기본 모델"),
     (EngineId::GeminiApi, "Gemini 2.5 Flash-Lite (API)", "gemini-2.5-flash-lite", "가장 싼 Gemini"),
     (EngineId::GeminiApi, "Gemini 3.8 Flash (API)", "gemini-3.8-flash", "2026-12-31까지 할인가"),
+    (EngineId::OpenCode, "DeepSeek V4.1 Flash Free", "opencode/deepseek-v4.1-flash-free", "OpenCode Zen 무료 모델"),
+    (EngineId::OpenCode, "GLM-5.3-Flash Free", "opencode/glm-5.3-flash-free", "OpenCode Zen 무료 모델"),
     (EngineId::Nvidia, "Nemotron 3 Nano Omni", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning", "NVIDIA Build 무료 체험 크레딧"),
     (EngineId::Nvidia, "DeepSeek v4.1 Flash", "deepseek-ai/deepseek-v4.1-flash", "NVIDIA Build 무료 체험 크레딧"),
 ];

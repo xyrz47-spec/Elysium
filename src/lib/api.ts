@@ -1,7 +1,7 @@
 // Rust 명령과 1:1로 대응하는 타입이 지정된 IPC 래퍼.
 import { invoke } from "@tauri-apps/api/core";
 
-export type CliId = "claude" | "codex" | "antigravity";
+export type CliId = "claude" | "codex" | "antigravity" | "opencode";
 export type ApiId = "claude-api" | "openai" | "gemini-api" | "nvidia";
 export type EngineId = CliId | ApiId;
 export type EngineChoice = "auto" | EngineId;
@@ -13,6 +13,7 @@ export const ENGINE_LABEL: Record<string, string> = {
   codex: "Codex",
   antigravity: "Antigravity",
   gemini: "Antigravity",
+  opencode: "OpenCode",
   "claude-api": "Claude API",
   openai: "OpenAI API",
   "gemini-api": "Gemini API",
@@ -29,6 +30,28 @@ export interface Settings {
   models: Record<string, string>;
   /** 대화 요청마다 동시에 돌릴 에이전트 수(1이면 끔, 최대 5) */
   agents: number;
+  /** true면 JEV가 요청을 보고 에이전트 수를 정한다 */
+  agentsAuto: boolean;
+  /** 입력하는 동안 JEV가 모드·스킬을 추천한다 */
+  jevSuggest: boolean;
+}
+
+/** 채팅에 붙은 파일(사용자가 올렸거나 에이전트가 답에 붙임) */
+export interface Attachment {
+  id: string;
+  name: string;
+  mime: string;
+  size: number;
+  kind: "image" | "text" | "pdf" | "file";
+  origin: "user" | "agent";
+}
+
+/** 입력창 추천 */
+export interface Suggestion {
+  mode: "chat" | "work" | "build" | "council" | null;
+  modeConfidence: number | null;
+  skill: string | null;
+  skillFit: number | null;
 }
 
 export interface EngineInfo {
@@ -41,6 +64,8 @@ export interface EngineInfo {
   version: string | null;
   verified: boolean;
   installHint: string;
+  /** 고를 수 있는 모델(OpenCode: 무료 모델만) */
+  models: string[];
 }
 
 export type SecretName = "typesafe" | "anthropic" | "openai" | "gemini" | "nvidia";
@@ -71,7 +96,7 @@ export const TIER_LABEL: Record<Budget["tier"], string> = { light: "가볍게", 
 export interface Step {
   engine: EngineId;
   label: string;
-  role: "draft" | "review" | "debate" | "rebuttal" | "judge" | "agent" | "synth" | "council" | "plan";
+  role: "draft" | "review" | "debate" | "rebuttal" | "judge" | "agent" | "synth" | "council" | "plan" | "finish";
   effort: string | null;
   model: string | null;
   ok: boolean;
@@ -137,13 +162,14 @@ export interface CouncilTurn {
 
 /** JEV가 답 비교·검토 생략을 판단한 기록 */
 export interface JevCheck {
-  kind: "compare" | "council" | "draft";
+  kind: "compare" | "council" | "draft" | "verify" | "triage" | "reviewCheck";
   value: number;
   ms: number;
   costUsd: number;
 }
 
 export interface MessageData {
+  attachments?: Attachment[];
   steps?: Step[];
   work?: boolean;
   reasons?: string[];
@@ -200,7 +226,6 @@ export interface Skill {
   engine: EngineId | null;
   review: boolean | null;
   mode: "chat" | "work" | null;
-  triggers: string[];
   source: string;
   path: string;
   enabled: boolean;
@@ -250,12 +275,27 @@ export const api = {
   conversationSetWorkspace: (conversationId: string, path: string | null) => invoke<void>("conversation_set_workspace", { conversationId, path }),
   pickFolder: () => invoke<string | null>("pick_folder"),
   /** work: 작업 모드(허락을 받은 뒤 파일 수정) · build: '만들기' — 승인 없이 폴더 안에서 끝까지 완성(작업 모드 포함) */
-  chatSend: (conversationId: string | null, text: string, engine: EngineChoice, work: boolean, build: boolean, workspace: string | null, council = false) =>
-    invoke<{ conversationId: string; taskId: string; userMessageId: string }>("chat_send", { conversationId, text, engine, work: !council && (work || build), build, workspace, council }),
+  chatSend: (conversationId: string | null, text: string, engine: EngineChoice, work: boolean, build: boolean, workspace: string | null, council = false, attachments: string[] = []) =>
+    invoke<{ conversationId: string; taskId: string; userMessageId: string }>("chat_send", { conversationId, text, engine, work: !council && (work || build), build, workspace, council, attachments }),
+  attachmentPick: () => invoke<Attachment[]>("attachment_pick"),
+  attachmentAddPaths: (paths: string[]) => invoke<Attachment[]>("attachment_add_paths", { paths }),
+  attachmentAddBytes: (name: string, dataBase64: string) => invoke<Attachment>("attachment_add_bytes", { name, dataBase64 }),
+  attachmentRemove: (id: string) => invoke<void>("attachment_remove", { id }),
+  attachmentPreview: (id: string) => invoke<string | null>("attachment_preview", { id }),
+  /** 실행되는 형식이면 열지 않고 탐색기에서 보여 주고 true를 돌려준다 */
+  attachmentOpen: (id: string) => invoke<boolean>("attachment_open", { id }),
+  attachmentReveal: (id: string) => invoke<void>("attachment_reveal", { id }),
+  attachmentSaveAs: (id: string) => invoke<string | null>("attachment_save_as", { id }),
+  jevSuggest: (text: string, hasFiles: boolean) => invoke<Suggestion | null>("jev_suggest", { text, hasFiles }),
   taskCancel: (taskId: string) => invoke<boolean>("task_cancel", { taskId }),
   /** 실행 중인 에이전트 하나만 멈춘다(같은 작업의 다른 에이전트는 계속) */
   agentCancel: (taskId: string, key: string) => invoke<boolean>("agent_cancel", { taskId, key }),
-  /** 작업 중 메시지: API 작업 모드가 다음 차례에 읽는다. 받지 않는 AI면 오류 */
+  /** 에이전트 하나에게 말을 건다 */
+  agentMessage: (taskId: string, key: string, text: string) => invoke<void>("agent_message", { taskId, key, text }),
+  /** 곁질문: 대화 기록에 남지 않는다. 답은 side:* 이벤트로 온다 */
+  sideAsk: (sideId: string, conversationId: string | null, workspace: string | null, question: string, progress: string | null, thread: { role: string; text: string }[]) =>
+    invoke<void>("side_ask", { sideId, conversationId, workspace, question, progress, thread }),
+  /** 작업 중 메시지: 지금 실행 중인 에이전트 모두에게 전한다 */
   taskSteer: (taskId: string, text: string) => invoke<void>("task_steer", { taskId, text }),
   cancelAll: () => invoke<number>("cancel_all"),
   approvalList: () => invoke<Approval[]>("approval_list"),
@@ -345,6 +385,28 @@ export function errorText(e: unknown): string {
   if (typeof e === "string") return e;
   if (e instanceof Error) return e.message;
   return JSON.stringify(e);
+}
+
+export function formatSize(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10 * 1024 ? 1 : 0)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+export function toBase64(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf);
+  let out = "";
+  // 한 번에 넘기면 인자 수 한도를 넘는다.
+  for (let i = 0; i < bytes.length; i += 0x8000) out += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(out);
+}
+
+/** 답이 흐르는 동안 파일 표시를 숨긴다(끝나면 백엔드가 첨부로 바꾼다). 닫히지 않은 블록은 끝까지 숨긴다. */
+export function stripFileMarkers(text: string): string {
+  return text
+    .replace(/^[ \t]*\[\[file:[^\]\n]*\]\][\s\S]*?(^[ \t]*\[\[\/file\]\][ \t]*$|(?![\s\S]))/gm, "")
+    .replace(/^[ \t]*\[\[attach:[^\]\n]*\]\][ \t]*$/gm, "")
+    .trimEnd();
 }
 
 /** 경로의 마지막 폴더 이름 */

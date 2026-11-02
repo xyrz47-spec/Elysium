@@ -173,3 +173,23 @@ export const CouncilIcon = ({ size = 18 }: { size?: number }) => (
     <path d="M10 15.5a2.5 2.5 0 0 0 2.5 2.5H16l2.5 2v-2.1a2.5 2.5 0 0 0 1.5-2.3v-2.1a2.5 2.5 0 0 0-2.5-2.5H17" />
   </Svg>
 );
+
+const stroke = { fill: "none", stroke: "currentColor", strokeWidth: 1.8, strokeLinecap: "round", strokeLinejoin: "round" } as const;
+
+export function ClipIcon({ size = 15 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" {...stroke} aria-hidden>
+      <path d="m21 11-9.2 9.2a5.5 5.5 0 0 1-7.8-7.8l9.2-9.2a3.7 3.7 0 0 1 5.2 5.2l-9.2 9.2a1.8 1.8 0 0 1-2.6-2.6l8.5-8.5" />
+    </svg>
+  );
+}
+
+export function ImageIcon({ size = 15 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" {...stroke} aria-hidden>
+      <rect x="3" y="4" width="18" height="16" rx="2.5" />
+      <circle cx="8.5" cy="9.5" r="1.6" />
+      <path d="m21 16-5-5-8 9" />
+    </svg>
+  );
+}

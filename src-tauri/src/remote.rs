@@ -347,6 +347,9 @@ fn router(ctx: Ctx) -> Router {
         .route("/api/conversations", get(conversations))
         .route("/api/conversations/{id}/messages", get(messages))
         .route("/api/send", post(send))
+        // 폰에서 올리는 파일(base64라 원본보다 커진다)
+        .route("/api/attachments", post(upload).layer(axum::extract::DefaultBodyLimit::max(72 * 1024 * 1024)))
+        .route("/api/attachments/{id}", get(attachment).delete(discard))
         .route("/api/tasks/{id}/cancel", post(cancel))
         .route("/api/approvals", get(approvals))
         .route("/api/approvals/{id}", post(decide))
@@ -400,6 +403,37 @@ struct SendReq {
     engine: Option<String>,
     #[serde(default)]
     work: bool,
+    #[serde(default)]
+    attachments: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadReq {
+    name: String,
+    data_base64: String,
+}
+
+async fn upload(State(ctx): State<Ctx>, Authed(d): Authed, Json(req): Json<UploadReq>) -> ApiResult<crate::attachments::Attachment> {
+    let bytes = crate::attachments::b64_decode(&req.data_base64).ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, "invalid base64".into()))?;
+    let a = crate::attachments::add_bytes(&ctx.st.data_dir, &req.name, &bytes, "user").map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
+    audit::record(&ctx.st.db, "remote", "remote.attachment", "ok", json!({ "device": d.name, "size": a.size }));
+    Ok(Json(a))
+}
+
+/// 폰에서 보는 첨부 내용(크기 한도 안에서만). 파일 경로는 보내지 않는다.
+async fn attachment(State(ctx): State<Ctx>, _: Authed, Path(id): Path<String>) -> ApiResult<Value> {
+    let a = crate::attachments::load(&ctx.st.data_dir, &id).ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "not found".into()))?;
+    if a.size > crate::attachments::MAX_INLINE_BYTES {
+        return Ok(Json(json!({ "attachment": a, "dataBase64": null })));
+    }
+    let bytes = std::fs::read(crate::attachments::path_of(&ctx.st.data_dir, &a)).map_err(|e| ApiError(StatusCode::NOT_FOUND, e.to_string()))?;
+    Ok(Json(json!({ "attachment": a, "dataBase64": crate::attachments::b64_encode(&bytes) })))
+}
+
+async fn discard(State(ctx): State<Ctx>, _: Authed, Path(id): Path<String>) -> ApiResult<Value> {
+    crate::attachments::remove(&ctx.st.data_dir, &id);
+    Ok(Json(json!({ "removed": true })))
 }
 
 async fn send(State(ctx): State<Ctx>, Authed(d): Authed, Json(req): Json<SendReq>) -> ApiResult<orchestrator::SendResult> {
@@ -409,7 +443,7 @@ async fn send(State(ctx): State<Ctx>, Authed(d): Authed, Json(req): Json<SendReq
     };
     audit::record(&ctx.st.db, "remote", "remote.send", "ok", json!({ "device": d.name, "work": req.work }));
     // 폰에서 보낸 작업은 '만들기'가 아니라 PC·폰의 허락을 받는 작업 모드로 돈다.
-    let r = orchestrator::send(&ctx.app, &ctx.st, req.conversation_id, req.text, choice, req.work, false, None, false).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
+    let r = orchestrator::send(&ctx.app, &ctx.st, req.conversation_id, req.text, choice, req.work, false, None, false, req.attachments).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
     Ok(Json(r))
 }
 

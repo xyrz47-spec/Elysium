@@ -24,6 +24,20 @@ export interface AgentRun {
   activities: string[];
   /** 사용자가 이 에이전트만 멈췄다 */
   stopped: boolean;
+  /** 사용자가 이 에이전트에게 보낸 메시지 */
+  sent: string[];
+}
+
+/** 곁질문 한 차례. 앱 메모리에만 두고 대화 기록에 남기지 않는다. */
+export interface SideTurn {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+  state?: "run" | "ok" | "fail";
+  engine?: EngineId | null;
+  activity?: string | null;
+  error?: string | null;
+  stopped?: boolean;
 }
 
 /** 병렬 작업의 하위 작업(실행 key → 이름·맡은 파일) */
@@ -71,7 +85,7 @@ export interface Live {
   activities: string[];
 }
 
-export type Dialog = null | "settings" | "skills" | "usage";
+export type Dialog = null | "settings" | "keys" | "skills" | "usage";
 
 interface AppCtx {
   engines: EngineInfo[];
@@ -94,12 +108,17 @@ interface AppCtx {
   approvals: Approval[];
   decide: (id: string, approve: boolean) => Promise<void>;
   /** work: 작업 모드(허락을 받은 뒤 파일 수정) · build: '만들기' — 폴더 안에서 승인 없이 끝까지 완성 · council: '회의' — 여러 AI가 서로 대화하며 푼다 */
-  send: (text: string, engine: EngineChoice, work: boolean, build: boolean, council?: boolean) => Promise<void>;
+    send: (text: string, engine: EngineChoice, work: boolean, build: boolean, council?: boolean, attachments?: string[]) => Promise<boolean>;
   cancel: (taskId: string) => void;
   /** 에이전트 하나만 멈춘다 */
   cancelAgent: (taskId: string, key: string) => void;
   /** 실행 중인 모든 작업을 멈춘다 */
   cancelAll: () => void;
+  /** 지금 세션의 곁질문 */
+  side: SideTurn[];
+  askSide: (question: string) => Promise<void>;
+  stopSide: () => void;
+  clearSide: () => void;
   skills: SkillsView | null;
   refreshSkills: () => Promise<void>;
   dialog: Dialog;
@@ -144,6 +163,20 @@ const blank = (taskId: string, conversationId: string, work: boolean): Live => (
   activities: [],
 });
 
+/** 곁질문 AI에게 줄 지금 진행 상황(화면에는 보이지 않는다) */
+function progressOf(l: Live): string {
+  const lines = [`경과 ${Math.round((Date.now() - l.startedAt) / 1000)}초 · ${l.work ? "파일 작업" : "대화"}`];
+  if (l.reasons.length) lines.push(`계획: ${l.reasons.join(" / ")}`);
+  for (const a of Object.values(l.agents)) {
+    const last = a.activities[a.activities.length - 1];
+    lines.push(`- ${l.parts[a.key]?.title ?? a.label}(${a.role}): ${a.state === "run" ? "실행 중" : a.state === "ok" ? "완료" : "중단"}${last ? ` · 최근 활동: ${last}` : ""}`);
+    const text = l.streams[a.key];
+    if (text) lines.push(`  쓴 글 끝부분: ${text.slice(-400)}`);
+  }
+  if (l.text) lines.push(`지금 쓰는 답의 끝부분:\n${l.text.slice(-1200)}`);
+  return lines.join("\n");
+}
+
 export function AppProvider({ children }: { children: ReactNode }) {
   const [engines, setEngines] = useState<EngineInfo[]>([]);
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -156,6 +189,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [dialog, setDialog] = useState<Dialog>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [newFolder, setNewFolder] = useState<string | null>(null);
+  const [sideThreads, setSideThreads] = useState<Record<string, SideTurn[]>>({});
 
   const toast = useCallback((text: string, kind: Toast["kind"] = "info") => {
     const id = Date.now() + Math.random();
@@ -223,8 +257,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
       const prev = l.agents[p.key];
       const run: AgentRun =
         p.state === "run"
-          ? { key: p.key, engine: p.engine, label: p.label, role: p.role, model: p.model ?? null, effort: p.effort ?? null, state: "run", startedAt: Date.now(), ms: null, error: null, chars: null, activities: [], stopped: false }
-          : { ...(prev ?? { key: p.key, engine: p.engine, label: p.label, role: p.role, model: null, effort: null, startedAt: Date.now(), activities: [] }), state: p.state, ms: p.ms ?? null, error: p.error ?? null, chars: p.chars ?? null, stopped: !!p.stopped };
+          ? { key: p.key, engine: p.engine, label: p.label, role: p.role, model: p.model ?? null, effort: p.effort ?? null, state: "run", startedAt: Date.now(), ms: null, error: null, chars: null, activities: [], stopped: false, sent: [] }
+          : { ...(prev ?? { key: p.key, engine: p.engine, label: p.label, role: p.role, model: null, effort: null, startedAt: Date.now(), activities: [], sent: [] }), state: p.state, ms: p.ms ?? null, error: p.error ?? null, chars: p.chars ?? null, stopped: !!p.stopped };
       return { ...m, [p.taskId]: { ...l, agents: { ...l.agents, [p.key]: run } } };
     }),
   );
@@ -232,6 +266,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
     patch(p.taskId, (l) => {
       const a = l.agents[p.key];
       return a ? { ...l, agents: { ...l.agents, [p.key]: { ...a, activities: [...a.activities, p.text].slice(-6) } } } : l;
+    }),
+  );
+  useTauriEvent<{ taskId: string; key: string; text: string }>("task:agent-message", (p) =>
+    patch(p.taskId, (l) => {
+      const a = l.agents[p.key];
+      return a ? { ...l, agents: { ...l.agents, [p.key]: { ...a, sent: [...a.sent, p.text] } } } : l;
     }),
   );
   useTauriEvent<{ taskId: string; key: string; delta: string }>("task:agent-delta", (p) =>
@@ -267,6 +307,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setLive(({ [p.taskId]: _, ...rest }) => rest);
     refreshConversations();
   });
+  const patchSide = useCallback((id: string, f: (t: SideTurn) => SideTurn) => {
+    setSideThreads((m) => Object.fromEntries(Object.entries(m).map(([k, v]) => [k, v.map((t) => (t.id === id ? f(t) : t))])));
+  }, []);
+  useTauriEvent<{ sideId: string; engine: EngineId }>("side:started", (p) => patchSide(p.sideId, (t) => ({ ...t, engine: p.engine, text: "", activity: null })));
+  useTauriEvent<{ sideId: string; delta: string }>("side:delta", (p) => patchSide(p.sideId, (t) => ({ ...t, text: t.text + p.delta })));
+  useTauriEvent<{ sideId: string; text: string }>("side:activity", (p) => patchSide(p.sideId, (t) => ({ ...t, activity: p.text })));
+  useTauriEvent<{ sideId: string; ok: boolean; text: string; error: string | null; engine: EngineId | null; stopped: boolean }>("side:done", (p) =>
+    patchSide(p.sideId, (t) => ({ ...t, state: p.ok ? "ok" : "fail", text: p.text || t.text, engine: p.engine ?? t.engine, error: p.error, stopped: p.stopped, activity: null })),
+  );
   // 키가 거절된 API를 백엔드가 자동 선택에서 뺐을 때
   useTauriEvent("engines:changed", () => {
     api.enginesList().then(setEngines).catch(() => {});
@@ -277,20 +326,23 @@ export function AppProvider({ children }: { children: ReactNode }) {
   useTauriEvent("data:cleared", () => {
     setConversationId(null);
     setMessages([]);
+    setSideThreads({});
     refreshConversations();
   });
 
   const send = useCallback(
-    async (text: string, engine: EngineChoice, work: boolean, build: boolean, council = false) => {
+    async (text: string, engine: EngineChoice, work: boolean, build: boolean, council = false, attachments: string[] = []) => {
       try {
-        const r = await api.chatSend(conversationId, text, engine, work, build, conversationId ? null : newFolder, council);
+        const r = await api.chatSend(conversationId, text, engine, work, build, conversationId ? null : newFolder, council, attachments);
         if (!conversationId) setNewFolder(null);
         setLive((m) => ({ ...m, [r.taskId]: m[r.taskId] ?? blank(r.taskId, r.conversationId, !council && (work || build)) }));
         if (r.conversationId !== conversationId) setConversationId(r.conversationId);
         else loadMessages(r.conversationId);
         refreshConversations();
+        return true;
       } catch (e) {
         toast(errorText(e), "error");
+        return false;
       }
     },
     [conversationId, loadMessages, refreshConversations, toast, newFolder],
@@ -336,6 +388,31 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const cancelAll = useCallback(() => {
     api.cancelAll().catch(() => {});
   }, []);
+
+  const sideKey = conversationId ?? "new";
+  const side = useMemo(() => sideThreads[sideKey] ?? [], [sideThreads, sideKey]);
+  const askSide = useCallback(
+    async (question: string) => {
+      const id = crypto.randomUUID();
+      const running = Object.values(live).filter((l) => l.conversationId === conversationId);
+      const progress = running.length ? running.map(progressOf).join("\n\n") : null;
+      const thread = side.filter((t) => t.text.trim() && t.state !== "fail").map((t) => ({ role: t.role, text: t.text }));
+      setSideThreads((m) => ({ ...m, [sideKey]: [...(m[sideKey] ?? []), { id: `${id}:q`, role: "user", text: question }, { id, role: "assistant", text: "", state: "run" }] }));
+      try {
+        await api.sideAsk(id, conversationId, conversationId ? null : newFolder, question, progress, thread);
+      } catch (e) {
+        patchSide(id, (t) => ({ ...t, state: "fail", error: errorText(e) }));
+      }
+    },
+    [conversationId, live, newFolder, patchSide, side, sideKey],
+  );
+  const stopSide = useCallback(() => {
+    for (const t of side) if (t.state === "run") api.taskCancel(t.id).catch(() => {});
+  }, [side]);
+  const clearSide = useCallback(() => {
+    stopSide();
+    setSideThreads((m) => ({ ...m, [sideKey]: [] }));
+  }, [sideKey, stopSide]);
 
   const decide = useCallback(
     async (id: string, approve: boolean) => {
@@ -396,6 +473,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
       cancel,
       cancelAgent,
       cancelAll,
+      side,
+      askSide,
+      stopSide,
+      clearSide,
       skills,
       refreshSkills,
       dialog,
@@ -403,7 +484,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       toasts,
       toast,
     }),
-    [engines, newFolder, chooseFolder, resetFolder, refreshEngines, settings, saveSettings, conversations, conversationId, deleteConversation, messages, live, approvals, decide, send, cancel, cancelAgent, cancelAll, skills, refreshSkills, dialog, toasts, toast],
+    [engines, newFolder, chooseFolder, resetFolder, refreshEngines, settings, saveSettings, conversations, conversationId, deleteConversation, messages, live, approvals, decide, send, cancel, cancelAgent, cancelAll, side, askSide, stopSide, clearSide, skills, refreshSkills, dialog, toasts, toast],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

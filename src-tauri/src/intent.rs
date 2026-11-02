@@ -50,7 +50,11 @@ const FAMILIES: &[Family] = &[
     Family { name: "GPT", aliases: &[("gpt", true), ("지피티", true)], targets: &[(Codex, ""), (OpenAi, "")] },
     Family { name: "Codex", aliases: &[("codex", true), ("코덱스", true)], targets: &[(Codex, "")] },
     Family { name: "Nemotron", aliases: &[("nemotron", true), ("네모트론", true), ("nvidia", true), ("엔비디아", true)], targets: &[(Nvidia, "")] },
-    Family { name: "DeepSeek", aliases: &[("deepseek", true), ("딥시크", true)], targets: &[(Nvidia, "deepseek-ai/deepseek-v4.1-flash")] },
+    Family { name: "DeepSeek", aliases: &[("deepseek", true), ("딥시크", true)], targets: &[(Nvidia, "deepseek-ai/deepseek-v4.1-flash"), (OpenCode, "opencode/deepseek-v4.1-flash-free")] },
+    Family { name: "OpenCode", aliases: &[("opencode", true), ("open code", true), ("오픈코드", true), ("오픈 코드", true)], targets: &[(OpenCode, "")] },
+    Family { name: "GLM", aliases: &[("glm", true)], targets: &[(OpenCode, "opencode/glm-5.3-flash-free")] },
+    Family { name: "MiMo", aliases: &[("mimo", true), ("미모", false)], targets: &[(OpenCode, "opencode/mimo-v2.6-flash-free")] },
+    Family { name: "Big Pickle", aliases: &[("big pickle", true), ("big-pickle", true), ("빅 피클", true)], targets: &[(OpenCode, "opencode/big-pickle")] },
 ];
 
 /// 이 이름 뒤에 오면 "이 모델로 해 달라"는 뜻으로 본다.
@@ -344,7 +348,20 @@ pub fn strip_directives(text: &str) -> String {
 mod tests {
     use super::*;
 
-    const ALL: &[EngineId] = &[Claude, Codex, Antigravity, ClaudeApi, OpenAi, GeminiApi, Nvidia];
+    const ALL: &[EngineId] = &[Claude, Codex, Antigravity, OpenCode, ClaudeApi, OpenAi, GeminiApi, Nvidia];
+
+    #[test]
+    fn opencode_is_asked_by_name_and_only_gets_free_models() {
+        assert_eq!(one("opencode로 답해 줘", ALL), Some((OpenCode, None)));
+        assert_eq!(one("오픈코드를 사용해서 정리해", ALL), Some((OpenCode, None)));
+        assert_eq!(one("glm으로 답해", ALL), Some((OpenCode, Some("opencode/glm-5.3-flash-free".into()))));
+        assert_eq!(one("딥시크로 답해", &[OpenCode]), Some((OpenCode, Some("opencode/deepseek-v4.1-flash-free".into()))));
+        for f in FAMILIES {
+            for (e, m) in f.targets {
+                assert!(*e != OpenCode || m.is_empty() || crate::engines::is_free_model(m), "{}", f.name);
+            }
+        }
+    }
 
     fn one(text: &str, installed: &[EngineId]) -> Option<(EngineId, Option<String>)> {
         let w = requested_models(text, installed, false);

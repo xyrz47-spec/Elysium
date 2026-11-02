@@ -2,11 +2,11 @@ import { useCallback, useEffect, useRef, useState, type CSSProperties } from "re
 import { listen } from "@tauri-apps/api/event";
 import ParticleOrb, { type OrbMode } from "../../src/components/ParticleOrb";
 import Segmented from "../../src/components/Segmented";
-import { ENGINE_LABEL, type EngineId } from "../../src/lib/api";
+import { ENGINE_LABEL, formatSize, stripFileMarkers, toBase64, type EngineId } from "../../src/lib/api";
 import Markdown from "./Markdown";
 import ConfirmDialog from "../../src/components/ConfirmDialog";
 import { ask } from "../../src/lib/confirm";
-import { deviceName, errorText, remote, type Approval, type Connection, type Conversation, type EngineInfo, type Message, type PcInfo } from "./remote";
+import { deviceName, errorText, remote, type Approval, type Attachment, type Connection, type Conversation, type EngineInfo, type Message, type PcInfo } from "./remote";
 
 interface Live {
   taskId: string;
@@ -104,14 +104,63 @@ function ago(iso: string): string {
 
 const engineLabel = (id: string | undefined | null) => (id ? (ENGINE_LABEL[id as EngineId] ?? id) : "");
 
-function Exchange({ ask, answer }: { ask: Message; answer?: Message }) {
+/** 폰에서 첨부 보기: 이미지·글은 눌러서 펼치고, 그 밖의 파일은 PC에서 연다 */
+function AttachmentItem({ a, toast }: { a: Attachment; toast: (t: string, k?: Toast["kind"]) => void }) {
+  const [state, setState] = useState<{ image?: string; text?: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+  async function toggle() {
+    if (state) return setState(null);
+    if (a.kind !== "image" && a.kind !== "text") return toast("이 파일은 PC에서 열 수 있습니다.");
+    setBusy(true);
+    try {
+      const r = await remote.attachment(a.id);
+      if (!r.dataBase64) return toast("파일이 너무 커서 모바일에서 미리 볼 수 없으며 PC에서 열 수 있습니다.");
+      const bytes = Uint8Array.from(atob(r.dataBase64), (c) => c.charCodeAt(0));
+      setState(a.kind === "image" ? { image: `data:${a.mime};base64,${r.dataBase64}` } : { text: new TextDecoder().decode(bytes) });
+    } catch (e) {
+      toast(errorText(e), "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="file">
+      <button className="file-chip" onClick={toggle} disabled={busy} aria-expanded={!!state}>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+          <path d="m21 11-9.2 9.2a5.5 5.5 0 0 1-7.8-7.8l9.2-9.2a3.7 3.7 0 0 1 5.2 5.2l-9.2 9.2a1.8 1.8 0 0 1-2.6-2.6l8.5-8.5" />
+        </svg>
+        <b>{a.name}</b>
+        <span>{formatSize(a.size)}</span>
+      </button>
+      {state?.image && <img className="file-image" src={state.image} alt={a.name} />}
+      {state?.text !== undefined && <pre className="file-text">{state.text}</pre>}
+    </div>
+  );
+}
+
+function Files({ items, toast }: { items?: Attachment[]; toast: (t: string, k?: Toast["kind"]) => void }) {
+  if (!items?.length) return null;
+  return (
+    <div className="files">
+      {items.map((a) => (
+        <AttachmentItem key={a.id} a={a} toast={toast} />
+      ))}
+    </div>
+  );
+}
+
+function Exchange({ ask, answer, toast }: { ask: Message; answer?: Message; toast: (t: string, k?: Toast["kind"]) => void }) {
   const d = answer?.data;
   return (
     <article className="ex">
-      <div className="ex-ask">{ask.content}</div>
+      <div className="ex-ask">
+        {ask.content}
+        <Files items={ask.data?.attachments} toast={toast} />
+      </div>
       {answer && (
         <div className="ex-answer">
           <Markdown text={answer.content} />
+          <Files items={d?.attachments} toast={toast} />
           {(d?.draftedBy || d?.reviewedBy) && (
             <div className="ex-by">
               {engineLabel(d?.draftedBy)}
@@ -149,6 +198,9 @@ export default function App() {
   const [engine, setEngine] = useState("auto");
   const [work, setWork] = useState(false);
   const [sending, setSending] = useState(false);
+  const [files, setFiles] = useState<Attachment[]>([]);
+  const [uploading, setUploading] = useState(0);
+  const picker = useRef<HTMLInputElement>(null);
   const cidRef = useRef(cid);
   cidRef.current = cid;
   const scroller = useRef<HTMLDivElement>(null);
@@ -249,13 +301,34 @@ export default function App() {
   const current = convs.find((c) => c.id === cid);
   const orb: OrbMode = !online ? "off" : approvals.length ? "approval" : Object.keys(live).length ? "thinking" : "idle";
 
+  async function upload(list: FileList | null) {
+    const picked = Array.from(list ?? []);
+    if (picker.current) picker.current.value = "";
+    for (const f of picked) {
+      if (f.size > 50 * 1024 * 1024) {
+        toast("{name} 파일이 50MB를 초과하여 첨부할 수 없습니다.".replace("{name}", f.name), "error");
+        continue;
+      }
+      setUploading((n) => n + 1);
+      try {
+        const a = await remote.upload(f.name, toBase64(await f.arrayBuffer()));
+        setFiles((cur) => [...cur, a]);
+      } catch (e) {
+        toast(errorText(e), "error");
+      } finally {
+        setUploading((n) => n - 1);
+      }
+    }
+  }
+
   async function send() {
     const t = text.trim();
-    if (!t || sending) return;
+    if ((!t && files.length === 0) || sending || uploading > 0) return;
     setSending(true);
     try {
-      const r = await remote.send(cid, t, engine, work);
+      const r = await remote.send(cid, t, engine, work, files.map((f) => f.id));
       setText("");
+      setFiles([]);
       setLive((m) => ({ ...m, [r.taskId]: m[r.taskId] ?? { taskId: r.taskId, conversationId: r.conversationId, work, phase: null, label: null, text: "", activity: null } }));
       if (r.conversationId !== cid) setCid(r.conversationId);
       else loadMessages(cid);
@@ -298,7 +371,7 @@ export default function App() {
           </div>
         )}
         {pair(messages).map((x) => (
-          <Exchange key={x.ask.id} ask={x.ask} answer={x.answer} />
+          <Exchange key={x.ask.id} ask={x.ask} answer={x.answer} toast={toast} />
         ))}
         {mine.map((l) => (
           <article key={l.taskId} className="ex live">
@@ -306,7 +379,7 @@ export default function App() {
               <div className="live-head">
                 <i className="spark" /> {l.label ? `${l.label} ${l.phase === "review" ? "검토 중" : l.phase === "judge" ? "토론을 판정하는 중" : "쓰는 중"}` : (l.activity ?? "JEV가 판단하는 중")}
               </div>
-              {l.text ? <Markdown text={l.text} /> : <div className="live-act">{l.activity ?? "준비 중"}</div>}
+              {l.text ? <Markdown text={stripFileMarkers(l.text)} /> : <div className="live-act">{l.activity ?? "준비 중"}</div>}
               <button className="stop" onClick={() => remote.cancel(l.taskId).catch((e) => toast(errorText(e), "error"))}>
                 중지
               </button>
@@ -335,8 +408,38 @@ export default function App() {
       </main>
 
       <footer className={`composer ${work ? "work" : ""}`}>
+        {(files.length > 0 || uploading > 0) && (
+          <div className="draft-files">
+            {files.map((f) => (
+              <span key={f.id} className="draft-file">
+                <b>{f.name}</b>
+                <button
+                  aria-label={"첨부 파일 삭제"}
+                  onClick={() => {
+                    setFiles((cur) => cur.filter((x) => x.id !== f.id));
+                    remote.discard(f.id).catch(() => {});
+                  }}
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+            {uploading > 0 && <span className="draft-file busy">{"파일 업로드 중..."}</span>}
+          </div>
+        )}
+        <input ref={picker} type="file" multiple hidden onChange={(e) => upload(e.target.files)} />
         <textarea value={text} onChange={(e) => setText(e.target.value)} placeholder={online ? "PC의 엘리시움에게 물어보세요" : "PC와 다시 연결하는 중"} rows={1} disabled={!online} />
         <div className="bar">
+          <button
+            className="icon-btn attach"
+            disabled={!online}
+            aria-label={"파일 첨부"}
+            onClick={() => picker.current?.click()}
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+              <path d="m21 11-9.2 9.2a5.5 5.5 0 0 1-7.8-7.8l9.2-9.2a3.7 3.7 0 0 1 5.2 5.2l-9.2 9.2a1.8 1.8 0 0 1-2.6-2.6l8.5-8.5" />
+            </svg>
+          </button>
           <select value={engine} onChange={(e) => setEngine(e.target.value)} aria-label="AI 고르기">
             <option value="auto">자동</option>
             {engines.map((e) => (
@@ -355,7 +458,7 @@ export default function App() {
             ]}
             onChange={(v) => setWork(v === "work")}
           />
-          <button className="send" aria-label="보내기" disabled={!text.trim() || sending || !online} onClick={send}>
+          <button className="send" aria-label="보내기" disabled={(!text.trim() && files.length === 0) || sending || uploading > 0 || !online} onClick={send}>
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden>
               <path d="M12 19V5M6 11l6-6 6 6" />
             </svg>

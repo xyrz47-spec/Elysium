@@ -562,8 +562,8 @@ input[type="text"].rail-search { height: 36px; margin-top: 10px; }
 .tool-engines span { color: var(--dim); text-align: right; }
 .tool-mem { max-height: 240px; overflow-y: auto; white-space: pre-wrap; font-size: 12.5px; line-height: 1.6; padding: 10px; border-radius: 12px; background: var(--surface-2); }
 .tool-jump { justify-content: space-between; }
-.tool-outline, .tool-hits, .tool-snips { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
-.tool-outline li, .tool-snips li { animation: rise 0.35s var(--ease) backwards; animation-delay: calc(var(--i, 0) * 25ms); }
+.tool-outline, .tool-hits { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+.tool-outline li { animation: rise 0.35s var(--ease) backwards; animation-delay: calc(var(--i, 0) * 25ms); }
 .tool-outline button, .tool-hits button { width: 100%; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 10px; align-items: baseline; text-align: left; padding: 8px 10px; border: 0; border-radius: 12px; background: transparent; transition: background 0.2s; }
 .tool-outline button:hover, .tool-hits button:hover, .tool-outline button:focus-visible, .tool-hits button:focus-visible { background: var(--surface); }
 .tool-num { grid-row: span 2; width: 22px; height: 22px; display: grid; place-items: center; border-radius: 50%; background: rgba(var(--accent-rgb), 0.14); color: var(--accent-ink); font-size: 11.5px; font-weight: 800; font-variant-numeric: tabular-nums; }
@@ -576,17 +576,6 @@ input[type="text"].rail-search { height: 36px; margin-top: 10px; }
 .tool-search { display: flex; align-items: center; gap: 8px; padding: 0 10px; height: 38px; border-radius: 12px; border: 1px solid var(--line-2); background: var(--surface); color: var(--dim); }
 .tool-search:focus-within { border-color: var(--accent); }
 .tool-search input { flex: 1; min-width: 0; border: 0; outline: none; background: transparent; font-size: 13.5px; color: var(--ink); }
-.tool-snips li { display: flex; align-items: stretch; gap: 4px; }
-.tool-snip-use { flex: 1; min-width: 0; display: grid; gap: 2px; text-align: left; padding: 8px 10px; border-radius: 12px; border: 1px solid var(--line); background: var(--surface); transition: border-color 0.2s, transform 0.2s var(--spring); }
-.tool-snip-use:hover { border-color: rgba(var(--accent-rgb), 0.5); }
-.tool-snip-use:active { transform: scale(0.98); }
-.tool-snip-use b { font-size: 13px; }
-.tool-snip-use span { font-size: 12px; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tool-x { border: 0; background: transparent; color: var(--dim); padding: 0 6px; border-radius: 8px; }
-.tool-x:hover { color: var(--err); }
-.tool-add { display: grid; gap: 6px; padding-top: 10px; border-top: 1px solid var(--line); }
-.tool-add input, .tool-add textarea { width: 100%; padding: 8px 10px; border-radius: 10px; border: 1px solid var(--line-2); background: var(--surface); font-size: 13px; resize: vertical; }
-.tool-add .btn { justify-self: start; }
 .btn.wide { width: 100%; justify-content: center; }
 .tool-keys { margin: 0; display: grid; gap: 2px; }
 .tool-keys div { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 7px 4px; border-bottom: 1px solid var(--line); font-size: 13px; }
@@ -953,7 +942,7 @@ body { background-color: var(--bg); background-image: var(--grain), var(--vignet
 .dock::after, .composer::after, .head-folder::after { display: none; }
 
 /* 호버: 위치·크기는 그대로, 바탕과 글자만 바뀐다 */
-.btn, .pill, .head-folder, .council-btn, .send, .build-btn, .new-session, .dock-btn, .session, .engine, .item, .welcome-cards button, .card, .seg button, .tool-snip-use, .theme-btn svg { transition: background-color 0.16s ease, color 0.16s ease, border-color 0.16s ease, box-shadow 0.2s ease, opacity 0.16s ease, transform 0.22s var(--ease); }
+.btn, .pill, .head-folder, .council-btn, .send, .build-btn, .new-session, .dock-btn, .session, .engine, .item, .welcome-cards button, .card, .seg button, .theme-btn svg { transition: background-color 0.16s ease, color 0.16s ease, border-color 0.16s ease, box-shadow 0.2s ease, opacity 0.16s ease, transform 0.22s var(--ease); }
 .btn:hover:not(:disabled), .pill:hover, .head-folder:hover, .council-btn:hover:not(:disabled), .send:hover:not(:disabled), .build-btn:hover:not(:disabled), .new-session:hover, .dock-btn:hover, .dock-btn.primary:hover, .engine:hover, .item:hover, .welcome-cards button:hover, .theme-btn:hover svg, .session-del:hover { transform: none; }
 .btn:hover:not(:disabled), .council-btn:hover:not(:disabled), .pill:hover { border-color: var(--line-2); box-shadow: none; color: var(--ink); }
 .card:hover, .item:hover, .session:hover { box-shadow: none; }
@@ -1097,3 +1086,61 @@ body { background-image: var(--vignette), var(--horizon), var(--sky); background
 :root[data-theme="light"] .dock-logo.busy img { animation-name: spin-logo-light; }
 @keyframes spin-logo-light { to { transform: scale(1.02) rotate(360deg); } }
 :root[data-theme="light"] .panel-brand img { transform: none; }
+
+/* 모델 메뉴: 입력창 밖(.composer-wrap)에 두고 첫 캡슐과 왼쪽을 맞춘다. 입력창 위로 뜬다. */
+.composer-wrap > .menu { bottom: calc(100% + 4px); left: 18px; }
+
+/* 곁질문 탭: 대화와 별개인 짧은 문답 */
+.tool-body.side { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; overflow: hidden; }
+.side-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding: 2px 2px 8px; }
+.side-q { align-self: flex-end; max-width: 88%; padding: 7px 11px; border-radius: 14px 14px 4px 14px; background: var(--lg-ctl-hi); box-shadow: var(--lg-ctl-edge); font-size: 13px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.side-a { padding: 2px 4px; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+.side-by { font-size: 11px; color: var(--dim); margin-bottom: 2px; }
+.side-act { font-size: 12px; color: var(--dim); }
+.side-box { display: flex; align-items: flex-end; gap: 6px; padding: 8px 8px 8px 12px; border-radius: 14px; background: var(--lg-ctl); box-shadow: var(--lg-ctl-edge); }
+.side-box textarea { flex: 1; min-width: 0; resize: none; border: 0; outline: none; background: transparent; font-size: 13px; line-height: 1.5; }
+.side-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 28px; padding: 4px 4px 0; font-size: 11px; color: var(--dim); }
+
+/* 에이전트에게 말 걸기 */
+.agent-talk { display: flex; align-items: center; gap: 6px; margin-top: 8px; padding: 3px 4px 3px 10px; border-radius: 12px; background: var(--lg-ctl); box-shadow: var(--lg-ctl-edge); }
+.agent-talk input { flex: 1; min-width: 0; border: 0; outline: none; background: transparent; font-size: 12.5px; }
+.agent-sent { font-size: 12px; color: var(--muted); padding: 2px 0; overflow-wrap: anywhere; }
+
+/* 첨부 파일 */
+.attach-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; animation: rise 0.25s var(--ease) backwards; }
+.attach-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 260px; min-height: 28px; padding: 3px 4px 3px 9px; border: 1px solid var(--line-2); border-radius: 10px; background: var(--surface-2); color: var(--muted); font-size: 12px; }
+.attach-chip svg { flex: none; }
+.attach-name { overflow: hidden; color: var(--ink); text-overflow: ellipsis; white-space: nowrap; }
+.attach-chip em { flex: none; color: var(--dim); font-style: normal; font-variant-numeric: tabular-nums; }
+.attach-x { display: inline-flex; flex: none; align-items: center; justify-content: center; width: 22px; height: 22px; border: 0; border-radius: 7px; background: transparent; color: var(--dim); transition: background 0.15s, color 0.15s; }
+.attach-x:hover { background: var(--line-2); color: var(--ink); }
+.attach-btn { padding: 5px 9px; }
+.composer.dropping { box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.55), var(--shadow-lg); }
+
+.attach-list { margin-top: 10px; }
+.card-ask { flex-wrap: wrap; }
+.card-ask .attach-list { order: 3; flex: 1 0 100%; min-width: 0; margin: 8px 0 2px; }
+.attach-title { display: flex; align-items: center; gap: 6px; margin-bottom: 7px; color: var(--muted); font-size: 12px; }
+.attach-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(230px, 100%), 1fr)); gap: 8px; }
+.attach-card { position: relative; display: flex; align-items: stretch; min-width: 0; border: 1px solid var(--line-2); border-radius: 12px; background: var(--surface-2); overflow: hidden; animation: rise 0.3s var(--ease) calc(var(--i, 0) * 40ms) backwards; transition: border-color 0.2s, transform 0.2s var(--ease); }
+.attach-card:hover { border-color: var(--accent-2); transform: translateY(-1px); }
+.attach-open { display: flex; flex: 1; align-items: center; gap: 9px; min-width: 0; padding: 7px 8px; border: 0; background: transparent; color: inherit; text-align: left; }
+.attach-thumb { flex: none; width: 40px; height: 40px; border-radius: 8px; object-fit: cover; }
+.attach-thumb.empty { display: inline-flex; align-items: center; justify-content: center; background: var(--line-2); color: var(--muted); }
+.attach-meta { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.attach-meta b { overflow: hidden; color: var(--ink); font-size: 12.5px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.attach-meta small { color: var(--dim); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.attach-actions { display: flex; flex: none; align-items: center; gap: 2px; padding-right: 5px; }
+.attach-actions button { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border: 0; border-radius: 8px; background: transparent; color: var(--dim); transition: background 0.15s, color 0.15s; }
+.attach-actions button:hover { background: var(--line-2); color: var(--ink); }
+
+/* JEV 입력 추천 */
+.jev-suggest { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0 0 7px 12px; color: var(--muted); font-size: 12px; animation: rise 0.25s var(--ease) backwards; }
+.jev-suggest-tag { color: var(--dim); font-size: 11px; font-weight: 600; letter-spacing: 0.04em; }
+.jev-suggest button { min-height: 26px; padding: 2px 10px; border: 1px solid var(--line-2); border-radius: 999px; background: var(--surface-2); color: var(--ink); font-size: 12px; transition: border-color 0.2s, transform 0.2s var(--spring); }
+.jev-suggest button:hover { border-color: var(--accent-2); transform: translateY(-1px); }
+.jev-suggest button:active { transform: scale(0.96); }
+
+.opencode-model { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+.opencode-model select { max-width: 320px; }
+.opencode-model small { color: var(--dim); font-size: 11.5px; line-height: 1.45; }

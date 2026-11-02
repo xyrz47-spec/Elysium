@@ -165,6 +165,16 @@ fn base64(data: &[u8]) -> String {
     out
 }
 
+struct TreeGuard(Option<u32>);
+
+impl Drop for TreeGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            crate::engines::kill_tree_blocking(pid);
+        }
+    }
+}
+
 async fn powershell(root: &Path, command: &str, secs: u64) -> Result<String, String> {
     // -EncodedCommand(UTF-16LE base64)로 넘겨 따옴표·줄바꿈이 섞인 명령도 그대로 전달한다.
     let script = format!("$ProgressPreference='SilentlyContinue'; [Console]::OutputEncoding=[System.Text.Encoding]::UTF8; {command}");
@@ -177,8 +187,13 @@ async fn powershell(root: &Path, command: &str, secs: u64) -> Result<String, Str
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let child = c.spawn().map_err(|e| format!("PowerShell을 실행할 수 없습니다: {e}"))?;
-    // 시간을 넘기면 future가 버려지며 kill_on_drop으로 프로세스가 끝난다.
-    match tokio::time::timeout(Duration::from_secs(secs), child.wait_with_output()).await {
+    // 시간을 넘기거나 강제 종료로 future가 버려지면 PowerShell이 띄운 자식까지 끝낸다.
+    let mut guard = TreeGuard(child.id());
+    let waited = tokio::time::timeout(Duration::from_secs(secs), child.wait_with_output()).await;
+    if waited.is_ok() {
+        guard.0 = None;
+    }
+    match waited {
         Ok(Ok(o)) => {
             let mut text = String::from_utf8_lossy(&o.stdout).to_string();
             let err = String::from_utf8_lossy(&o.stderr);
@@ -413,8 +428,8 @@ pub async fn run(http: &reqwest::Client, spec: &RunSpec, a: &Api, key: &str, mod
     base["tools"] = tools_for(a.wire);
     let mut msgs: Vec<Value> = match a.wire {
         // 첫 메시지는 대화 모드와 같은 조각으로: 같은 세션의 대화·작업 요청이 메모리 캐시를 함께 쓴다.
-        Wire::Anthropic => vec![json!({"role": "user", "content": apis::user_content(Wire::Anthropic, &spec.prompt)})],
-        Wire::OpenAiCompat => vec![json!({"role": "system", "content": system}), json!({"role": "user", "content": spec.prompt})],
+        Wire::Anthropic => vec![json!({"role": "user", "content": apis::add_files(a.wire, apis::user_content(Wire::Anthropic, &spec.prompt), spec.engine, &spec.attachments)})],
+        Wire::OpenAiCompat => vec![json!({"role": "system", "content": system}), json!({"role": "user", "content": apis::add_files(a.wire, json!(spec.prompt), spec.engine, &spec.attachments)})],
     };
     for _ in 0..MAX_TURNS {
         base["messages"] = Value::Array(cache_last(a.wire, &msgs));

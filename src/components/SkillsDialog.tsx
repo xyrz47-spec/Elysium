@@ -28,7 +28,6 @@ function SkillRow({ s, onToggle }: { s: Skill; onToggle: (v: boolean) => void })
           {s.mode === "work" && <span className="tag warn">작업 모드</span>}
         </div>
         <div className="item-desc">{s.description || "설명 없음"}</div>
-        {s.triggers.length > 0 && <div className="item-meta">자동 적용 낱말: {s.triggers.join(", ")}</div>}
       </div>
       <button className="btn sm ghost" onClick={() => api.openPath(`skill:${s.path}`).catch((e) => toast(errorText(e), "error"))} title="SKILL.md 열기">
         편집

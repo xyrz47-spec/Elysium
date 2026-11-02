@@ -1,8 +1,8 @@
 // PC의 엘리시움과 이야기하는 래퍼. 실제 통신은 Rust(지문 고정 TLS)가 하고, 토큰은 화면으로 오지 않는다.
 import { invoke } from "@tauri-apps/api/core";
-import type { Approval, Conversation, EngineInfo, Message, UsageSummary } from "../../src/lib/api";
+import type { Approval, Attachment, Conversation, EngineInfo, Message, UsageSummary } from "../../src/lib/api";
 
-export type { Approval, Conversation, EngineInfo, Message };
+export type { Approval, Attachment, Conversation, EngineInfo, Message };
 
 export interface Connection {
   pcName: string;
@@ -20,6 +20,7 @@ export interface PcInfo {
 
 const get = <T,>(path: string) => invoke<T>("call", { method: "GET", path, body: null });
 const post = <T,>(path: string, body: unknown = {}) => invoke<T>("call", { method: "POST", path, body });
+const del = <T,>(path: string) => invoke<T>("call", { method: "DELETE", path, body: null });
 
 export const remote = {
   connection: () => invoke<Connection | null>("connection"),
@@ -30,8 +31,11 @@ export const remote = {
   engines: () => get<EngineInfo[]>("/api/engines"),
   conversations: () => get<Conversation[]>("/api/conversations"),
   messages: (id: string) => get<Message[]>(`/api/conversations/${encodeURIComponent(id)}/messages`),
-  send: (conversationId: string | null, text: string, engine: string, work: boolean) =>
-    post<{ conversationId: string; taskId: string; userMessageId: string }>("/api/send", { conversationId, text, engine, work }),
+  send: (conversationId: string | null, text: string, engine: string, work: boolean, attachments: string[] = []) =>
+    post<{ conversationId: string; taskId: string; userMessageId: string }>("/api/send", { conversationId, text, engine, work, attachments }),
+  upload: (name: string, dataBase64: string) => post<Attachment>("/api/attachments", { name, dataBase64 }),
+  attachment: (id: string) => get<{ attachment: Attachment; dataBase64: string | null }>(`/api/attachments/${encodeURIComponent(id)}`),
+  discard: (id: string) => del<{ removed: boolean }>(`/api/attachments/${encodeURIComponent(id)}`),
   cancel: (taskId: string) => post<{ cancelled: boolean }>(`/api/tasks/${encodeURIComponent(taskId)}/cancel`),
   approvals: () => get<Approval[]>("/api/approvals"),
   decide: (id: string, approve: boolean) => post<Approval>(`/api/approvals/${encodeURIComponent(id)}`, { approve }),

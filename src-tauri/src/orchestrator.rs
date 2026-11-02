@@ -1,5 +1,6 @@
 //! 요청 하나를 처리하는 흐름: 스킬 고르기 → 엔진 고르기 → (작업 모드면 승인) → 초안 → (필요하면) 다른 AI가 검토 → 저장.
 
+use crate::attachments::{self, AttachedFile, Attachment};
 use crate::audit;
 use crate::db::{new_id, Db};
 use crate::jev;
@@ -11,7 +12,7 @@ use crate::skills::{self, Catalog, Skill};
 use crate::memory;
 use crate::store;
 use crate::teamwork;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -28,11 +29,35 @@ pub struct AppState {
     pub settings: RwLock<Settings>,
     pub engines: RwLock<Vec<EngineInfo>>,
     pub tasks: Mutex<HashMap<String, CancellationToken>>,
-    /// 실행 중인 에이전트 하나하나("작업 번호/실행 key" → 작업 토큰의 자식). 에이전트 탭에서 하나만 멈출 수 있다.
-    pub agents: Mutex<HashMap<String, CancellationToken>>,
+    /// 실행 중인 에이전트 하나하나("작업 번호/실행 key"). 에이전트 탭에서 하나만 멈추거나 말을 걸 수 있다.
+    pub agents: Mutex<HashMap<String, AgentLine>>,
     /// 작업 중 메시지 칸(작업 번호 → 칸). 작업이 끝나면 지운다.
     pub steers: Mutex<HashMap<String, Steer>>,
     pub approvals: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+}
+
+/// 실행 중인 에이전트로 가는 선.
+pub struct AgentLine {
+    /// 이 에이전트 전체를 멈춘다(작업 토큰의 자식)
+    stop: CancellationToken,
+    /// 지금 차례만 끊는다(stop의 자식). 말을 걸면 끊고 메시지를 반영해 이어 간다.
+    turn: CancellationToken,
+    inbox: Vec<String>,
+    steer: Option<Steer>,
+}
+
+impl AgentLine {
+    /// 차례 중간에 읽을 수 있는 엔진(API 작업 모드)은 칸에 넣고, 나머지는 지금 차례를 끊는다.
+    fn deliver(&mut self, text: String) {
+        if let Some(s) = &self.steer {
+            if let Some(v) = s.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+                v.push(text);
+                return;
+            }
+        }
+        self.inbox.push(text);
+        self.turn.cancel();
+    }
 }
 
 impl AppState {
@@ -99,6 +124,8 @@ pub struct Plan {
     pub council: Option<Council>,
     /// 동시 에이전트를 정하며 남긴 이유(회의로 바뀌면 지운다)
     pub team_reasons: Vec<String>,
+    /// OpenCode에 줄 무료 모델(요청·설정·첨부·민감도·JEV 판단으로 정한다)
+    pub free_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -138,7 +165,7 @@ pub struct Debate {
 }
 
 /// JEV 판단 결과(요청 종류·난이도)
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Judgment {
     pub model: String,
@@ -157,6 +184,26 @@ pub struct Judgment {
     /// 이 PC의 파일·프로젝트를 열어 봐야 할 확률(0~1)
     #[serde(default)]
     pub local: Option<f64>,
+    /// 켜진 스킬 중 가장 맞는 스킬 id와, 그 스킬이 이 요청을 위한 것일 확률
+    pub skill: Option<String>,
+    pub skill_fit: Option<f64>,
+    /// 가장 알맞은 AI(엔진 id)와 확신도
+    pub engine: Option<String>,
+    pub engine_confidence: Option<f64>,
+    /// 작업을 나눌 독립 부분의 수와, 나누지 않는 편이 낫다고 본 확률
+    pub parts: Option<u8>,
+    pub parts_single: Option<f64>,
+    /// 요청·첨부에 비밀번호·개인 정보 같은 민감한 내용이 있을 확률(0~1)
+    #[serde(default)]
+    pub sensitive: Option<f64>,
+    /// 파일을 고치는 작업의 위험도(0~3)
+    #[serde(default)]
+    pub risk: Option<f64>,
+    /// OpenCode 무료 모델 중 가장 알맞은 모델과 확신도
+    #[serde(default)]
+    pub free_model: Option<String>,
+    #[serde(default)]
+    pub free_model_confidence: Option<f64>,
     pub ms: u64,
     pub cost_usd: f64,
 }
@@ -171,6 +218,30 @@ const JEV_TOOLS: f64 = 0.6;
 const JEV_AGREE: f64 = 0.8;
 /// 초안이 이미 완성됐을 확률이 이 이상이면 검토를 건너뛴다.
 const JEV_DRAFT_OK: f64 = 0.85;
+/// 스킬이 이 요청을 위한 것일 확률이 이 이상이면 적용한다. 실측(2026-11-01, 샘플 18개): 맞는 요청 0.80 이상, 스킬이 필요 없는 요청 0.30 이하.
+const JEV_SKILL_FIT: f64 = 0.6;
+/// 나누지 않는 편이 낫다고 본 확률이 이 이하일 때만 병렬로 돈다(병렬은 사본·통합 비용이 든다). 실측: 나눌 요청 0.04 이하, 아닌 요청 0.70 이상.
+const JEV_SPLIT_MAX_SINGLE: f64 = 0.3;
+/// 완성 확률이 이 값 아래면 검토 계획이 없어도 다른 AI에게 검토를 맡긴다. 실측(2026-11-02): 맞는 답 0.84 이상, 틀린 답 0.30, 답을 못 한 경우 0.00.
+const JEV_ESCALATE: f64 = 0.4;
+/// 검토 답이 초안보다 나쁠 확률이 이 이상이면 초안을 쓴다.
+const JEV_KEEP_DRAFT: f64 = 0.75;
+/// 작업이 끝나지 않았을 확률이 이 이상이면 같은 AI에게 한 차례 더 맡긴다. 실측: 끝난 보고 0.51, 남은 일을 적은 보고 1.00, 사용자에게 되묻는 보고 0.01.
+const JEV_UNFINISHED: f64 = 0.7;
+/// 오류가 일시적일 확률이 이 이상이면 같은 AI로 한 번 더 시도한다. 실측: 429·503·연결 끊김 0.98 이상, 키·로그인·한도 소진·없는 모델 0.16 이하.
+const JEV_RETRY: f64 = 0.6;
+/// 바뀐 파일이 사용자에게 건넬 결과물일 확률이 이 이상이면 답에 붙인다.
+const JEV_DELIVERABLE: f64 = 0.7;
+/// 답에 자동으로 붙이는 파일 수와 JEV에게 보여 주는 후보 수
+const JEV_MAX_AUTO_ATTACH: usize = 5;
+const JEV_MAX_ATTACH_CANDIDATES: usize = 30;
+/// 민감한 내용일 확률이 이 이상이면 입력을 보관하지 않는 무료 모델만 쓴다.
+const JEV_SENSITIVE: f64 = 0.5;
+/// JEV에게 보여 주는 첨부 파일 앞부분 글자 수와, 다시 붙일지 물어보는 이전 첨부 수
+const JEV_FILE_CHARS: usize = 1500;
+const JEV_MAX_EARLIER: usize = 12;
+/// JEV에 보내는 스킬 설명 하나의 최대 글자 수
+const JEV_SKILL_CHARS: usize = 240;
 /// JEV에 보내는 답 하나의 최대 글자 수
 const JEV_ANSWER_CHARS: usize = 6000;
 
@@ -204,7 +275,54 @@ pub fn jev_questions() -> serde_json::Map<String, Value> {
         "needed": "Refers to the user's files, folder, project, repository, codebase, logs or documents that must be read to answer",
         "no": "Can be answered without reading any local file"
     }}));
+    q.insert("sensitive".into(), json!({"type": "noul", "instructions": "Does `request` (or `attachments`, if present) contain sensitive data: passwords, API keys or tokens, personal identity numbers, private contact details, medical or financial records, or confidential business information?"}));
     q
+}
+
+/// 판단용 파일 설명: 이름·종류·크기와 글 파일의 앞부분. 파일의 내용은 판단 자료일 뿐이다.
+fn file_brief(data_dir: &std::path::Path, a: &Attachment) -> Value {
+    json!({ "name": a.name, "kind": a.kind, "size_kb": a.size.div_ceil(1024), "excerpt": attachments::excerpt(&attachments::path_of(data_dir, a), &a.kind, JEV_FILE_CHARS) })
+}
+
+/// OpenCode 무료 모델을 고를 때 JEV에게 보여 주는 사실(문맥 크기·이미지·데이터 보관). 2026-11-02 models.dev·opencode.ai/docs/zen 확인.
+fn free_model_brief(m: &str) -> String {
+    let fact = match m {
+        "opencode/deepseek-v4.1-flash-free" => "DeepSeek V4.1 Flash: 200K context, reasons, reads images, prompts are not retained.",
+        "opencode/glm-5.3-flash-free" => "GLM-5.3 Flash: 200K context, reasons, reads images, prompts are not retained.",
+        "opencode/mimo-v2.6-flash-free" => "MiMo V2.6 Flash: 200K context, reasons, reads images; prompts may be used to improve the model.",
+        "opencode/nemotron-3.5-super-vl-free" => "Nemotron 3.5 Super VL: 1M context for very long input, reads images; use is logged by NVIDIA.",
+        "opencode/nemotron-3.5-lightning-free" => "Nemotron 3.5 Lightning: 262K context, built for speed, text only; use is logged by NVIDIA.",
+        "opencode/beam-free" => "Beam: 1M context for very long input, text only; prompts are kept 30 days but not used for training.",
+        "opencode/flint-40b-free" => "Flint 40B: 262K context, small open model, text only; prompts are kept 30 days and may be used to improve it.",
+        "opencode/big-pickle" => "Big Pickle: 200K context, reasons, text only; prompts may be used to improve the model.",
+        _ => "A free OpenCode model.",
+    };
+    fact.to_string()
+}
+
+/// OpenCode에 줄 무료 모델. 이미지가 있으면 이미지를 읽는 모델만, 민감한 요청이면 입력을 보관하지 않는 모델만 후보로 둔다.
+pub fn pick_free_model(models: &[String], setting: Option<&str>, jev: Option<&Judgment>, images: bool) -> Option<String> {
+    let sensitive = jev.and_then(|j| j.sensitive).is_some_and(|p| p >= JEV_SENSITIVE);
+    let fits = |m: &str| engines::is_free_model(m) && (!images || engines::OPENCODE_VISION.contains(&m)) && (!sensitive || engines::OPENCODE_ZERO_RETENTION.contains(&m));
+    if let Some(m) = setting.filter(|m| fits(m)) {
+        return Some(m.to_string());
+    }
+    // 이미지는 JEV가 모델을 고르지 않는다: 이름만으로는 실제로 이미지를 보는지 알 수 없다.
+    if let Some(m) = jev.filter(|j| !images && j.free_model_confidence.unwrap_or(0.0) >= JEV_MIN_CONFIDENCE).and_then(|j| j.free_model.as_deref()).filter(|m| fits(m) && models.iter().any(|x| x == m)) {
+        return Some(m.to_string());
+    }
+    if images && !sensitive && (models.is_empty() || models.iter().any(|x| x == engines::OPENCODE_IMAGE_FIRST)) {
+        return Some(engines::OPENCODE_IMAGE_FIRST.to_string());
+    }
+    if fits(engines::OPENCODE_DEFAULT) && (models.is_empty() || models.iter().any(|x| x == engines::OPENCODE_DEFAULT)) {
+        return Some(engines::OPENCODE_DEFAULT.to_string());
+    }
+    models.iter().find(|m| fits(m)).cloned().or_else(|| Some(engines::OPENCODE_DEFAULT.to_string()))
+}
+
+/// 답이 약할 때 검토를 맡길 AI: 초안을 쓴 회사가 아닌 가장 강한 AI. 초안보다 약하면 맡기지 않는다.
+fn stronger_reviewer(drafted_by: EngineId, installed: &[EngineId]) -> Option<EngineId> {
+    installed.iter().copied().filter(|e| e.vendor() != drafted_by.vendor() && strength(*e) >= strength(drafted_by)).max_by_key(|e| strength(*e))
 }
 
 fn cut(text: &str, n: usize) -> String {
@@ -245,6 +363,106 @@ pub async fn compare_answers(http: &reqwest::Client, key: &str, request: &str, a
     Ok(Consensus { agree, best, ms: r.latency_ms, cost_usd: r.response.usage.input_tokens as f64 * JEV_PRICE / 1e6 })
 }
 
+/// 검토 답이 초안보다 나빠졌을 확률. (확률, ms, 비용)
+pub async fn review_worse(http: &reqwest::Client, key: &str, request: &str, draft: &str, review: &str) -> Result<(f64, u64, f64), String> {
+    let state = json!({ "request": cut(request, memory::FILTER_REQUEST_CHARS), "draft": cut(draft, JEV_ANSWER_CHARS), "review": cut(review, JEV_ANSWER_CHARS) });
+    let mut q = serde_json::Map::new();
+    q.insert("verdict".into(), json!({"type": "choice", "instructions": "`review` is a reviewer's rewrite of `draft`, an answer to `request`. Compare them as answers to `request`.", "criteria": {
+        "better": "`review` is at least as correct and complete as `draft`, and fixes or keeps everything that matters",
+        "worse": "`review` lost correct content, added an error, or answers `request` less well than `draft`"
+    }}));
+    let r = jev::ask(http, key, "jev-latest", state, q, 1, Duration::from_secs(12)).await.map_err(|e| secrets::redact(&e.to_string()))?;
+    let p = jev::prob(&r.response.answers, "verdict", "worse").ok_or("JEV returned no verdict")?;
+    Ok((p, r.latency_ms, r.response.usage.input_tokens as f64 * JEV_PRICE / 1e6))
+}
+
+/// 파일을 고치는 작업의 마지막 보고를 보고 일이 끝나지 않았을 확률을 묻는다. 사용자에게 되묻는 경우는 이어 가지 않는다. (확률, ms, 비용)
+pub async fn work_unfinished(http: &reqwest::Client, key: &str, request: &str, report: &str) -> Result<(f64, u64, f64), String> {
+    let state = json!({ "request": cut(request, memory::FILTER_REQUEST_CHARS), "report": cut(report, JEV_ANSWER_CHARS) });
+    let mut q = serde_json::Map::new();
+    q.insert("status".into(), json!({"type": "choice", "instructions": "`report` is an AI agent's final report after working on `request` by editing files. What is the state of the work?", "criteria": {
+        "done": "Everything `request` asks for is reported as finished, including when some optional step was skipped with a clear reason",
+        "unfinished": "The agent stopped early: it says parts are still to do, left placeholders or TODOs, hit an error it did not resolve, or only described what it would do next",
+        "needs_user": "The agent cannot continue without a decision, credential or information only the user has, and asks for it"
+    }}));
+    let r = jev::ask(http, key, "jev-latest", state, q, 1, Duration::from_secs(12)).await.map_err(|e| secrets::redact(&e.to_string()))?;
+    let p = jev::prob(&r.response.answers, "status", "unfinished").ok_or("JEV returned no status")?;
+    Ok((p, r.latency_ms, r.response.usage.input_tokens as f64 * JEV_PRICE / 1e6))
+}
+
+/// 실패한 AI를 바로 다시 불러 볼 만한지(일시적인 오류일 확률). (확률, ms, 비용)
+pub async fn failure_transient(http: &reqwest::Client, key: &str, engine: &str, error: &str) -> Result<(f64, u64, f64), String> {
+    let state = json!({ "ai": engine, "error": cut(error, 800) });
+    let mut q = serde_json::Map::new();
+    q.insert("kind".into(), json!({"type": "choice", "instructions": "`error` is why a call to the AI named `ai` failed. Would the same call likely succeed if repeated a few seconds later?", "criteria": {
+        "transient": "Temporary: overload, rate limit that resets soon, network drop, timeout, stream cut, or a server error",
+        "permanent": "Will fail again: not logged in, bad key, used-up quota or credit, unknown model, invalid request, refusal, or missing software"
+    }}));
+    let r = jev::ask(http, key, "jev-latest", state, q, 1, Duration::from_secs(8)).await.map_err(|e| secrets::redact(&e.to_string()))?;
+    let p = jev::prob(&r.response.answers, "kind", "transient").ok_or("JEV returned no kind")?;
+    Ok((p, r.latency_ms, r.response.usage.input_tokens as f64 * JEV_PRICE / 1e6))
+}
+
+/// 앞선 차례의 첨부 파일 중 지금 요청에 필요한 것을 고른다. (위치들, ms, 비용)
+pub async fn pick_earlier_files(http: &reqwest::Client, key: &str, data_dir: &std::path::Path, text: &str, files: &[Attachment]) -> Result<(Vec<usize>, u64, f64), String> {
+    let mut list = serde_json::Map::new();
+    let mut q = serde_json::Map::new();
+    for (i, f) in files.iter().enumerate() {
+        let k = format!("f{i}");
+        list.insert(k.clone(), file_brief(data_dir, f));
+        q.insert(k.clone(), json!({"type": "choice", "instructions": format!("`files.{k}` was attached earlier in this chat session. Does the assistant need to open it to answer `request`?"), "criteria": {
+            "needed": "`request` refers to, continues work on, or depends on the content of this file",
+            "skip": "`request` is unrelated to this file"
+        }}));
+    }
+    let state = json!({ "request": cut(text, memory::FILTER_REQUEST_CHARS), "files": list });
+    let r = jev::ask(http, key, "jev-latest", state, q, 1, Duration::from_secs(12)).await.map_err(|e| secrets::redact(&e.to_string()))?;
+    let a = &r.response.answers;
+    let keep = (0..files.len()).filter(|i| jev::prob(a, &format!("f{i}"), "needed").unwrap_or(0.0) >= 0.5).collect();
+    Ok((keep, r.latency_ms, r.response.usage.input_tokens as f64 * JEV_PRICE / 1e6))
+}
+
+/// JEV 없이 앞선 첨부를 다시 붙이는 규칙: 요청이 파일 이름을 말할 때만.
+fn earlier_by_name(text: &str, files: &[Attachment]) -> Vec<usize> {
+    let low = text.to_lowercase();
+    (0..files.len()).filter(|i| low.contains(&files[*i].name.to_lowercase())).collect()
+}
+
+/// 입력창 추천: 보내기 전에 어떤 모드와 스킬이 맞는지.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Suggestion {
+    /// chat · work · build · council
+    pub mode: Option<String>,
+    pub mode_confidence: Option<f64>,
+    pub skill: Option<String>,
+    pub skill_fit: Option<f64>,
+    pub ms: u64,
+    pub cost_usd: f64,
+}
+
+pub async fn suggest(http: &reqwest::Client, key: &str, text: &str, skills: &[&Skill], has_files: bool) -> Result<Suggestion, String> {
+    let (mut state, mut q) = route_request(text, &RouteAsk { skills: skills.to_vec(), ..Default::default() });
+    state["has_attachments"] = json!(has_files);
+    q.insert("mode".into(), json!({"type": "choice", "instructions": "A user is typing `request` to an AI app that has several ways to run it. Which way fits best?", "criteria": {
+        "chat": "A question, explanation, advice or text answer: no file on disk needs to change",
+        "work": "Change, fix or refactor specific existing files or an existing project",
+        "build": "Create a whole new app, website, tool, script or project and finish it",
+        "council": "A hard open-ended decision or design question where several AIs arguing the trade-offs would clearly beat one answer"
+    }}));
+    let r = jev::ask(http, key, "jev-latest", state, q, 0, Duration::from_secs(6)).await.map_err(|e| secrets::redact(&e.to_string()))?;
+    let a = &r.response.answers;
+    let mode = jev::choice(a, "mode");
+    Ok(Suggestion {
+        mode: mode.as_ref().map(|m| m.0.clone()),
+        mode_confidence: mode.as_ref().map(|m| m.1),
+        skill: jev::choice(a, "skill").map(|c| c.0).or_else(|| (skills.len() == 1).then(|| skills[0].id.clone())),
+        skill_fit: jev::noul(a, "skill_fit"),
+        ms: r.latency_ms,
+        cost_usd: r.response.usage.input_tokens as f64 * JEV_PRICE / 1e6,
+    })
+}
+
 /// 초안이 이미 요청에 완전하고 정확하게 답했을 확률(검토를 건너뛸지 정한다). (확률, ms, 비용)
 pub async fn draft_ready(http: &reqwest::Client, key: &str, request: &str, draft: &str) -> Result<(f64, u64, f64), String> {
     let state = json!({ "request": cut(request, memory::FILTER_REQUEST_CHARS), "draft": cut(draft, JEV_ANSWER_CHARS) });
@@ -258,9 +476,97 @@ pub async fn draft_ready(http: &reqwest::Client, key: &str, request: &str, draft
     Ok((p, r.latency_ms, r.response.usage.input_tokens as f64 * JEV_PRICE / 1e6))
 }
 
+/// JEV에게 이번 요청에 대해 무엇을 물을지.
+#[derive(Default)]
+pub struct RouteAsk<'a> {
+    /// 요청 종류·난이도·정확도·도구 필요 여부
+    pub core: bool,
+    /// 지금 켜진 스킬(자동 적용 후보)
+    pub skills: Vec<&'a Skill>,
+    /// 고를 수 있는 AI
+    pub engines: Vec<EngineId>,
+    /// 몇 부분으로 나눌지(파일을 고치는 요청만)
+    pub parts: bool,
+    /// 이 요청에 붙은 파일 설명
+    pub files: Vec<Value>,
+    /// 고를 수 있는 OpenCode 무료 모델(이 요청에 OpenCode를 쓸 수 있을 때만)
+    pub free_models: Vec<String>,
+    /// 파일을 고치는 요청인지(위험도를 묻는다)
+    pub work: bool,
+}
+
+/// AI를 고를 때 JEV에게 보여 주는 설명: 무엇을 잘하는지, 파일·웹을 쓸 수 있는지, 비용.
+fn engine_brief(e: EngineId) -> &'static str {
+    match e {
+        EngineId::Claude => "Claude Code CLI: strongest at coding, multi-file edits and careful reasoning; can read and edit files and search the web. Most expensive and slower.",
+        EngineId::Codex => "Codex CLI: strong at coding and code edits; can read and edit files. Mid cost.",
+        EngineId::Antigravity => "Antigravity CLI (Gemini): good at research with web search and at reading files; can edit files. Mid cost.",
+        EngineId::OpenCode => "OpenCode CLI with free models only: costs nothing; can read and edit files and search the web. Weaker than paid AIs, so only for simple or moderate work.",
+        EngineId::ClaudeApi => "Claude API: careful writing and reasoning; no web access in chat. Mid to high cost.",
+        EngineId::OpenAi => "OpenAI API: general writing, reasoning and code answers; no web access in chat. Mid cost.",
+        EngineId::GeminiApi => "Gemini API: very fast and cheap; no file or web access in chat. Best for quick questions, translation and simple rewrites.",
+        EngineId::Nvidia => "NVIDIA API (open models): cheapest; no file or web access in chat. Only for simple questions and short rewrites.",
+    }
+}
+
+fn engine_criteria(engines: &[EngineId]) -> Value {
+    Value::Object(engines.iter().map(|e| (e.as_str().to_string(), Value::String(engine_brief(*e).to_string()))).collect())
+}
+
+/// 같은 상태에 대한 독립 질문이라 한 요청으로 묶는다(모델은 병렬로 판단한다). 선택지가 하나면 고를 것이 없으니 Choice를 묻지 않는다.
+fn route_request(text: &str, ask: &RouteAsk) -> (Value, serde_json::Map<String, Value>) {
+    let mut state = serde_json::Map::new();
+    state.insert("request".into(), Value::String(text.to_string()));
+    if !ask.files.is_empty() {
+        state.insert("attachments".into(), Value::Array(ask.files.clone()));
+    }
+    let mut q = if ask.core { jev_questions() } else { serde_json::Map::new() };
+    if ask.work {
+        q.insert("risk".into(), json!({"type": "score", "instructions": "An AI will carry out `request` by editing files and running commands on the user's computer. How much damage could a mistake do?", "criteria": [
+            "None: new files only, or easily undone edits",
+            "Low: ordinary code or text edits in a project",
+            "High: bulk changes, deleting or moving many files, or changing configuration, data or deployment",
+            "Critical: production systems, credentials, payments, or anything that cannot be undone"
+        ]}));
+    }
+    if ask.free_models.len() >= 2 {
+        let list: serde_json::Map<String, Value> = ask.free_models.iter().take(255).map(|m| (m.clone(), Value::String(free_model_brief(m)))).collect();
+        q.insert("free_model".into(), json!({"type": "choice", "instructions": "If OpenCode handles `request`, which of its free models fits best? Weigh input length, whether images are attached, and how private the content is.", "criteria": list}));
+    }
+    if !ask.skills.is_empty() {
+        // API 한도: Choice 선택지 255개
+        let list: serde_json::Map<String, Value> = ask.skills.iter().take(255).map(|s| (s.id.clone(), Value::String(if s.description.trim().is_empty() { s.name.clone() } else { cut(&s.description, JEV_SKILL_CHARS) }))).collect();
+        state.insert("skills".into(), Value::Object(list.clone()));
+        if list.len() >= 2 {
+            q.insert("skill".into(), json!({"type": "choice", "instructions": "Which skill in `skills` best matches what `request` asks the assistant to do?", "criteria": list}));
+        }
+        q.insert("skill_fit".into(), json!({"type": "noul", "instructions": "Is `request` a task that one of `skills` is specifically designed for, so that following that skill's procedure would clearly improve the result? Answer no for greetings, small talk, simple questions answerable in a sentence or two, and when the action asked for differs from what the skill does (for example, changing code is not reviewing it)."}));
+    }
+    if ask.engines.len() >= 2 {
+        q.insert("engine".into(), json!({"type": "choice", "instructions": "Which AI should handle `request` to get a good result at the lowest cost and time? Prefer the cheapest AI that can do it well.", "criteria": engine_criteria(&ask.engines)}));
+    }
+    if ask.parts {
+        q.insert("parts".into(), json!({"type": "choice", "instructions": "An AI will carry out `request` by editing files in a project. Into how many independent parts should the work be split to finish most efficiently? Splitting has overhead, so only split when the parts are clearly separate.", "criteria": {
+            "one": "One agent should do it: small, or a single coherent change where the parts depend on each other or touch the same files",
+            "two": "Exactly two substantial parts that can be done at the same time without seeing each other's results and touch different files",
+            "three": "Exactly three such independent parts",
+            "four": "Four or more such independent parts"
+        }}));
+    }
+    (Value::Object(state), q)
+}
+
 pub async fn judge(http: &reqwest::Client, key: &str, text: &str) -> Result<Judgment, String> {
-    let r = jev::ask(http, key, "jev-latest", json!({ "request": text }), jev_questions(), 1, Duration::from_secs(12)).await.map_err(|e| secrets::redact(&e.to_string()))?;
+    route(http, key, text, &RouteAsk { core: true, ..Default::default() }).await
+}
+
+pub async fn route(http: &reqwest::Client, key: &str, text: &str, ask: &RouteAsk<'_>) -> Result<Judgment, String> {
+    let (state, questions) = route_request(text, ask);
+    let r = jev::ask(http, key, "jev-latest", state, questions, 1, Duration::from_secs(12)).await.map_err(|e| secrets::redact(&e.to_string()))?;
     let a = &r.response.answers;
+    let picked = jev::choice(a, "engine");
+    let parts = jev::choice(a, "parts");
+    let only_skill = (ask.skills.len() == 1).then(|| ask.skills[0].id.clone());
     let task = jev::choice(a, "task");
     let diff = jev::score(a, "difficulty");
     let stakes = jev::score(a, "stakes");
@@ -274,6 +580,88 @@ pub async fn judge(http: &reqwest::Client, key: &str, text: &str) -> Result<Judg
         stakes_confidence: stakes.map(|s| s.1),
         fresh: jev::prob(a, "fresh", "needed"),
         local: jev::prob(a, "local", "needed"),
+        skill: jev::choice(a, "skill").map(|c| c.0).or(only_skill),
+        skill_fit: match a.get("skill_fit") {
+            Some(jev::Answer::Noul { noul }) => Some(*noul),
+            _ => None,
+        },
+        engine: picked.as_ref().map(|c| c.0.clone()),
+        engine_confidence: picked.as_ref().map(|c| c.1),
+        parts: parts.as_ref().map(|c| match c.0.as_str() {
+            "two" => 2,
+            "three" => 3,
+            "four" => 4,
+            _ => 1,
+        }),
+        parts_single: jev::prob(a, "parts", "one"),
+        sensitive: jev::noul(a, "sensitive"),
+        risk: jev::score(a, "risk").map(|x| x.0),
+        free_model: jev::choice(a, "free_model").map(|c| c.0),
+        free_model_confidence: jev::choice(a, "free_model").map(|c| c.1),
+        ms: r.latency_ms,
+        cost_usd: r.response.usage.input_tokens as f64 * JEV_PRICE / 1e6,
+    })
+}
+
+/// JEV가 고른 스킬: 켜져 있고 이 요청을 위한 것일 때만.
+fn jev_skill<'a>(jev: Option<&Judgment>, catalog: &'a Catalog) -> Option<(&'a Skill, f64)> {
+    let j = jev?;
+    let fit = j.skill_fit.filter(|f| *f >= JEV_SKILL_FIT)?;
+    let id = j.skill.as_deref()?;
+    catalog.enabled_skills().find(|s| s.id == id).map(|s| (s, fit))
+}
+
+/// JEV가 고른 AI. 고를 수 없는 AI이거나 도구가 필요한데 도구 없는 API를 고른 경우, 어려운 요청에 약한 AI를 고른 경우는 따르지 않는다.
+fn jev_engine(jev: Option<&Judgment>, available: &[EngineId], tools_first: bool) -> Option<EngineId> {
+    let j = jev?;
+    let e = j.engine.as_deref().filter(|_| j.engine_confidence.unwrap_or(0.0) >= JEV_MIN_CONFIDENCE).and_then(EngineId::parse)?;
+    if !available.contains(&e) || (tools_first && e.is_api() && available.iter().any(|x| !x.is_api())) {
+        return None;
+    }
+    let hard = j.difficulty.filter(|_| j.difficulty_confidence.unwrap_or(0.0) >= JEV_MIN_CONFIDENCE).is_some_and(|d| d >= 2.0);
+    (!hard || strength(e) >= 4).then_some(e)
+}
+
+/// JEV가 본 작업 분할 수(나누지 않으면 None).
+fn jev_parts(jev: Option<&Judgment>) -> Option<u8> {
+    let j = jev?;
+    j.parts.filter(|n| *n >= 2 && j.parts_single.is_some_and(|p| p <= JEV_SPLIT_MAX_SINGLE))
+}
+
+/// 하위 작업별 JEV 배정 결과
+pub struct PartAssign {
+    pub engines: Vec<Option<EngineId>>,
+    pub tiers: Vec<Option<Budget>>,
+    pub ms: u64,
+    pub cost_usd: f64,
+}
+
+fn assign_request(parts: &[teamwork::Part], engines: &[EngineId]) -> (Value, serde_json::Map<String, Value>) {
+    let mut list = serde_json::Map::new();
+    let mut q = serde_json::Map::new();
+    for (i, part) in parts.iter().enumerate() {
+        list.insert(format!("p{i}"), json!({ "title": part.title, "task": cut(&part.task, memory::FILTER_REQUEST_CHARS), "files": part.files }));
+        if engines.len() >= 2 {
+            q.insert(format!("e{i}"), json!({"type": "choice", "instructions": format!("Which AI should carry out `parts.p{i}` by editing files, to get a good result at the lowest cost and time?"), "criteria": engine_criteria(engines)}));
+        }
+        q.insert(format!("d{i}"), json!({"type": "score", "instructions": format!("How much reasoning capability does `parts.p{i}` need?"), "criteria": [
+            "Trivial: rename, copy edit or one-line change",
+            "Simple change in one or two files following an existing pattern",
+            "Multi-file feature or refactor needing some design",
+            "Complex architecture, concurrency, security or algorithms"
+        ]}));
+    }
+    (json!({ "parts": list }), q)
+}
+
+/// 하위 작업마다 맡을 AI와 노력 단계를 JEV에게 묻는다. 파일을 고치는 일이라 가장 가벼운 단계로는 내리지 않는다.
+async fn assign_parts(http: &reqwest::Client, key: &str, parts: &[teamwork::Part], engines: &[EngineId]) -> Result<PartAssign, String> {
+    let (state, q) = assign_request(parts, engines);
+    let r = jev::ask(http, key, "jev-latest", state, q, 1, Duration::from_secs(12)).await.map_err(|e| secrets::redact(&e.to_string()))?;
+    let a = &r.response.answers;
+    Ok(PartAssign {
+        engines: (0..parts.len()).map(|i| jev::choice(a, &format!("e{i}")).filter(|c| c.1 >= JEV_MIN_CONFIDENCE).and_then(|c| EngineId::parse(&c.0)).filter(|e| engines.contains(e))).collect(),
+        tiers: (0..parts.len()).map(|i| jev::score(a, &format!("d{i}")).filter(|d| d.1 >= JEV_MIN_CONFIDENCE).and_then(|d| budget_for(if d.0 < 2.0 { "standard" } else { "deep" }))).collect(),
         ms: r.latency_ms,
         cost_usd: r.response.usage.input_tokens as f64 * JEV_PRICE / 1e6,
     })
@@ -332,6 +720,7 @@ fn strength(e: EngineId) -> u8 {
         EngineId::ClaudeApi => 6,
         EngineId::OpenAi | EngineId::Codex => 5,
         EngineId::GeminiApi | EngineId::Antigravity => 4,
+        EngineId::OpenCode => 3,
         EngineId::Nvidia => 2,
     }
 }
@@ -358,11 +747,11 @@ fn tier_label(t: &str) -> &'static str {
 fn order_for(kind: &str) -> Vec<EngineId> {
     use EngineId::*;
     match kind {
-        "code" => vec![Claude, Codex, Antigravity, ClaudeApi, OpenAi, GeminiApi, Nvidia],
-        "research" => vec![Antigravity, Claude, GeminiApi, ClaudeApi, OpenAi, Codex, Nvidia],
-        "chat" | "translate" => vec![GeminiApi, Nvidia, ClaudeApi, OpenAi, Claude, Antigravity, Codex],
-        "writing" | "analysis" => vec![Claude, ClaudeApi, Antigravity, GeminiApi, OpenAi, Codex, Nvidia],
-        _ => vec![Claude, Antigravity, Codex, ClaudeApi, GeminiApi, OpenAi, Nvidia],
+        "code" => vec![Claude, Codex, Antigravity, ClaudeApi, OpenAi, GeminiApi, OpenCode, Nvidia],
+        "research" => vec![Antigravity, Claude, GeminiApi, ClaudeApi, OpenAi, Codex, OpenCode, Nvidia],
+        "chat" | "translate" => vec![GeminiApi, Nvidia, ClaudeApi, OpenAi, OpenCode, Claude, Antigravity, Codex],
+        "writing" | "analysis" => vec![Claude, ClaudeApi, Antigravity, GeminiApi, OpenAi, Codex, OpenCode, Nvidia],
+        _ => vec![Claude, Antigravity, Codex, ClaudeApi, GeminiApi, OpenAi, OpenCode, Nvidia],
     }
 }
 
@@ -415,9 +804,9 @@ pub fn plan_with(text: &str, choice: Option<EngineId>, work_requested: bool, ins
             reasons.push(format!("/{} 스킬을 불렀습니다", s.name));
             (Some(s), if rest.is_empty() { s.description.clone() } else { rest.to_string() })
         }
-        None => match catalog.triggered(text) {
-            Some(s) => {
-                reasons.push(format!("요청에 맞는 '{}' 스킬을 자동으로 적용했습니다", s.name));
+        None => match jev_skill(jev, catalog) {
+            Some((s, fit)) => {
+                reasons.push(format!("JEV: {name} 스킬 적용 ({pct}%)", name = s.name, pct = (fit * 100.0).round() as u32));
                 (Some(s), text.trim().to_string())
             }
             None => (None, text.trim().to_string()),
@@ -502,6 +891,9 @@ pub fn plan_with(text: &str, choice: Option<EngineId>, work_requested: bool, ins
     } else if let Some(e) = skill_engine.filter(|e| usable(e)) {
         reasons.push(format!("스킬이 {}를 지정했습니다", e.label()));
         (e, available.iter().copied().filter(|x| *x != e).collect())
+    } else if let Some(e) = jev_engine(jev, &available, work || needs_tools) {
+        reasons.push(format!("JEV: {name} 선택 ({pct}%)", name = e.label(), pct = (jev.and_then(|j| j.engine_confidence).unwrap_or(0.0) * 100.0).round() as u32));
+        (e, available.iter().copied().filter(|x| *x != e).collect())
     } else {
         let p = available[0];
         reasons.push(format!("{} 요청이라 {}가 먼저 답합니다", kind_label(&kind), p.label()));
@@ -510,7 +902,10 @@ pub fn plan_with(text: &str, choice: Option<EngineId>, work_requested: bool, ins
 
     // 동시 에이전트: 요청 글의 모델 여럿 > 요청 글의 에이전트 수 > 설정의 기본 수
     let asked_agents = intent::requested_agents(text);
-    let want = if wanted.picks.len() >= 2 { wanted.picks.len() } else { asked_agents.unwrap_or(agents as usize) }.min(intent::MAX_AGENTS);
+    // agents 0: JEV가 정한다. 대화 답을 여럿 합치는 것은 효율이 나쁘므로 파일 작업을 나눌 수 있을 때만 병렬로 돈다.
+    let jev_split = if agents == 0 && work && choice.is_none() { jev_parts(jev) } else { None };
+    let setting = if agents == 0 { jev_split.unwrap_or(1) } else { agents };
+    let want = if wanted.picks.len() >= 2 { wanted.picks.len() } else { asked_agents.unwrap_or(setting as usize) }.min(intent::MAX_AGENTS);
     let team_from = reasons.len();
     let team = if want < 2 {
         None
@@ -551,7 +946,11 @@ pub fn plan_with(text: &str, choice: Option<EngineId>, work_requested: bool, ins
         let names = list.iter().map(|a| match &a.model { Some(m) => format!("{}({m})", a.engine.label()), None => a.engine.label().to_string() }).collect::<Vec<_>>().join(", ");
         let synth_label = synth.label();
         if asked_agents.is_none() && wanted.picks.len() < 2 {
-            reasons.push(format!("설정에 지정된 기본 실행 수에 따라 {n}개의 에이전트를 동시에 실행합니다."));
+            if jev_split.is_some() {
+                reasons.push(format!("JEV: {n}개 에이전트로 나눠 동시 진행"));
+            } else {
+                reasons.push(format!("설정에 지정된 기본 실행 수에 따라 {n}개의 에이전트를 동시에 실행합니다."));
+            }
         }
         if work {
             reasons.push(format!("작업을 하위 작업으로 나누어 {n}개의 에이전트({names})가 별도 복사본에서 동시 작업한 후, 변경 사항을 병합하여 {synth_label}이 최종 검증 및 요약을 진행합니다."));
@@ -663,7 +1062,7 @@ pub fn plan_with(text: &str, choice: Option<EngineId>, work_requested: bool, ins
             b.max_tokens
         ));
     }
-    Ok(Plan { primary, fallbacks, reviewer, skill, prompt, work, reasons, jev: jev.cloned(), budget, debate, models, team, council: None, team_reasons })
+    Ok(Plan { primary, fallbacks, reviewer, skill, prompt, work, reasons, jev: jev.cloned(), budget, debate, models, team, council: None, team_reasons, free_model: None })
 }
 
 pub fn system_prompt(work: bool, workspace: &str, skill: Option<&(SkillRef, String)>) -> String {
@@ -677,11 +1076,17 @@ pub fn system_prompt(work: bool, workspace: &str, skill: Option<&(SkillRef, Stri
     } else {
         s.push_str("대화 모드: 파일을 읽을 수는 있지만 고치거나 명령을 실행하지 마세요. 파일을 바꿔야 하면 바꿀 내용을 보여 주고 '만들기' 버튼으로 다시 요청하라고 안내하세요.\n");
     }
+    s.push_str(ATTACH_SYSTEM);
     if let Some((r, body)) = skill {
         s.push_str(&format!("\n[스킬: {}]\n{}\n", r.name, body));
     }
     s
 }
+
+/// 에이전트가 답에 파일을 붙이는 방법. attachments::extract가 답에서 표시를 떼어 첨부로 만든다.
+pub const ATTACH_SYSTEM: &str = "\n[파일 전달] 사용자에게 파일을 건네려면 답에 아래 표시를 한 줄씩 쓰세요. 표시는 화면에서 첨부 파일로 바뀌므로 표시나 이 방법을 답에서 설명하지 마세요. 요청한 결과물이 파일일 때만 쓰세요.\n\
+- 작업 폴더의 파일: [[attach: 작업 폴더 기준 경로]]\n\
+- 글 파일을 새로 만들어 건네기(파일을 고칠 수 없는 대화 모드에서도 됩니다):\n[[file: 파일이름.확장자]]\n내용\n[[/file]]\n";
 
 /// '만들기': 버튼 한 번으로 폴더 안에서 결과물을 끝까지 완성한다(작업 모드 지시 뒤에 붙는다).
 pub const BUILD_SYSTEM: &str = "\n[만들기] 사용자가 '만들기'를 눌러 이 작업 폴더 안에서 요청을 끝까지 완성해 달라고 했습니다. 파일을 만들고 고치는 것은 이미 허락받았습니다.\n\
@@ -875,7 +1280,8 @@ pub fn review_prompt(request: &str, draft: &str, evidence: &[String]) -> String 
     let mut s = format!(
         "아래 [요청]에 대해 다른 AI가 쓴 [초안]이 있습니다. 검토자로서 사실 오류, 빠진 내용, 모호하거나 실행할 수 없는 부분을 바로잡아 완성된 최종 답만 출력하세요.\n\
          - 초안이 이미 충분히 좋으면 거의 그대로 두세요. '초안을 고쳤습니다' 같은 검토 과정 설명은 쓰지 마세요.\n\
-         - 초안은 당신이 볼 수 없는 파일·검색·실행 결과에 근거했을 수 있습니다. 확인할 수 없다는 이유만으로 내용을 지우거나 '모름'으로 바꾸지 말고, 분명히 틀린 부분만 고치세요.\n\n[요청]\n{request}\n\n[초안]\n{draft}"
+         - 초안은 당신이 볼 수 없는 파일·검색·실행 결과에 근거했을 수 있습니다. 확인할 수 없다는 이유만으로 내용을 지우거나 '모름'으로 바꾸지 말고, 분명히 틀린 부분만 고치세요.\n\
+         - 초안의 [[attach: …]]·[[file: …]] 표시는 고치지 말고 그대로 두세요.\n\n[요청]\n{request}\n\n[초안]\n{draft}"
     );
     if !evidence.is_empty() {
         s.push_str("\n\n[초안을 쓴 AI가 확인한 자료]\n");
@@ -924,8 +1330,13 @@ pub fn decide_approval(app: &AppHandle, st: &AppState, approval_id: &str, approv
 /// build: '만들기' 버튼. 작업 모드로 돌고, 누른 것이 곧 허락이라 승인을 묻지 않는다.
 /// council: '회의' 버튼. 여러 AI가 서로 대화하며 푼다(대화 모드에서만).
 #[allow(clippy::too_many_arguments)]
-pub fn send(app: &AppHandle, st: &std::sync::Arc<AppState>, conversation_id: Option<String>, text: String, choice: Option<EngineId>, work: bool, build: bool, workspace: Option<String>, council: bool) -> Result<SendResult, String> {
+pub fn send(app: &AppHandle, st: &std::sync::Arc<AppState>, conversation_id: Option<String>, text: String, choice: Option<EngineId>, work: bool, build: bool, workspace: Option<String>, council: bool, attachment_ids: Vec<String>) -> Result<SendResult, String> {
+    if attachment_ids.len() > attachments::MAX_PER_MESSAGE {
+        return Err("메시지당 파일은 최대 10개까지 첨부할 수 있습니다.".to_string());
+    }
+    let files: Vec<Attachment> = attachment_ids.iter().map(|id| attachments::load(&st.data_dir, id).ok_or_else(|| "첨부 파일을 찾을 수 없으니 다시 첨부해 주세요.".to_string())).collect::<Result<_, _>>()?;
     let text = text.trim().to_string();
+    let text = if text.is_empty() && !files.is_empty() { "첨부된 파일을 확인해 주세요.".to_string() } else { text };
     if text.is_empty() {
         return Err("보낼 내용이 없습니다".into());
     }
@@ -944,20 +1355,201 @@ pub fn send(app: &AppHandle, st: &std::sync::Arc<AppState>, conversation_id: Opt
             store::create_conversation(&st.db, &text, workspace.as_deref()).map_err(|e| e.to_string())?
         }
     };
-    let user_message_id = store::insert_message(&st.db, &conv, "user", &text, Some(&json!({ "work": work, "build": build, "askedCouncil": council, "engine": choice.map(|c| c.as_str()) }))).map_err(|e| e.to_string())?;
+    let user_message_id = store::insert_message(&st.db, &conv, "user", &text, Some(&json!({ "work": work, "build": build, "askedCouncil": council, "engine": choice.map(|c| c.as_str()), "attachments": files }))).map_err(|e| e.to_string())?;
     let task_id = new_id();
     let cancel = CancellationToken::new();
     st.tasks.lock().unwrap_or_else(|p| p.into_inner()).insert(task_id.clone(), cancel.clone());
     st.steers.lock().unwrap_or_else(|p| p.into_inner()).insert(task_id.clone(), Steer::default());
     let (app2, st2, conv2, task2) = (app.clone(), st.clone(), conv.clone(), task_id.clone());
     tauri::async_runtime::spawn(async move {
-        run_task(&app2, &st2, &conv2, &task2, &text, choice, work, build, council, cancel).await;
+        let since = std::time::SystemTime::now() - Duration::from_secs(2);
+        run_task(&app2, &st2, &conv2, &task2, &text, choice, work, build, council, cancel.clone()).await;
+        if work && !cancel.is_cancelled() {
+            attach_deliverables(&app2, &st2, &conv2, &task2, &text, since).await;
+        }
         st2.tasks.lock().unwrap_or_else(|p| p.into_inner()).remove(&task2);
         st2.steers.lock().unwrap_or_else(|p| p.into_inner()).remove(&task2);
         emit(&app2, "task:done", json!({ "taskId": task2, "conversationId": conv2 }));
         refresh_memory(&app2, &st2, &conv2).await;
     });
     Ok(SendResult { conversation_id: conv, task_id, user_message_id })
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SideTurn {
+    pub role: String,
+    pub text: String,
+}
+
+/// 곁질문에 다시 보내는 앞선 곁질문 차례 수·글자 수, 진행 상황 글자 수
+const SIDE_TURNS: usize = 6;
+const SIDE_TURN_CHARS: usize = 700;
+const SIDE_PROGRESS_CHARS: usize = 4000;
+const SIDE_TIMEOUT: Duration = Duration::from_secs(300);
+
+const SIDE_SYSTEM: &str = "\n[곁질문] 사용자가 진행 중인 작업과 별개로 짧게 묻는 곁질문입니다. 이 문답은 대화 기록에 남지 않고 다른 AI에게도 전해지지 않습니다.\n\
+- 작업의 진행 상황이나 프로젝트에 대한 질문에 간결하게 답하세요. 프로젝트 내용은 필요할 때만 파일을 읽어 확인하세요.\n\
+- 파일을 고치거나 명령을 실행하지 말고, 진행 중인 작업을 이어받아 하지도 마세요.\n\
+- [지금 진행 상황]에 없는 것은 추측하지 말고 모른다고 말하세요.\n";
+
+fn side_prompt(question: &str, progress: Option<&str>, thread: &[SideTurn]) -> String {
+    let mut s = String::new();
+    match progress.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(p) => s.push_str(&format!("[지금 진행 상황]\n{}\n\n", cut(p, SIDE_PROGRESS_CHARS))),
+        None => s.push_str("[지금 진행 상황]\n이 세션에서 실행 중인 작업이 없습니다.\n\n"),
+    }
+    let recent = &thread[thread.len().saturating_sub(SIDE_TURNS)..];
+    if !recent.is_empty() {
+        s.push_str("[앞선 곁질문]\n");
+        for t in recent {
+            s.push_str(&format!("{}: {}\n", if t.role == "user" { "사용자" } else { "AI" }, cut(&t.text, SIDE_TURN_CHARS)));
+        }
+        s.push('\n');
+    }
+    s.push_str(&format!("[곁질문]\n{question}"));
+    s
+}
+
+/// 작업이 끝난 뒤 바뀐 파일 중 사용자에게 건넬 결과물(보고서·문서·이미지·내보낸 데이터 등)을 JEV가 골라 답에 붙인다.
+async fn attach_deliverables(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: &str, since: std::time::SystemTime) {
+    let s = st.settings();
+    let Some(key) = secrets::get(SecretName::TypeSafe).filter(|_| s.jev_enabled) else { return };
+    let Some(answer) = store::list_messages(&st.db, conv).ok().and_then(|m| m.into_iter().rev().find(|m| m.role == "assistant")) else { return };
+    let mut data = answer.data.clone().unwrap_or_else(|| json!({}));
+    if data.get("error").is_some() || data.get("rejected").is_some() {
+        return;
+    }
+    let workspace = store::get_workspace(&st.db, conv).ok().flatten().map(PathBuf::from).unwrap_or_else(|| s.workspace());
+    let mut have = attachments::of_data(Some(&data));
+    let files: Vec<PathBuf> = attachments::changed_since(&workspace, since, JEV_MAX_ATTACH_CANDIDATES).into_iter().filter(|p| std::fs::metadata(p).is_ok_and(|m| m.len() <= attachments::MAX_FILE_BYTES)).collect();
+    if files.is_empty() {
+        return;
+    }
+    let mut list = serde_json::Map::new();
+    let mut q = serde_json::Map::new();
+    for (i, f) in files.iter().enumerate() {
+        let k = format!("f{i}");
+        let rel = f.strip_prefix(&workspace).unwrap_or(f).to_string_lossy().replace('\\', "/");
+        let head = std::fs::read(f).ok().map(|b| attachments::classify(&rel, &b[..b.len().min(8192)]).0).unwrap_or("file");
+        list.insert(k.clone(), json!({ "path": rel, "kind": head, "size_kb": std::fs::metadata(f).map(|m| m.len().div_ceil(1024)).unwrap_or(0), "excerpt": attachments::excerpt(f, head, 300) }));
+        q.insert(k.clone(), json!({"type": "noul", "instructions": format!("An AI just carried out `request` and created or changed `files.{k}`. Is this file a finished result the user asked to receive, such as a report, document, image, spreadsheet, data export or installer? Answer no for source code, project configuration, lock files, logs, caches and anything edited only as part of building software.")}));
+    }
+    let state = json!({ "request": cut(text, memory::FILTER_REQUEST_CHARS), "summary": cut(&answer.content, 1500), "files": list });
+    let Ok(r) = jev::ask(&st.http, &key, "jev-latest", state, q, 1, Duration::from_secs(12)).await else { return };
+    let _ = store::record_usage(&st.db, &store::Usage { engine: "jev", role: "attach", ok: true, latency_ms: r.latency_ms, input_tokens: None, output_tokens: None, cost_usd: Some(r.response.usage.input_tokens as f64 * JEV_PRICE / 1e6) });
+    let a = &r.response.answers;
+    let mut picked: Vec<(f64, usize)> = (0..files.len()).filter_map(|i| jev::noul(a, &format!("f{i}")).filter(|p| *p >= JEV_DELIVERABLE).map(|p| (p, i))).collect();
+    picked.sort_by(|x, y| y.0.total_cmp(&x.0));
+    let mut added = 0;
+    for (_, i) in picked.into_iter().take(JEV_MAX_AUTO_ATTACH) {
+        let name = files[i].file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        if have.iter().any(|h| h.name == name) {
+            continue;
+        }
+        if let Ok(f) = attachments::add_path(&st.data_dir, &files[i], "agent") {
+            have.push(f);
+            added += 1;
+        }
+    }
+    if added > 0 {
+        if let Some(o) = data.as_object_mut() {
+            o.insert("attachments".into(), json!(have));
+        }
+        let _ = store::set_message_data(&st.db, &answer.id, &data);
+        emit(app, "message:created", json!({ "conversationId": conv, "messageId": answer.id, "taskId": task }));
+    }
+}
+
+/// 곁질문: messages·세션 메모리·CLI 세션을 읽기만 하고 쓰지 않으므로 대화에 영향을 주지 않는다. 사용량만 기록한다.
+#[allow(clippy::too_many_arguments)]
+pub fn side_ask(app: &AppHandle, st: &std::sync::Arc<AppState>, side_id: String, conversation_id: Option<String>, workspace: Option<String>, question: String, progress: Option<String>, thread: Vec<SideTurn>) -> Result<(), String> {
+    let question = question.trim().to_string();
+    if question.is_empty() {
+        return Err("보낼 내용이 없습니다".into());
+    }
+    let cancel = CancellationToken::new();
+    st.tasks.lock().unwrap_or_else(|p| p.into_inner()).insert(side_id.clone(), cancel.clone());
+    let (app2, st2) = (app.clone(), st.clone());
+    tauri::async_runtime::spawn(async move {
+        let (engine, o) = run_side(&app2, &st2, &side_id, conversation_id.as_deref(), workspace, &question, progress.as_deref(), &thread, &cancel).await;
+        st2.tasks.lock().unwrap_or_else(|p| p.into_inner()).remove(&side_id);
+        emit(&app2, "side:done", json!({ "sideId": side_id, "ok": o.ok && !o.text.trim().is_empty(), "text": o.text, "error": o.error, "engine": engine, "stopped": cancel.is_cancelled() }));
+    });
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_side(app: &AppHandle, st: &AppState, side_id: &str, conv: Option<&str>, workspace: Option<String>, question: &str, progress: Option<&str>, thread: &[SideTurn], cancel: &CancellationToken) -> (Option<EngineId>, Outcome) {
+    let s = st.settings();
+    let fail = |e: String| (None, Outcome { error: Some(e), ..Default::default() });
+    // JEV가 있으면 AI와 노력 단계를 고르게 한다(파일·웹이 필요한 질문은 도구 있는 CLI로).
+    let mut judgment = None;
+    if let Some(key) = secrets::get(SecretName::TypeSafe).filter(|_| s.jev_enabled) {
+        emit(app, "side:activity", json!({ "sideId": side_id, "text": "JEV가 요청을 판단하는 중" }));
+        if let Ok(j) = route(&st.http, &key, question, &RouteAsk { core: true, engines: st.installed(), ..Default::default() }).await {
+            let _ = store::record_usage(&st.db, &store::Usage { engine: "jev", role: "side", ok: true, latency_ms: j.ms, input_tokens: None, output_tokens: None, cost_usd: Some(j.cost_usd) });
+            judgment = Some(j);
+        }
+    }
+    let mut p = match plan_with(question, None, false, &st.installed(), &Catalog::default(), ReviewMode::Off, judgment.as_ref(), 1) {
+        Ok(p) => p,
+        Err(e) => return fail(e),
+    };
+    if p.budget.is_none() {
+        p.budget = budget_for("standard");
+    }
+    let stored = conv.and_then(|c| store::get_workspace(&st.db, c).ok().flatten());
+    let cwd = workspace.or(stored).map(PathBuf::from).unwrap_or_else(|| s.workspace());
+    let ws = cwd.to_string_lossy().to_string();
+    let msgs = conv.map(|c| store::list_messages(&st.db, c).unwrap_or_default()).unwrap_or_default();
+    let history = memory::turns(&msgs);
+    let (summary, upto) = conv.map(|c| store::get_memory(&st.db, c).unwrap_or((None, None))).unwrap_or((None, None));
+    // 곁질문도 지금 질문에 필요한 기억만 보낸다.
+    let mut selection = None;
+    if let Some(key) = secrets::get(SecretName::TypeSafe).filter(|_| s.jev_enabled) {
+        if let Ok(Some(f)) = filter_memory(&st.http, &key, question, summary.as_deref(), &history).await {
+            let _ = store::record_usage(&st.db, &store::Usage { engine: "jev", role: "memory", ok: true, latency_ms: f.ms, input_tokens: None, output_tokens: None, cost_usd: Some(f.cost_usd) });
+            selection = Some(f.selection);
+        }
+    }
+    let prompt = memory::context(summary.as_deref(), upto.as_deref(), &history, None, &side_prompt(&p.prompt, progress, thread), selection.as_ref());
+    let system = format!("{}{SIDE_SYSTEM}", system_prompt(false, &ws, None));
+    let mut last = (None, Outcome::default());
+    for engine in std::iter::once(p.primary).chain(p.fallbacks.iter().copied()) {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let spec = RunSpec {
+            engine,
+            prompt: prompt.clone(),
+            system: system.clone(),
+            cwd: cwd.clone(),
+            work: false,
+            resume: None,
+            plugin_dirs: vec![],
+            model: model_for(&p, engine, &s),
+            effort: spec_effort(&p),
+            max_tokens: p.budget.as_ref().map(|b| b.max_tokens),
+            extra_dirs: vec![],
+            steer: None,
+            attachments: vec![],
+        };
+        emit(app, "side:started", json!({ "sideId": side_id, "engine": engine, "label": engine.label() }));
+        let o = engines::run(&st.http, &spec, SIDE_TIMEOUT, cancel, |ev| match ev {
+            Event::Text(t) => emit(app, "side:delta", json!({ "sideId": side_id, "delta": t })),
+            Event::Activity(a) => emit(app, "side:activity", json!({ "sideId": side_id, "text": a })),
+            _ => {}
+        })
+        .await;
+        let _ = store::record_usage(&st.db, &store::Usage { engine: engine.as_str(), role: "side", ok: o.ok, latency_ms: o.latency_ms, input_tokens: o.input_tokens, output_tokens: o.output_tokens, cost_usd: o.cost_usd });
+        let good = o.ok && !o.text.trim().is_empty();
+        last = (Some(engine), o);
+        if good {
+            break;
+        }
+    }
+    audit::record(&st.db, "user", "side.asked", if last.1.ok { "ok" } else { "error" }, json!({ "engine": last.0 }));
+    last
 }
 
 /// 기본 작업 폴더 안의 새 프로젝트 폴더(project-20261030-143015). 같은 이름이 있으면 뒤에 수를 붙인다.
@@ -999,6 +1591,9 @@ fn model_for(p: &Plan, engine: EngineId, s: &Settings) -> Option<String> {
     if let Some((_, m)) = p.models.iter().find(|(e, _)| *e == engine) {
         return Some(m.clone());
     }
+    if engine == EngineId::OpenCode {
+        return p.free_model.clone().or_else(|| s.models.get(engine.as_str()).cloned());
+    }
     if engine == EngineId::Claude {
         p.budget.as_ref().and_then(|b| b.claude_model).map(str::to_string)
     } else {
@@ -1010,6 +1605,9 @@ fn model_for(p: &Plan, engine: EngineId, s: &Settings) -> Option<String> {
 fn spec_model(p: &Plan, engine: EngineId, s: &Settings) -> Option<String> {
     if let Some((_, m)) = p.models.iter().find(|(e, _)| *e == engine) {
         return Some(m.clone());
+    }
+    if engine == EngineId::OpenCode {
+        return Some(engines::opencode_model(p.free_model.as_deref().or(s.models.get(engine.as_str()).map(String::as_str))));
     }
     if engine == EngineId::Claude {
         p.budget.as_ref().and_then(|b| b.claude_model).map(str::to_string)
@@ -1048,6 +1646,10 @@ fn message_data(steps: &[Step], p: &Plan, extra: Value) -> Value {
 
 /// 에이전트 하나만 멈췄을 때 그 실행의 오류(같은 작업의 다른 에이전트는 계속 돈다)
 pub const AGENT_STOPPED: &str = "사용자에 의해 중지되었습니다.";
+/// 말을 건 뒤의 차례에 최소한 주는 시간
+const FOLLOW_UP_MIN: Duration = Duration::from_secs(120);
+/// 세션을 이어 쓸 수 없는 엔진에 다시 보내는 앞선 글의 최대 글자 수
+const FOLLOW_UP_PARTIAL: usize = 6000;
 
 fn agent_slot(task: &str, key: &str) -> String {
     format!("{task}/{key}")
@@ -1056,11 +1658,76 @@ fn agent_slot(task: &str, key: &str) -> String {
 /// 에이전트 하나만 멈춘다. 없거나 이미 끝났으면 false.
 pub fn cancel_agent(st: &AppState, task: &str, key: &str) -> bool {
     match st.agents.lock().unwrap_or_else(|p| p.into_inner()).get(&agent_slot(task, key)) {
-        Some(t) => {
-            t.cancel();
+        Some(l) => {
+            l.stop.cancel();
             true
         }
         None => false,
+    }
+}
+
+fn agent_said(app: &AppHandle, task: &str, key: &str, text: &str) {
+    emit(app, "task:agent-message", json!({ "taskId": task, "key": key, "text": text }));
+}
+
+/// 에이전트 하나에게 말을 건다. 없거나 이미 끝났으면 false.
+pub fn message_agent(app: &AppHandle, st: &AppState, task: &str, key: &str, text: &str) -> bool {
+    let delivered = match st.agents.lock().unwrap_or_else(|p| p.into_inner()).get_mut(&agent_slot(task, key)) {
+        Some(l) => {
+            l.deliver(text.to_string());
+            true
+        }
+        None => false,
+    };
+    if delivered {
+        agent_said(app, task, key, text);
+    }
+    delivered
+}
+
+/// 이 작업에서 지금 실행 중인 에이전트 모두에게 말을 건다. 받은 에이전트 수를 돌려준다.
+pub fn message_task(app: &AppHandle, st: &AppState, task: &str, text: &str) -> usize {
+    let prefix = format!("{task}/");
+    let keys: Vec<String> = {
+        let mut g = st.agents.lock().unwrap_or_else(|p| p.into_inner());
+        g.iter_mut()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(k, l)| {
+                l.deliver(text.to_string());
+                k[prefix.len()..].to_string()
+            })
+            .collect()
+    };
+    for k in &keys {
+        agent_said(app, task, k, text);
+    }
+    keys.len()
+}
+
+/// 말을 건 뒤의 다음 차례. 자기 세션을 이어 쓸 수 있으면 메시지만, 아니면 원래 요청과 지금까지 쓴 글을 함께 보낸다.
+fn follow_up(spec: &RunSpec, original: &str, o: &Outcome, msgs: &[String]) -> RunSpec {
+    let said = msgs.join("\n");
+    let mut next = spec.clone();
+    let session = o.session_id.clone().or_else(|| spec.resume.clone());
+    match session.filter(|_| spec.engine.resumable()) {
+        Some(s) => {
+            next.resume = Some(s);
+            next.prompt = format!("[사용자가 작업 중에 보낸 메시지]\n{said}\n\n이 메시지를 반영해 원래 요청을 이어서 끝내세요. 마지막에는 앞서 쓴 부분까지 포함한 완성된 답을 쓰세요.");
+        }
+        None => {
+            let n = o.text.chars().count();
+            let partial: String = o.text.chars().skip(n.saturating_sub(FOLLOW_UP_PARTIAL)).collect();
+            let files = if spec.work { " 앞선 시도에서 이미 고친 파일이 있을 수 있으니 폴더의 현재 상태를 확인하고 이어 가세요." } else { "" };
+            next.prompt = format!("{original}\n\n[중단되기 전까지 쓴 내용]\n{partial}\n\n[사용자가 작업 중에 보낸 메시지]\n{said}\n\n이 메시지를 반영해 요청을 끝까지 완성하세요.{files} 마지막에는 앞서 쓴 부분까지 포함한 완성된 답을 쓰세요.");
+        }
+    }
+    next
+}
+
+fn add_opt<T: std::ops::Add<Output = T> + Copy>(a: Option<T>, b: Option<T>) -> Option<T> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x + y),
+        (x, y) => x.or(y),
     }
 }
 
@@ -1083,21 +1750,71 @@ async fn run_engine_as(app: &AppHandle, st: &AppState, conv: &str, task: &str, m
     // 에이전트 하나만 멈출 수 있게 작업 토큰의 자식 토큰으로 돌린다(작업을 멈추면 같이 멈춘다).
     let own = cancel.child_token();
     let slot = agent_slot(task, key);
-    st.agents.lock().unwrap_or_else(|p| p.into_inner()).insert(slot.clone(), own.clone());
-    let mut o = engines::run(&st.http, &spec, timeout, &own, |ev| match ev {
-        Event::Text(t) if stream => emit(app, "task:delta", json!({ "taskId": task, "conversationId": conv, "messageId": mid, "phase": role, "delta": t })),
-        // 여러 AI가 동시에 쓸 때는 실행(key)별로 흘려 각 창이 따로 보여 준다(회의 창).
-        Event::Text(t) => emit(app, "task:agent-delta", json!({ "taskId": task, "conversationId": conv, "key": key, "delta": t })),
-        Event::Activity(a) => {
-            emit(app, "task:agent-activity", json!({ "taskId": task, "conversationId": conv, "key": key, "text": a }));
-            if stream {
-                emit(app, "task:activity", json!({ "taskId": task, "conversationId": conv, "phase": role, "text": a }));
+    let mut turn = own.child_token();
+    st.agents.lock().unwrap_or_else(|p| p.into_inner()).insert(slot.clone(), AgentLine { stop: own.clone(), turn: turn.clone(), inbox: vec![], steer: spec.steer.clone() });
+    let original = spec.prompt.clone();
+    let deadline = std::time::Instant::now() + timeout;
+    let mut spec = spec;
+    let mut earlier = Outcome::default();
+    let mut o = loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now()).max(FOLLOW_UP_MIN);
+        let cur = engines::run(&st.http, &spec, left, &turn, |ev| match ev {
+            Event::Text(t) if stream => emit(app, "task:delta", json!({ "taskId": task, "conversationId": conv, "messageId": mid, "phase": role, "delta": t })),
+            // 여러 AI가 동시에 쓸 때는 실행(key)별로 흘려 각 창이 따로 보여 준다(회의 창).
+            Event::Text(t) => emit(app, "task:agent-delta", json!({ "taskId": task, "conversationId": conv, "key": key, "delta": t })),
+            Event::Activity(a) => {
+                emit(app, "task:agent-activity", json!({ "taskId": task, "conversationId": conv, "key": key, "text": a }));
+                if stream {
+                    emit(app, "task:activity", json!({ "taskId": task, "conversationId": conv, "phase": role, "text": a }));
+                }
             }
+            _ => {}
+        })
+        .await;
+        // 잠금 안에서 함께 처리해 메시지가 끝난 실행으로 사라지지 않게 한다: 받은 메시지가 없으면 이 자리에서 선을 닫는다.
+        let msgs = {
+            let mut g = st.agents.lock().unwrap_or_else(|p| p.into_inner());
+            match g.get_mut(&slot) {
+                Some(l) if !own.is_cancelled() && !l.inbox.is_empty() => {
+                    turn = own.child_token();
+                    l.turn = turn.clone();
+                    std::mem::take(&mut l.inbox)
+                }
+                _ => {
+                    g.remove(&slot);
+                    vec![]
+                }
+            }
+        };
+        if msgs.is_empty() {
+            break cur;
         }
-        _ => {}
-    })
-    .await;
-    st.agents.lock().unwrap_or_else(|p| p.into_inner()).remove(&slot);
+        spec = follow_up(&spec, &original, &cur, &msgs);
+        emit(app, "task:agent-activity", json!({ "taskId": task, "conversationId": conv, "key": key, "text": format!("메시지 전달: {}", cut(&msgs.join(" "), 60)) }));
+        if stream {
+            emit(app, "task:delta", json!({ "taskId": task, "conversationId": conv, "messageId": mid, "phase": role, "delta": "\n\n" }));
+        } else {
+            emit(app, "task:agent-delta", json!({ "taskId": task, "conversationId": conv, "key": key, "delta": "\n\n" }));
+        }
+        earlier.cost_usd = add_opt(earlier.cost_usd, cur.cost_usd);
+        earlier.input_tokens = add_opt(earlier.input_tokens, cur.input_tokens);
+        earlier.output_tokens = add_opt(earlier.output_tokens, cur.output_tokens);
+        earlier.latency_ms += cur.latency_ms;
+        earlier.activities.extend(cur.activities);
+        earlier.text = cur.text;
+    };
+    // 끊긴 차례의 사용량도 합치고, 마지막 차례가 글을 못 냈으면 그 앞의 글을 살린다.
+    o.cost_usd = add_opt(earlier.cost_usd, o.cost_usd);
+    o.input_tokens = add_opt(earlier.input_tokens, o.input_tokens);
+    o.output_tokens = add_opt(earlier.output_tokens, o.output_tokens);
+    o.latency_ms += earlier.latency_ms;
+    if !earlier.activities.is_empty() {
+        earlier.activities.append(&mut o.activities);
+        o.activities = earlier.activities;
+    }
+    if o.text.trim().is_empty() {
+        o.text = earlier.text;
+    }
     let stopped = own.is_cancelled() && !cancel.is_cancelled();
     if stopped {
         o.ok = false;
@@ -1137,7 +1854,26 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
     let mut jev_error: Option<String> = None;
     let mut selection: Option<memory::Selection> = None;
     let mut memory_note: Option<String> = None;
-    let want_judge = s.jev_enabled && !(choice.is_some() && s.review != ReviewMode::Auto);
+    let want_core = s.jev_enabled;
+    // 이번 요청에 붙은 파일과 앞선 차례의 파일
+    let current_files = msgs.last().map(|m| attachments::of_data(m.data.as_ref())).unwrap_or_default();
+    let mut earlier_files: Vec<Attachment> = msgs[..msgs.len().saturating_sub(1)].iter().flat_map(|m| attachments::of_data(m.data.as_ref())).collect();
+    earlier_files.drain(..earlier_files.len().saturating_sub(JEV_MAX_EARLIER));
+    let mut picked_earlier = earlier_by_name(text, &earlier_files);
+    let free_models: Vec<String> = st.engines.read().unwrap_or_else(|p| p.into_inner()).iter().find(|e| e.id == EngineId::OpenCode && e.installed).map(|e| e.models.clone()).unwrap_or_default();
+    let free_choices: Vec<String> = if choice.is_none() || choice == Some(EngineId::OpenCode) { free_models.clone() } else { vec![] };
+    let file_briefs: Vec<Value> = current_files.iter().map(|f| file_brief(&st.data_dir, f)).collect();
+    // JEV가 고를 것: /이름으로 직접 부르지 않았으면 켜진 스킬 중에서, 직접 고르지 않았으면 AI와 작업 분할까지.
+    let route_skills: Vec<&Skill> = if s.jev_enabled && catalog.explicit(text).is_none() { catalog.enabled_skills().collect() } else { vec![] };
+    let route_engines: Vec<EngineId> = if s.jev_enabled && choice.is_none() {
+        let all = st.installed();
+        let clis: Vec<EngineId> = all.iter().copied().filter(|e| !e.is_api()).collect();
+        if work_req && !clis.is_empty() { clis } else { all }
+    } else {
+        vec![]
+    };
+    let want_parts = s.jev_enabled && s.agents_auto && work_req && choice.is_none() && intent::requested_agents(text).is_none();
+    let want_judge = want_core || !route_skills.is_empty();
     let jev_key = if s.jev_enabled { secrets::get(SecretName::TypeSafe) } else { None };
     if want_judge && jev_key.is_none() {
         jev_error = Some("TypeSafe API 키가 없습니다".into());
@@ -1152,10 +1888,10 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
             };
             emit(app, "task:activity", json!({ "taskId": task, "conversationId": conv, "phase": "plan", "text": what }));
         }
-        let (jr, fr) = tokio::join!(
+        let (jr, fr, er) = tokio::join!(
             async {
                 if want_judge {
-                    Some(judge(&st.http, key, text).await)
+                    Some(route(&st.http, key, text, &RouteAsk { core: want_core, skills: route_skills, engines: route_engines, parts: want_parts, files: file_briefs, free_models: free_choices, work: work_req }).await)
                 } else {
                     None
                 }
@@ -1167,7 +1903,18 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
                     Ok(None)
                 }
             },
+            async {
+                if earlier_files.is_empty() {
+                    None
+                } else {
+                    Some(pick_earlier_files(&st.http, key, &st.data_dir, text, &earlier_files).await)
+                }
+            },
         );
+        if let Some(Ok((keep, ms, cost))) = er {
+            let _ = store::record_usage(&st.db, &store::Usage { engine: "jev", role: "attach", ok: true, latency_ms: ms, input_tokens: None, output_tokens: None, cost_usd: Some(cost) });
+            picked_earlier = keep;
+        }
         match jr {
             Some(Ok(j)) => {
                 let _ = store::record_usage(&st.db, &store::Usage { engine: "jev", role: "judge", ok: true, latency_ms: j.ms, input_tokens: None, output_tokens: None, cost_usd: Some(j.cost_usd) });
@@ -1188,6 +1935,12 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
     }
     let checks: Mutex<Vec<Value>> = Mutex::new(vec![]);
     let finish = |content: String, mut data: Value| {
+        // 답 안의 파일 표시를 첨부로 바꾼다.
+        let (content, sent) = attachments::extract(&st.data_dir, &workspace, &content);
+        let content = if content.trim().is_empty() && !sent.is_empty() { "파일을 첨부했습니다.".to_string() } else { content };
+        if let (false, Some(o)) = (sent.is_empty(), data.as_object_mut()) {
+            o.insert("attachments".into(), json!(sent));
+        }
         let c = checks.lock().unwrap_or_else(|p| p.into_inner()).clone();
         if let (false, Some(o)) = (c.is_empty(), data.as_object_mut()) {
             o.insert("jevChecks".into(), json!(c));
@@ -1195,7 +1948,7 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
         let _ = store::insert_message_as(&st.db, &mid, conv, "assistant", &content, Some(&data));
         emit(app, "message:created", json!({ "conversationId": conv, "messageId": mid, "taskId": task }));
     };
-    let mut p = match plan_with(text, choice, work_req, &st.installed(), &catalog, s.review, judgment.as_ref(), s.agents) {
+    let mut p = match plan_with(text, choice, work_req, &st.installed(), &catalog, s.review, judgment.as_ref(), if s.agents_auto { 0 } else { s.agents }) {
         Ok(p) => p,
         Err(e) => return finish(format!("⚠ {e}"), json!({ "error": e })),
     };
@@ -1204,6 +1957,25 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
     }
     if let Some(n) = memory_note {
         p.reasons.push(n);
+    }
+    // 이번 요청의 파일 + JEV가 고른 앞선 파일. CLI는 이 폴더들을 읽을 수 있어야 한다.
+    let mut all_files = current_files.clone();
+    for i in &picked_earlier {
+        if let Some(f) = earlier_files.get(*i) {
+            all_files.push(f.clone());
+        }
+    }
+    if !picked_earlier.is_empty() {
+        p.reasons.push(format!("이전 첨부 파일 {}개를 이 요청에 함께 전달합니다", picked_earlier.len()));
+    }
+    let files: Vec<AttachedFile> = all_files.iter().map(|f| attachments::to_file(&st.data_dir, f)).collect();
+    p.free_model = pick_free_model(&free_models, s.models.get("opencode").map(String::as_str), judgment.as_ref(), files.iter().any(|f| f.kind == "image"));
+    prefer_file_readers(&mut p, &files, choice);
+    if let Some(r) = judgment.as_ref().and_then(|j| j.risk).filter(|_| p.work) {
+        p.reasons.push(format!("JEV: 이 작업의 위험도 {r:.1}/3"));
+    }
+    if judgment.as_ref().and_then(|j| j.sensitive).is_some_and(|x| x >= JEV_SENSITIVE) && (p.primary == EngineId::OpenCode || p.fallbacks.contains(&EngineId::OpenCode)) {
+        p.reasons.push("JEV: 민감한 내용이 있어 OpenCode는 입력을 보관하지 않는 무료 모델만 씁니다".into());
     }
     if build {
         // 끝까지 완성해야 하므로 가장 깊은 노력 단계로 돈다(요청 글에서 고른 모델은 그대로 따른다).
@@ -1268,7 +2040,8 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
     }
 
     // 스킬 참고 파일을 CLI가 읽을 수 있게 그 폴더를 넘긴다.
-    let skill_dirs: Vec<String> = p.skill.as_ref().and_then(|s| s.0.dir.clone()).into_iter().collect();
+    let mut skill_dirs: Vec<String> = p.skill.as_ref().and_then(|s| s.0.dir.clone()).into_iter().collect();
+    skill_dirs.extend(files.iter().filter_map(|f| f.path.parent().map(|d| d.to_string_lossy().to_string())));
     // 세션 메모리: JEV가 걸렀으면 남긴 것만, 아니면 요약 + 최근 대화를 붙인다.
     let ctx = |seen: Option<&str>, prompt: &str| memory::context(summary.as_deref(), upto.as_deref(), &history, seen, prompt, selection.as_ref());
     let system = if build { format!("{}{BUILD_SYSTEM}", system_prompt(true, &ws, p.skill.as_ref())) } else { system_prompt(p.work, &ws, p.skill.as_ref()) };
@@ -1278,7 +2051,7 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
     // 병렬 작업: 작업(만들기)을 하위 작업으로 나눠 에이전트마다 폴더 사본에서 동시에 하고 → 바뀐 파일을 합치고 → 통합 AI가 마무리한다.
     if p.work {
         if let Some(team) = p.team.clone() {
-            let tw = TeamWork { app, st, conv, task, mid: &mid, workspace: &workspace, settings: &s, system: &system, timeout, cancel: &cancel, extra_dirs: &skill_dirs, plugin_dirs: &plugin_dirs };
+            let tw = TeamWork { app, st, conv, task, mid: &mid, workspace: &workspace, settings: &s, system: &system, timeout, cancel: &cancel, extra_dirs: &skill_dirs, plugin_dirs: &plugin_dirs, assign_key: jev_key.as_deref().filter(|_| choice.is_none()), files: &files };
             if let Some((content, data)) = run_team_work(&tw, &mut p, &team, &ctx, &mut steps).await {
                 return finish(content, data);
             }
@@ -1297,6 +2070,7 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
         max_tokens: p.budget.as_ref().map(|b| b.max_tokens),
         extra_dirs: skill_dirs.clone(),
         steer: None,
+        attachments: files.clone(),
     };
     // JEV로 확인해 건너뛴 단계(답 비교·검토 생략)를 사용량과 답 기록에 남긴다.
     let jev_note = |kind: &'static str, value: f64, ms: u64, cost: f64| {
@@ -1589,87 +2363,152 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
 
     let steer: Steer = st.steers.lock().unwrap_or_else(|p| p.into_inner()).get(task).cloned().unwrap_or_default();
     let mut draft: Option<(EngineId, Outcome)> = None;
-    for engine in std::iter::once(p.primary).chain(p.fallbacks.iter().copied()) {
-        if cancel.is_cancelled() {
-            break;
-        }
-        // Claude Code·Antigravity는 같은 대화의 세션을 이어 쓰고, 나머지는 최근 대화를 요청에 붙인다.
-        let resume = if engine.resumable() { store::get_session(&st.db, conv, engine.as_str()).ok().flatten() } else { None };
-        let model = model_for(&p, engine, &s);
-        // 자기 세션을 이어 쓰면 못 본 차례만, 아니면 세션 요약 + 최근 대화를 붙인다.
-        let seen = if resume.is_some() { store::get_seen(&st.db, conv, engine.as_str()).ok().flatten() } else { None };
-        let prompt = ctx(seen.as_deref(), &p.prompt);
-        // 작업 중 메시지는 API 작업 모드에서만 받는다(CLI는 중간에 끼어들 수 없다).
-        *steer.lock().unwrap_or_else(|p| p.into_inner()) = (engine.is_api() && p.work).then(Vec::new);
-        let spec = RunSpec {
-            engine,
-            prompt,
-            system: system.clone(),
-            cwd: workspace.clone(),
-            work: p.work,
-            resume,
-            plugin_dirs: if engine == EngineId::Claude { plugin_dirs.clone() } else { vec![] },
-            model,
-            effort: p.budget.as_ref().map(|b| b.effort.to_string()),
-            max_tokens: p.budget.as_ref().map(|b| b.max_tokens),
-            extra_dirs: skill_dirs.clone(),
-            steer: Some(steer.clone()),
-        };
-        let o = run_engine(app, st, conv, task, &mid, "draft", spec, timeout, &cancel).await;
-        // 에이전트 탭에서 이 AI만 멈췄으면 다음 AI로 넘어가지 않는다.
-        let stopped = o.error.as_deref() == Some(AGENT_STOPPED);
-        let left = steer.lock().unwrap_or_else(|p| p.into_inner()).take().unwrap_or_default();
-        if !left.is_empty() {
-            emit(app, "task:activity", json!({ "taskId": task, "conversationId": conv, "phase": "draft", "text": format!("작업이 끝나 전달하지 못한 메시지 {}개가 있습니다. 다시 보내 주세요", left.len()) }));
-        }
-        steps.push(step(engine, "draft", &o, &spec_effort(&p), spec_model(&p, engine, &s)));
-        if let Some(sid) = &o.session_id {
-            if o.ok && engine.resumable() {
-                let _ = store::set_session(&st.db, conv, engine.as_str(), sid);
+    let mut last_spec: Option<RunSpec> = None;
+    'engines: for engine in std::iter::once(p.primary).chain(p.fallbacks.iter().copied()) {
+        let mut retried = false;
+        loop {
+            if cancel.is_cancelled() {
+                break 'engines;
             }
-        }
-        if o.ok && !o.text.trim().is_empty() {
-            draft = Some((engine, o));
-            break;
-        }
-        if stopped {
-            break;
-        }
-        // 키가 거절된 API는 키를 다시 넣을 때까지 자동 선택에서 뺀다(매번 실패를 거치지 않도록).
-        if engine.is_api() && o.error.as_deref().is_some_and(|e| e.contains("(401)") || e.contains("(403)")) {
-            if let Some(e) = st.engines.write().unwrap_or_else(|p| p.into_inner()).iter_mut().find(|e| e.id == engine) {
-                e.installed = false;
+            // Claude Code·Antigravity·OpenCode는 같은 대화의 세션을 이어 쓰고, 나머지는 최근 대화를 요청에 붙인다.
+            let resume = if engine.resumable() { store::get_session(&st.db, conv, engine.as_str()).ok().flatten() } else { None };
+            let model = model_for(&p, engine, &s);
+            // 자기 세션을 이어 쓰면 못 본 차례만, 아니면 세션 요약 + 최근 대화를 붙인다.
+            let seen = if resume.is_some() { store::get_seen(&st.db, conv, engine.as_str()).ok().flatten() } else { None };
+            let prompt = ctx(seen.as_deref(), &p.prompt);
+            // 작업 중 메시지는 API 작업 모드에서만 받는다(CLI는 중간에 끼어들 수 없다).
+            *steer.lock().unwrap_or_else(|p| p.into_inner()) = (engine.is_api() && p.work).then(Vec::new);
+            let spec = RunSpec {
+                engine,
+                prompt,
+                system: system.clone(),
+                cwd: workspace.clone(),
+                work: p.work,
+                resume,
+                plugin_dirs: if engine == EngineId::Claude { plugin_dirs.clone() } else { vec![] },
+                model,
+                effort: p.budget.as_ref().map(|b| b.effort.to_string()),
+                max_tokens: p.budget.as_ref().map(|b| b.max_tokens),
+                extra_dirs: skill_dirs.clone(),
+                steer: Some(steer.clone()),
+                attachments: files.clone(),
+            };
+            let o = run_engine(app, st, conv, task, &mid, "draft", spec.clone(), timeout, &cancel).await;
+            // 에이전트 탭에서 이 AI만 멈췄으면 다음 AI로 넘어가지 않는다.
+            let stopped = o.error.as_deref() == Some(AGENT_STOPPED);
+            let left = steer.lock().unwrap_or_else(|p| p.into_inner()).take().unwrap_or_default();
+            if !left.is_empty() {
+                emit(app, "task:activity", json!({ "taskId": task, "conversationId": conv, "phase": "draft", "text": format!("작업이 끝나 전달하지 못한 메시지 {}개가 있습니다. 다시 보내 주세요", left.len()) }));
             }
-            emit(app, "engines:changed", json!({}));
-        }
-        if !p.fallbacks.is_empty() {
-            emit(app, "task:activity", json!({ "taskId": task, "conversationId": conv, "phase": "draft", "text": format!("{} 실패, 다음 AI로 넘어갑니다", engine.label()) }));
+            steps.push(step(engine, "draft", &o, &spec_effort(&p), spec_model(&p, engine, &s)));
+            if let Some(sid) = &o.session_id {
+                if o.ok && engine.resumable() {
+                    let _ = store::set_session(&st.db, conv, engine.as_str(), sid);
+                }
+            }
+            if o.ok && !o.text.trim().is_empty() {
+                last_spec = Some(spec);
+                draft = Some((engine, o));
+                break 'engines;
+            }
+            if stopped || cancel.is_cancelled() {
+                break 'engines;
+            }
+            // 일시적인 오류면 같은 AI로 한 번 더 시도한다. 이미 도구를 쓴 작업은 파일을 두 번 고칠 수 있어 다시 돌리지 않는다.
+            let error = o.error.clone().unwrap_or_default();
+            // 시간 초과는 다시 돌려도 같은 시간을 또 쓰므로 바로 다음 AI로 넘어간다.
+            if !retried && !error.is_empty() && !error.contains("안에 끝나지 않") && (!p.work || o.activities.is_empty()) {
+                retried = true;
+                let worth = match &jev_key {
+                    Some(key) => match failure_transient(&st.http, key, engine.label(), &error).await {
+                        Ok((x, ms, cost)) => {
+                            jev_note("triage", x, ms, cost);
+                            x >= JEV_RETRY
+                        }
+                        Err(_) => crate::apis::transient(&error),
+                    },
+                    None => crate::apis::transient(&error),
+                };
+                if worth {
+                    emit(app, "task:activity", json!({ "taskId": task, "conversationId": conv, "phase": "draft", "text": format!("{} 일시적인 오류로 다시 시도합니다", engine.label()) }));
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    continue;
+                }
+            }
+            // 키가 거절된 API는 키를 다시 넣을 때까지 자동 선택에서 뺀다(매번 실패를 거치지 않도록).
+            if engine.is_api() && o.error.as_deref().is_some_and(|e| e.contains("(401)") || e.contains("(403)")) {
+                if let Some(e) = st.engines.write().unwrap_or_else(|p| p.into_inner()).iter_mut().find(|e| e.id == engine) {
+                    e.installed = false;
+                }
+                emit(app, "engines:changed", json!({}));
+            }
+            if !p.fallbacks.is_empty() {
+                emit(app, "task:activity", json!({ "taskId": task, "conversationId": conv, "phase": "draft", "text": format!("{} 실패, 다음 AI로 넘어갑니다", engine.label()) }));
+            }
+            break;
         }
     }
-    let Some((drafted_by, d)) = draft else {
+    let Some((drafted_by, mut d)) = draft else {
         let why = if cancel.is_cancelled() { "중지했습니다.".to_string() } else { steps.last().and_then(|s| s.error.clone()).unwrap_or_else(|| "답을 받지 못했습니다".into()) };
         return finish(format!("⚠ {why}"), message_data(&steps, &p, json!({ "error": why })));
     };
 
-    // 검토: 다른 AI가 초안을 다듬는다(실패하면 초안을 그대로 쓴다).
-    if let Some(rev) = p.reviewer.filter(|_| !cancel.is_cancelled()) {
-        // 초안이 이미 완성됐다고 JEV가 확신하면 검토 AI를 부르지 않는다.
-        if let Some(key) = &jev_key {
-            emit(app, "task:activity", json!({ "taskId": task, "conversationId": conv, "phase": "review", "text": "JEV가 초안 검토 생략 여부를 판단하는 중" }));
-            if let Ok((ready, ms, cost)) = draft_ready(&st.http, key, &p.prompt, &d.text).await {
-                jev_note("draft", ready, ms, cost);
-                if ready >= JEV_DRAFT_OK {
-                    let mut p2 = p.clone();
-                    p2.reasons.push(format!(
-                        "JEV: 초안의 완성도가 충분하다고 판단(신뢰도 {pct}%)하여 {rev}의 검토를 생략합니다.",
-                        rev = rev.label(),
-                        pct = pct(ready)
-                    ));
-                    finish(d.text.clone(), message_data(&steps, &p2, json!({ "draftedBy": drafted_by, "skippedReview": rev })));
-                    mark_seen(st, conv, drafted_by);
-                    return;
+    // 작업: JEV가 보기에 끝나지 않았으면 같은 AI에게 한 차례 더 맡긴다.
+    let mut notes: Vec<String> = vec![];
+    if let (true, Some(key), Some(spec)) = (p.work && !cancel.is_cancelled(), &jev_key, &last_spec) {
+        emit(app, "task:activity", json!({ "taskId": task, "conversationId": conv, "phase": "draft", "text": "JEV가 작업이 끝났는지 확인하는 중" }));
+        if let Ok((x, ms, cost)) = work_unfinished(&st.http, key, &p.prompt, &d.text).await {
+            jev_note("verify", x, ms, cost);
+            if x >= JEV_UNFINISHED {
+                notes.push(format!("JEV: 작업이 끝나지 않았다고 판단({pct}%)해 {who}에게 이어서 맡겼습니다", pct = pct(x), who = drafted_by.label()));
+                let msg = "작업이 아직 끝나지 않은 것으로 보입니다. 남은 부분을 끝내고 실제로 동작하는지 확인하세요.".to_string();
+                let next = follow_up(spec, &p.prompt, &d, &[msg]);
+                let r = run_engine(app, st, conv, task, &mid, "finish", next, timeout, &cancel).await;
+                steps.push(step(drafted_by, "finish", &r, &spec_effort(&p), spec_model(&p, drafted_by, &s)));
+                if let (true, Some(sid)) = (r.ok && drafted_by.resumable(), &r.session_id) {
+                    let _ = store::set_session(&st.db, conv, drafted_by.as_str(), sid);
+                }
+                if r.ok && !r.text.trim().is_empty() {
+                    d.text = r.text;
                 }
             }
+        }
+    }
+    // 대화: JEV로 초안을 확인한다. 이미 충분하면 검토를 건너뛰고, 검토 계획이 없어도 답이 약해 보이면 다른 AI에게 맡긴다.
+    let mut reviewer = p.reviewer;
+    let may_escalate = reviewer.is_none() && !p.work && s.review == ReviewMode::Auto && choice.is_none();
+    let mut ready: Option<f64> = None;
+    if let (true, Some(key)) = ((reviewer.is_some() || may_escalate) && !cancel.is_cancelled(), &jev_key) {
+        emit(app, "task:activity", json!({ "taskId": task, "conversationId": conv, "phase": "review", "text": "JEV가 초안 검토 생략 여부를 판단하는 중" }));
+        if let Ok((x, ms, cost)) = draft_ready(&st.http, key, &p.prompt, &d.text).await {
+            jev_note("draft", x, ms, cost);
+            ready = Some(x);
+            if may_escalate && x < JEV_ESCALATE {
+                reviewer = stronger_reviewer(drafted_by, &st.installed());
+                if let Some(r) = reviewer {
+                    notes.push(format!("JEV: 초안이 충분하지 않다고 판단(완성도 {pct}%)해 {who}에게 검토를 맡겼습니다", pct = pct(x), who = r.label()));
+                }
+            }
+        }
+    }
+    let pn = {
+        let mut x = p.clone();
+        x.reasons.extend(notes.iter().cloned());
+        x
+    };
+    // 검토: 다른 AI가 초안을 다듬는다(실패하면 초안을 그대로 쓴다).
+    if let Some(rev) = reviewer.filter(|_| !cancel.is_cancelled()) {
+        // 초안이 이미 완성됐다고 JEV가 확신하면 검토 AI를 부르지 않는다.
+        if let Some(x) = ready.filter(|x| *x >= JEV_DRAFT_OK) {
+            let mut p2 = pn.clone();
+            p2.reasons.push(format!(
+                "JEV: 초안의 완성도가 충분하다고 판단(신뢰도 {pct}%)하여 {rev}의 검토를 생략합니다.",
+                rev = rev.label(),
+                pct = pct(x)
+            ));
+            finish(d.text.clone(), message_data(&steps, &p2, json!({ "draftedBy": drafted_by, "skippedReview": rev })));
+            mark_seen(st, conv, drafted_by);
+            return;
         }
         let spec = RunSpec {
             engine: rev,
@@ -1684,23 +2523,54 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
             max_tokens: p.budget.as_ref().map(|b| b.max_tokens),
             extra_dirs: skill_dirs.clone(),
             steer: None,
+            attachments: files.clone(),
         };
         let r = run_engine(app, st, conv, task, &mid, "review", spec, timeout, &cancel).await;
         steps.push(step(rev, "review", &r, &spec_effort(&p), spec_model(&p, rev, &s)));
         if r.ok && !r.text.trim().is_empty() && !review_is_degraded(&d.text, &r.text) {
+            // 검토가 오히려 답을 망쳤는지 JEV로 한 번 더 본다.
+            if let Some(key) = jev_key.as_ref().filter(|_| !cancel.is_cancelled()) {
+                if let Ok((x, ms, cost)) = review_worse(&st.http, key, &p.prompt, &d.text, &r.text).await {
+                    jev_note("reviewCheck", x, ms, cost);
+                    if x >= JEV_KEEP_DRAFT {
+                        let mut p2 = pn.clone();
+                        p2.reasons.push(format!("JEV: {who}의 검토가 초안보다 못하다고 판단({pct}%)해 초안을 씁니다", who = rev.label(), pct = pct(x)));
+                        finish(d.text.clone(), message_data(&steps, &p2, json!({ "draftedBy": drafted_by, "rejectedReview": r.text })));
+                        mark_seen(st, conv, drafted_by);
+                        return;
+                    }
+                }
+            }
             mark_seen(st, conv, drafted_by);
-            return finish(r.text.clone(), message_data(&steps, &p, json!({ "draft": d.text, "draftedBy": drafted_by, "reviewedBy": rev })));
+            return finish(r.text.clone(), message_data(&steps, &pn, json!({ "draft": d.text, "draftedBy": drafted_by, "reviewedBy": rev })));
         }
         if r.ok && review_is_degraded(&d.text, &r.text) {
-            let mut p2 = p.clone();
+            let mut p2 = pn.clone();
             p2.reasons.push(format!("{}의 검토가 초안보다 지나치게 짧거나 내용을 지워 초안을 그대로 씁니다", rev.label()));
             finish(d.text.clone(), message_data(&steps, &p2, json!({ "draftedBy": drafted_by, "rejectedReview": r.text })));
             mark_seen(st, conv, drafted_by);
             return;
         }
     }
-    finish(d.text.clone(), message_data(&steps, &p, json!({ "draftedBy": drafted_by })));
+    finish(d.text.clone(), message_data(&steps, &pn, json!({ "draftedBy": drafted_by })));
     mark_seen(st, conv, drafted_by);
+}
+
+/// 첨부를 읽지 못하는 API가 먼저 답하게 되면 파일을 읽을 수 있는 CLI를 앞세운다(직접 고른 AI는 그대로).
+fn prefer_file_readers(p: &mut Plan, files: &[AttachedFile], choice: Option<EngineId>) {
+    if choice.is_some() || !p.primary.is_api() {
+        return;
+    }
+    let ok = crate::apis::can_send_binary(p.primary);
+    if files.iter().all(|f| f.kind == "text" || ok(f)) {
+        return;
+    }
+    if let Some(i) = p.fallbacks.iter().position(|e| !e.is_api()) {
+        let cli = p.fallbacks.remove(i);
+        p.fallbacks.insert(0, p.primary);
+        p.primary = cli;
+        p.reasons.push(format!("첨부 파일을 읽을 수 있는 {}가 먼저 답합니다", cli.label()));
+    }
 }
 
 /// 병렬 작업에 필요한 작업 정보
@@ -1718,6 +2588,9 @@ struct TeamWork<'a> {
     cancel: &'a CancellationToken,
     extra_dirs: &'a [String],
     plugin_dirs: &'a [String],
+    /// 있으면 하위 작업마다 맡을 AI와 노력 단계를 JEV에게 묻는다
+    assign_key: Option<&'a str>,
+    files: &'a [AttachedFile],
 }
 
 /// 나누는 AI 한 번에 기다리는 최대 시간
@@ -1773,6 +2646,7 @@ async fn run_team_work(tw: &TeamWork<'_>, p: &mut Plan, team: &Team, ctx: &(dyn 
         max_tokens: Some(4000),
         extra_dirs: tw.extra_dirs.to_vec(),
         steer: None,
+        attachments: tw.files.to_vec(),
     };
     let o = run_engine_as(app, st, conv, task, mid, "plan", split, SPLIT_TIMEOUT, tw.cancel, false, "plan").await;
     steps.push(step(team.synth, "plan", &o, &Some("medium".into()), spec_model(p, team.synth, s)));
@@ -1801,7 +2675,37 @@ async fn run_team_work(tw: &TeamWork<'_>, p: &mut Plan, team: &Team, ctx: &(dyn 
     }
 
     // 4) 하위 작업을 동시에
-    let agents: Vec<&TeamAgent> = team.agents.iter().take(parts.len()).collect();
+    // 하위 작업마다 맡을 AI와 노력 단계: JEV가 정하고, 못 정한 칸은 처음 계획을 따른다. 요청 글에서 모델을 고른 팀은 그대로 둔다.
+    let mut assigned: Vec<TeamAgent> = team.agents.iter().take(parts.len()).cloned().collect();
+    let mut tiers: Vec<Option<Budget>> = vec![None; parts.len()];
+    if let Some(key) = tw.assign_key.filter(|_| assigned.iter().all(|a| a.model.is_none())) {
+        act("JEV가 AI 배정 중".to_string());
+        let all = st.installed();
+        let clis: Vec<EngineId> = all.iter().copied().filter(|e| !e.is_api()).collect();
+        let pool = if clis.is_empty() { all } else { clis };
+        match assign_parts(&st.http, key, &parts, &pool).await {
+            Ok(a) => {
+                let _ = store::record_usage(&st.db, &store::Usage { engine: "jev", role: "assign", ok: true, latency_ms: a.ms, input_tokens: None, output_tokens: None, cost_usd: Some(a.cost_usd) });
+                for (slot, e) in assigned.iter_mut().zip(&a.engines) {
+                    if let Some(e) = e {
+                        slot.engine = *e;
+                    }
+                }
+                // 스킬이 노력 단계를 정했거나 요청 글에서 모델을 고른 경우 그 뜻을 따른다.
+                if p.skill.is_none() && p.models.is_empty() {
+                    tiers = a.tiers;
+                }
+                let list = parts.iter().zip(&assigned).map(|(x, a)| format!("{} → {}", x.title, a.engine.label())).collect::<Vec<_>>().join(", ");
+                p.reasons.push(format!("JEV: 작업 배정 {list}"));
+                let mut t = team.clone();
+                t.agents = assigned.clone();
+                p.team = Some(t.clone());
+                emit(app, "task:plan", json!({ "taskId": task, "conversationId": conv, "team": t, "reasons": p.reasons }));
+            }
+            Err(e) => act(format!("⚠ {e}")),
+        }
+    }
+    let agents: Vec<&TeamAgent> = assigned.iter().collect();
     let who = |a: &TeamAgent| match &a.model {
         Some(m) => format!("{} · {m}", a.engine.label()),
         None => a.engine.label().to_string(),
@@ -1822,11 +2726,15 @@ async fn run_team_work(tw: &TeamWork<'_>, p: &mut Plan, team: &Team, ctx: &(dyn 
                 work: true,
                 resume: None,
                 plugin_dirs: if a.engine == EngineId::Claude { tw.plugin_dirs.to_vec() } else { vec![] },
-                model: a.model.clone().or_else(|| model_for(pr, a.engine, s)),
-                effort: effort.clone(),
-                max_tokens,
+                model: a.model.clone().or_else(|| match (&tiers[i], a.engine) {
+                    (Some(b), EngineId::Claude) => b.claude_model.map(str::to_string),
+                    _ => model_for(pr, a.engine, s),
+                }),
+                effort: tiers[i].as_ref().map(|b| b.effort.to_string()).or_else(|| effort.clone()),
+                max_tokens: tiers[i].as_ref().map(|b| b.max_tokens).or(max_tokens),
                 extra_dirs: tw.extra_dirs.to_vec(),
                 steer: None,
+                attachments: tw.files.to_vec(),
             };
             let key = format!("agent:{i}");
             async move { run_engine_as(app, st, conv, task, mid, "agent", spec, tw.timeout, tw.cancel, false, &key).await }
@@ -1834,8 +2742,13 @@ async fn run_team_work(tw: &TeamWork<'_>, p: &mut Plan, team: &Team, ctx: &(dyn 
         futures_util::future::join_all(runs).await
     };
     let good = |o: &Outcome| o.ok && !o.text.trim().is_empty();
-    for (a, o) in agents.iter().zip(&outs) {
-        steps.push(step(a.engine, "agent", o, &spec_effort(p), a.model.clone().or_else(|| spec_model(p, a.engine, s))));
+    for (i, (a, o)) in agents.iter().zip(&outs).enumerate() {
+        let (effort, model) = match (&tiers[i], a.engine) {
+            (Some(b), EngineId::Claude) => (Some(b.effort.to_string()), b.claude_model.map(str::to_string)),
+            (Some(b), _) => (Some(b.effort.to_string()), spec_model(p, a.engine, s)),
+            (None, _) => (spec_effort(p), spec_model(p, a.engine, s)),
+        };
+        steps.push(step(a.engine, "agent", o, &effort, a.model.clone().or(model)));
     }
 
     // 5) 바뀐 파일 찾기(실패·중지한 에이전트는 합치지 않는다)
@@ -1914,6 +2827,7 @@ async fn run_team_work(tw: &TeamWork<'_>, p: &mut Plan, team: &Team, ctx: &(dyn 
         max_tokens,
         extra_dirs: extra,
         steer: None,
+        attachments: tw.files.to_vec(),
     };
     let j = run_engine(app, st, conv, task, mid, "synth", spec, tw.timeout, tw.cancel).await;
     steps.push(step(team.synth, "synth", &j, &spec_effort(p), spec_model(p, team.synth, s)));
@@ -1985,6 +2899,7 @@ pub async fn refresh_memory(app: &AppHandle, st: &AppState, conv: &str) {
             max_tokens: Some(1200),
             extra_dirs: vec![],
             steer: None,
+            attachments: vec![],
         };
         let o = engines::run(&st.http, &spec, Duration::from_secs(120), &CancellationToken::new(), |_| {}).await;
         let _ = store::record_usage(&st.db, &store::Usage { engine: engine.as_str(), role: "memory", ok: o.ok, latency_ms: o.latency_ms, input_tokens: o.input_tokens, output_tokens: o.output_tokens, cost_usd: o.cost_usd });
@@ -2043,7 +2958,254 @@ mod tests {
         assert!(plan(deep, None, true, &[EngineId::Claude], &c, ReviewMode::Always, None).unwrap().reviewer.is_none(), "작업 모드는 검토 안 함");
         // 스킬 review: true(report) / false(code-review)
         assert!(plan("/report 전기차 시장", None, false, &[EngineId::Claude], &c, ReviewMode::Auto, None).unwrap().reviewer.is_some());
-        assert!(plan("이 코드 리뷰 자세히 해줘", None, false, &[EngineId::Claude], &c, ReviewMode::Auto, None).unwrap().reviewer.is_none());
+        assert!(plan("/code-review 자세히 해줘", None, false, &[EngineId::Claude], &c, ReviewMode::Auto, None).unwrap().reviewer.is_none());
+    }
+
+    #[test]
+    fn jev_picks_only_enabled_skills_and_words_alone_do_not() {
+        let (t, c) = catalog();
+        // 낱말이 있어도 JEV 판단 없이는 적용하지 않는다
+        assert!(plan("이 코드 리뷰 부탁해", None, false, &[EngineId::Claude], &c, ReviewMode::Auto, None).unwrap().skill.is_none());
+        let j = |id: &str, fit: f64| Judgment { skill: Some(id.into()), skill_fit: Some(fit), ..Default::default() };
+        let p = plan("로그인이 튕겨", None, false, &[EngineId::Claude], &c, ReviewMode::Auto, Some(&j("root-cause", 0.9))).unwrap();
+        assert_eq!(p.skill.as_ref().map(|s| (s.0.id.as_str(), s.0.how)), Some(("root-cause", "auto")));
+        assert!(p.reasons.iter().any(|r| r.contains("JEV") && r.contains("root-cause") && r.contains("90%")));
+        assert!(plan("안녕", None, false, &[EngineId::Claude], &c, ReviewMode::Auto, Some(&j("root-cause", 0.3))).unwrap().skill.is_none(), "적합도가 낮으면 적용 안 함");
+        assert!(plan("안녕", None, false, &[EngineId::Claude], &c, ReviewMode::Auto, Some(&j("없는스킬", 0.9))).unwrap().skill.is_none(), "목록에 없는 스킬은 무시");
+        // 꺼진 스킬은 고를 수 없다
+        let mut off = HashMap::new();
+        off.insert("skill:root-cause".to_string(), false);
+        let c2 = skills::load(t.path(), &off);
+        assert!(plan("로그인이 튕겨", None, false, &[EngineId::Claude], &c2, ReviewMode::Auto, Some(&j("root-cause", 0.9))).unwrap().skill.is_none());
+        // /이름은 JEV 판단보다 먼저
+        let p = plan("/summarize 이 글", None, false, &[EngineId::Claude], &c, ReviewMode::Auto, Some(&j("root-cause", 0.9))).unwrap();
+        assert_eq!(p.skill.unwrap().0.how, "explicit");
+    }
+
+    #[test]
+    fn jev_picks_engine_within_rules() {
+        use EngineId::*;
+        let (_t, c) = catalog();
+        let j = |e: EngineId, conf: f64| Judgment { engine: Some(e.as_str().into()), engine_confidence: Some(conf), ..Default::default() };
+        let all = [Claude, Codex, GeminiApi];
+        let p = plan("이거 해줘", None, false, &all, &c, ReviewMode::Off, Some(&j(GeminiApi, 0.9))).unwrap();
+        assert_eq!(p.primary, GeminiApi);
+        assert!(p.fallbacks.contains(&Claude) && !p.fallbacks.contains(&GeminiApi));
+        assert_eq!(plan("이거 해줘", None, false, &all, &c, ReviewMode::Off, Some(&j(GeminiApi, 0.2))).unwrap().primary, Claude, "확신이 낮으면 기본 순서");
+        assert_eq!(plan("이거 해줘", None, false, &[Claude, Codex], &c, ReviewMode::Off, Some(&j(GeminiApi, 0.9))).unwrap().primary, Claude, "쓸 수 없는 AI는 무시");
+        assert_eq!(plan("파일 고쳐", None, true, &all, &c, ReviewMode::Off, Some(&j(GeminiApi, 0.9))).unwrap().primary, Claude, "작업은 도구가 있는 CLI");
+        assert_eq!(plan("파일 고쳐", None, true, &all, &c, ReviewMode::Off, Some(&j(Codex, 0.9))).unwrap().primary, Codex);
+        assert_eq!(plan("이거 해줘", Some(Claude), false, &all, &c, ReviewMode::Off, Some(&j(Codex, 0.9))).unwrap().primary, Claude, "직접 고른 AI가 먼저");
+        let needs_files = Judgment { local: Some(0.9), ..j(GeminiApi, 0.9) };
+        assert_eq!(plan("내 폴더 봐줘", None, false, &all, &c, ReviewMode::Off, Some(&needs_files)).unwrap().primary, Claude, "파일이 필요하면 API를 고르지 않는다");
+        let hard = Judgment { difficulty: Some(2.8), difficulty_confidence: Some(0.9), ..j(Nvidia, 0.9) };
+        assert_eq!(plan("어려운 설계", None, false, &[Claude, Nvidia], &c, ReviewMode::Off, Some(&hard)).unwrap().primary, Claude, "어려운 요청에 약한 AI는 고르지 않는다");
+    }
+
+    #[test]
+    fn jev_decides_parallel_only_for_clearly_split_work() {
+        use EngineId::*;
+        let (_t, c) = catalog();
+        let all = [Claude, Codex];
+        let j = |n: u8, single: f64| Judgment { parts: Some(n), parts_single: Some(single), ..Default::default() };
+        let auto = |text: &str, work: bool, jj: Option<&Judgment>, choice: Option<EngineId>| plan_with(text, choice, work, &all, &c, ReviewMode::Auto, jj, 0).unwrap().team;
+        assert_eq!(auto("세 모듈 추가", true, Some(&j(3, 0.04)), None).map(|t| t.agents.len()), Some(3));
+        assert!(auto("세 모듈 추가", true, Some(&j(3, 0.5)), None).is_none(), "나누지 않는 편일 확률이 높으면 하나로");
+        assert!(auto("이름 바꿔", true, Some(&j(1, 0.99)), None).is_none());
+        assert!(auto("세 모듈 추가", false, Some(&j(3, 0.04)), None).is_none(), "대화 답은 나누지 않는다");
+        assert!(auto("세 모듈 추가", true, None, None).is_none(), "JEV가 없으면 하나로");
+        assert!(auto("세 모듈 추가", true, Some(&j(3, 0.04)), Some(Claude)).is_none(), "AI를 직접 고르면 하나로");
+        assert_eq!(auto("에이전트 2개로 고쳐", true, Some(&j(4, 0.01)), None).map(|t| t.agents.len()), Some(2), "요청 글의 수가 먼저");
+        // 수동 설정은 JEV 판단을 쓰지 않는다
+        assert!(plan_with("세 모듈 추가", None, true, &all, &c, ReviewMode::Auto, Some(&j(3, 0.04)), 1).unwrap().team.is_none());
+    }
+
+    /// 실제 호출로 임계값을 확인한다: TYPESAFE_API_KEY=... cargo test --lib live_jev -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn live_jev_thresholds() {
+        let key = std::env::var("TYPESAFE_API_KEY").unwrap();
+        let http = reqwest::Client::new();
+        let d = |a: &'static str, b: &'static str| (a, b);
+        for (req, ans) in [
+            d("1부터 10까지 더하면?", "1부터 10까지의 합은 55입니다."),
+            d("1부터 10까지 더하면?", "100입니다."),
+            d("파이썬으로 CSV 읽어서 합계 내는 코드 짜줘", "죄송합니다. 잘 모르겠습니다."),
+            d("대한민국의 수도와 인구, 면적, 주요 산업을 표로 정리해 줘", "서울입니다."),
+            d("리액트 useEffect 정리 함수가 언제 실행되는지 설명해 줘", "useEffect의 정리 함수는 컴포넌트가 사라지기 직전과, 의존성이 바뀌어 효과가 다시 실행되기 직전에 실행됩니다. 구독 해제나 타이머 제거에 씁니다."),
+        ] {
+            println!("draft_ready {:.3}  {req} => {ans}", draft_ready(&http, &key, req, ans).await.unwrap().0);
+        }
+        for (rep, label) in [
+            ("로그인 페이지를 만들고 테스트까지 통과했습니다. 바꾼 파일: login.tsx, login.test.tsx", "done"),
+            ("로그인 폼은 만들었습니다. 다음으로 API 연결과 테스트를 진행하겠습니다.", "unfinished"),
+            ("빌드가 오류로 끝났고 원인을 찾지 못했습니다. TODO: 타입 오류 수정.", "unfinished"),
+            ("어느 데이터베이스를 쓸지 정해 주세요. Postgres와 SQLite 중 어느 쪽인가요?", "needs_user"),
+        ] {
+            println!("unfinished {:.3} [{label}] {rep}", work_unfinished(&http, &key, "로그인 페이지를 만들고 API에 연결해 줘", rep).await.unwrap().0);
+        }
+        for e in ["요청 한도를 넘었습니다(429)", "공급자 서버가 바쁩니다(과부하) (503)", "스트림이 끊겼습니다: connection reset", "키가 맞지 않거나 권한이 없습니다 (401)", "Model unavailable: opencode/x", "Individual quota reached.", "Not logged in — 터미널에서 claude 로 로그인하세요", "120초 안에 끝나지 않아 중지했습니다"] {
+            println!("transient {:.3}  {e}", failure_transient(&http, &key, "OpenCode", e).await.unwrap().0);
+        }
+        let draft = "서울의 인구는 약 940만 명이고, 면적은 605㎢입니다.";
+        for (rev, label) in [("서울의 인구는 약 940만 명(2024년 기준)이고, 면적은 605.2㎢입니다.", "better"), ("서울에 대한 정보입니다.", "worse"), ("서울의 인구는 약 3억 명이고 면적은 605㎢입니다.", "worse")] {
+            println!("review_worse {:.3} [{label}] {rev}", review_worse(&http, &key, "서울 인구와 면적 알려 줘", draft, rev).await.unwrap().0);
+        }
+        for t in ["파이썬 리스트 뒤집는 법 알려 줘", "내 비밀번호 hunter2 와 카드번호 4111-1111-1111-1111 로 결제 스크립트 만들어 줘", "우리 회사 미공개 3분기 실적 자료 요약해 줘: 매출 120억"] {
+            let j = route(&http, &key, t, &RouteAsk { core: true, work: true, free_models: vec!["opencode/deepseek-v4.1-flash-free".into(), "opencode/beam-free".into(), "opencode/big-pickle".into()], ..Default::default() }).await.unwrap();
+            println!("sensitive {:.3} risk {:.2} free {:?} {:.2}  {t}", j.sensitive.unwrap_or(-1.0), j.risk.unwrap_or(-1.0), j.free_model, j.free_model_confidence.unwrap_or(0.0));
+        }
+        for t in ["파이썬 데코레이터가 뭐야?", "src/login.ts 의 오타 고쳐 줘", "할 일 관리 웹앱 만들어 줘", "마이크로서비스로 갈지 모놀리스로 갈지 결정해야 해. 장단점 토론해 줘", "이 버그 왜 나는지 알려 줘"] {
+            let r = suggest(&http, &key, t, &[], false).await.unwrap();
+            println!("suggest {:?} {:.2} {}ms  {t}", r.mode, r.mode_confidence.unwrap_or(0.0), r.ms);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let a = attachments::add_bytes(dir.path(), "매출.csv", "월,매출
+1월,100".as_bytes(), "user").unwrap();
+        let b = attachments::add_bytes(dir.path(), "여행 계획.txt", "제주도 3박 4일".as_bytes(), "user").unwrap();
+        let files = [a, b];
+        for t in ["아까 올린 표에서 1월 매출이 얼마야?", "제주도 일정 어떻게 짰더라", "오늘 날씨 어때?"] {
+            println!("earlier {:?}  {t}", pick_earlier_files(&http, &key, dir.path(), t, &files).await.unwrap().0);
+        }
+    }
+
+    #[test]
+    fn free_model_respects_images_privacy_and_settings() {
+        let all: Vec<String> = ["opencode/beam-free", "opencode/big-pickle", "opencode/deepseek-v4.1-flash-free", "opencode/glm-5.3-flash-free", "opencode/mimo-v2.6-flash-free"].iter().map(|m| m.to_string()).collect();
+        let j = |m: &str, conf: f64, sensitive: f64| Judgment { free_model: Some(m.into()), free_model_confidence: Some(conf), sensitive: Some(sensitive), ..Default::default() };
+        assert_eq!(pick_free_model(&all, None, None, false).as_deref(), Some(engines::OPENCODE_DEFAULT));
+        assert_eq!(pick_free_model(&all, None, Some(&j("opencode/beam-free", 0.9, 0.0)), false).as_deref(), Some("opencode/beam-free"));
+        assert_eq!(pick_free_model(&all, None, Some(&j("opencode/beam-free", 0.2, 0.0)), false).as_deref(), Some(engines::OPENCODE_DEFAULT), "확신이 낮으면 기본");
+        let with_vl: Vec<String> = all.iter().cloned().chain([engines::OPENCODE_IMAGE_FIRST.to_string()]).collect();
+        assert_eq!(pick_free_model(&with_vl, None, Some(&j("opencode/beam-free", 0.9, 0.0)), true).as_deref(), Some(engines::OPENCODE_IMAGE_FIRST), "이미지는 시험한 모델로");
+        assert_eq!(pick_free_model(&with_vl, None, Some(&j("opencode/beam-free", 0.9, 0.9)), true).as_deref(), Some(engines::OPENCODE_DEFAULT), "민감한 이미지는 보관하지 않는 모델로");
+        assert_eq!(pick_free_model(&all, None, Some(&j("opencode/beam-free", 0.9, 0.0)), true).as_deref(), Some(engines::OPENCODE_DEFAULT), "이미지를 못 읽는 모델은 고르지 않는다");
+        assert_eq!(pick_free_model(&all, None, Some(&j("opencode/mimo-v2.6-flash-free", 0.9, 0.9)), false).as_deref(), Some(engines::OPENCODE_DEFAULT), "민감하면 보관하지 않는 모델만");
+        assert_eq!(pick_free_model(&all, Some("opencode/glm-5.3-flash-free"), None, false).as_deref(), Some("opencode/glm-5.3-flash-free"), "설정 우선");
+        assert_eq!(pick_free_model(&all, Some("opencode/beam-free"), Some(&j("opencode/beam-free", 0.9, 0.9)), false).as_deref(), Some(engines::OPENCODE_DEFAULT), "설정도 민감한 요청에는 양보");
+        assert_eq!(pick_free_model(&all, Some("anthropic/claude-opus-5-5"), None, false).as_deref(), Some(engines::OPENCODE_DEFAULT), "유료 모델은 없다");
+        let only_paidless = vec!["opencode/glm-5.3-flash-free".to_string()];
+        assert_eq!(pick_free_model(&only_paidless, None, None, false).as_deref(), Some("opencode/glm-5.3-flash-free"), "기본 모델이 사라지면 있는 것 중에서");
+    }
+
+    #[test]
+    fn route_reads_attachments_and_asks_privacy_and_risk() {
+        use EngineId::*;
+        let (s, q) = route_request("요약해 줘", &RouteAsk { core: true, files: vec![json!({"name": "a.txt"})], free_models: vec!["opencode/beam-free".into(), "opencode/big-pickle".into()], work: true, engines: vec![Claude, OpenCode], ..Default::default() });
+        assert_eq!(s["attachments"][0]["name"], "a.txt");
+        for k in ["sensitive", "risk", "free_model", "engine"] {
+            assert!(q.contains_key(k), "{k}");
+        }
+        assert_eq!(q["free_model"]["criteria"].as_object().unwrap().len(), 2);
+        let (s, q) = route_request("안녕", &RouteAsk { core: true, free_models: vec!["opencode/beam-free".into()], ..Default::default() });
+        assert!(s.get("attachments").is_none() && !q.contains_key("risk") && !q.contains_key("free_model"), "선택지가 없으면 묻지 않는다");
+    }
+
+    #[test]
+    fn opencode_routing_stays_within_its_strength() {
+        use EngineId::*;
+        let (_t, c) = catalog();
+        // 쉬운 요청은 JEV가 무료 AI를 고를 수 있고, 어려운 요청은 따르지 않는다.
+        let pick = |d: f64| Judgment { engine: Some("opencode".into()), engine_confidence: Some(0.9), difficulty: Some(d), difficulty_confidence: Some(0.9), ..Default::default() };
+        let easy = plan("간단히 정리해 줘", None, false, &[Claude, OpenCode], &c, ReviewMode::Off, Some(&pick(0.5))).unwrap();
+        assert_eq!(easy.primary, OpenCode);
+        let hard = plan("분산 시스템을 설계해 줘", None, false, &[Claude, OpenCode], &c, ReviewMode::Off, Some(&pick(2.8))).unwrap();
+        assert_eq!(hard.primary, Claude);
+        assert_eq!(plan("안녕", Some(OpenCode), false, &[Claude, OpenCode], &c, ReviewMode::Off, None).unwrap().primary, OpenCode, "직접 고르면 그대로");
+        assert_eq!(stronger_reviewer(OpenCode, &[OpenCode, GeminiApi, Claude]), Some(Claude));
+        assert_eq!(stronger_reviewer(Claude, &[Claude, OpenCode]), None, "더 약한 AI에게 검토를 맡기지 않는다");
+    }
+
+    #[test]
+    fn unreadable_attachments_move_cli_first() {
+        use EngineId::*;
+        let (_t, c) = catalog();
+        let zip = AttachedFile { name: "a.zip".into(), path: PathBuf::from("a.zip"), kind: "file".into(), mime: String::new(), size: 1 };
+        let txt = AttachedFile { kind: "text".into(), ..zip.clone() };
+        let chat = Judgment { task: Some("chat".into()), task_confidence: Some(0.9), ..Default::default() };
+        let base = || plan("안녕", None, false, &[GeminiApi, Claude], &c, ReviewMode::Off, Some(&chat)).unwrap();
+        assert_eq!(base().primary, GeminiApi);
+        let mut p = base();
+        prefer_file_readers(&mut p, std::slice::from_ref(&zip), None);
+        assert_eq!((p.primary, p.fallbacks[0]), (Claude, GeminiApi));
+        let mut p = base();
+        prefer_file_readers(&mut p, &[txt], None);
+        assert_eq!(p.primary, GeminiApi, "글 파일은 API도 읽는다");
+        let mut p = base();
+        prefer_file_readers(&mut p, &[zip], Some(GeminiApi));
+        assert_eq!(p.primary, GeminiApi, "직접 고른 AI는 그대로");
+    }
+
+    #[test]
+    fn route_asks_only_what_is_needed() {
+        use EngineId::*;
+        let (_t, c) = catalog();
+        let skills: Vec<&Skill> = c.enabled_skills().collect();
+        let (s, q) = route_request("안녕", &RouteAsk { core: true, skills: skills.clone(), engines: vec![Claude, Codex], parts: true, ..Default::default() });
+        for k in ["task", "skill", "skill_fit", "engine", "parts"] {
+            assert!(q.contains_key(k), "{k}");
+        }
+        assert!(s["skills"].as_object().unwrap().contains_key("root-cause"));
+        let (s, q) = route_request("안녕", &RouteAsk { core: false, skills: skills[..1].to_vec(), engines: vec![Claude], parts: false, ..Default::default() });
+        assert!(!q.contains_key("task") && !q.contains_key("skill") && !q.contains_key("engine") && !q.contains_key("parts"), "선택지가 하나면 Choice를 묻지 않는다");
+        assert!(q.contains_key("skill_fit") && s["skills"].as_object().unwrap().len() == 1);
+        let (_, q) = route_request("안녕", &RouteAsk { core: true, ..Default::default() });
+        assert_eq!(q.len(), jev_questions().len());
+    }
+
+    #[test]
+    fn assign_request_covers_every_part() {
+        use EngineId::*;
+        let parts = vec![teamwork::Part { title: "화면".into(), task: "만들기".into(), files: vec!["src".into()] }, teamwork::Part { title: "서버".into(), task: "만들기".into(), files: vec![] }];
+        let (s, q) = assign_request(&parts, &[Claude, Codex]);
+        assert_eq!(s["parts"]["p1"]["title"], "서버");
+        assert!(q.contains_key("e0") && q.contains_key("e1") && q.contains_key("d0") && q.contains_key("d1"));
+        let (_, q) = assign_request(&parts, &[Claude]);
+        assert!(!q.contains_key("e0") && q.contains_key("d0"), "AI가 하나면 배정은 묻지 않는다");
+    }
+
+    #[test]
+    fn talking_to_an_agent_interrupts_or_steers() {
+        let stop = CancellationToken::new();
+        let turn = stop.child_token();
+        let mut line = AgentLine { stop: stop.clone(), turn: turn.clone(), inbox: vec![], steer: None };
+        line.deliver("테스트도".into());
+        assert!(turn.is_cancelled() && !stop.is_cancelled(), "차례만 끊는다");
+        assert_eq!(line.inbox, vec!["테스트도"]);
+        // API 작업 모드: 끊지 않고 칸에 넣는다
+        let steer: Steer = std::sync::Arc::new(Mutex::new(Some(vec![])));
+        let turn = stop.child_token();
+        let mut line = AgentLine { stop, turn: turn.clone(), inbox: vec![], steer: Some(steer.clone()) };
+        line.deliver("README도".into());
+        assert!(!turn.is_cancelled() && line.inbox.is_empty());
+        assert_eq!(steer.lock().unwrap().as_ref().unwrap(), &vec!["README도".to_string()]);
+        // 칸이 닫혀 있으면(CLI) 끊는 쪽으로
+        *steer.lock().unwrap() = None;
+        line.deliver("다시".into());
+        assert!(turn.is_cancelled());
+    }
+
+    #[test]
+    fn follow_up_resumes_or_resends() {
+        let spec = |e: EngineId, work: bool| RunSpec { engine: e, prompt: "원래".into(), system: String::new(), cwd: PathBuf::from("."), work, resume: None, plugin_dirs: vec![], model: None, effort: None, max_tokens: None, extra_dirs: vec![], steer: None, attachments: vec![] };
+        let o = Outcome { text: "쓰던 글".into(), session_id: Some("sid".into()), ..Default::default() };
+        let n = follow_up(&spec(EngineId::Claude, false), "원래", &o, &["짧게".to_string()]);
+        assert_eq!(n.resume.as_deref(), Some("sid"));
+        assert!(n.prompt.contains("짧게") && !n.prompt.contains("쓰던 글"), "세션이 있으면 메시지만");
+        let n = follow_up(&spec(EngineId::Codex, true), "원래 요청", &o, &["짧게".to_string()]);
+        assert!(n.resume.is_none() && n.prompt.contains("원래 요청") && n.prompt.contains("쓰던 글") && n.prompt.contains("짧게") && n.prompt.contains("이미 고친 파일"));
+        // 세션 번호를 받기 전에 끊겨도 원래 요청을 잃지 않는다
+        let early = Outcome::default();
+        let n = follow_up(&spec(EngineId::Claude, false), "원래 요청", &early, &["짧게".to_string()]);
+        assert!(n.resume.is_none() && n.prompt.contains("원래 요청"));
+    }
+
+    #[test]
+    fn side_prompt_carries_progress_and_thread_only() {
+        let thread = vec![SideTurn { role: "user".into(), text: "앞 질문".into() }, SideTurn { role: "assistant".into(), text: "앞 답".into() }];
+        let p = side_prompt("어디까지 됐어?", Some("초안 작성 중"), &thread);
+        assert!(p.contains("초안 작성 중") && p.contains("앞 질문") && p.contains("앞 답") && p.ends_with("어디까지 됐어?"));
+        assert!(side_prompt("q", None, &[]).contains("실행 중인 작업이 없습니다"));
     }
 
     #[test]
@@ -2080,7 +3242,7 @@ mod tests {
         let p = plan(deep, None, false, &[Claude, ClaudeApi, GeminiApi], &c, ReviewMode::Auto, None).unwrap();
         assert_eq!((p.primary, p.reviewer), (Claude, Some(GeminiApi)));
         // JEV: 가벼운 대화 → 빠른 API 먼저, 난이도 낮으면 검토 안 함
-        let j = Judgment { model: "jev".into(), task: Some("chat".into()), task_confidence: Some(0.9), difficulty: Some(0.4), difficulty_confidence: Some(0.8), stakes: None, stakes_confidence: None, fresh: None, local: None, ms: 1, cost_usd: 0.0 };
+        let j = Judgment { model: "jev".into(), task: Some("chat".into()), task_confidence: Some(0.9), difficulty: Some(0.4), difficulty_confidence: Some(0.8), stakes: None, stakes_confidence: None, fresh: None, local: None, ms: 1, cost_usd: 0.0, ..Default::default() };
         let p = plan(deep, None, false, &[Claude, GeminiApi], &c, ReviewMode::Auto, Some(&j)).unwrap();
         assert_eq!(p.primary, GeminiApi);
         assert!(p.reviewer.is_none(), "JEV 난이도가 낮으면 규칙(자세히)보다 우선");
@@ -2102,7 +3264,7 @@ mod tests {
 
     #[test]
     fn jev_difficulty_sets_model_and_effort() {
-        let j = |task: &str, d: f64, conf: f64| Judgment { model: "jev".into(), task: Some(task.into()), task_confidence: Some(0.9), difficulty: Some(d), difficulty_confidence: Some(conf), stakes: None, stakes_confidence: None, fresh: None, local: None, ms: 1, cost_usd: 0.0 };
+        let j = |task: &str, d: f64, conf: f64| Judgment { model: "jev".into(), task: Some(task.into()), task_confidence: Some(0.9), difficulty: Some(d), difficulty_confidence: Some(conf), stakes: None, stakes_confidence: None, fresh: None, local: None, ms: 1, cost_usd: 0.0, ..Default::default() };
         assert_eq!(budget(None, false), None, "JEV가 없으면 기본값");
         let b = budget(Some(&j("code", 0.5, 0.9)), false).unwrap();
         assert_eq!((b.tier, b.effort, b.claude_model, b.max_tokens), ("light", "low", Some("haiku"), 1500));
@@ -2139,7 +3301,7 @@ mod tests {
     }
 
     fn jj(task: &str, d: f64, stakes: f64) -> Judgment {
-        Judgment { model: "jev".into(), task: Some(task.into()), task_confidence: Some(0.9), difficulty: Some(d), difficulty_confidence: Some(0.9), stakes: Some(stakes), stakes_confidence: Some(0.9), fresh: None, local: None, ms: 1, cost_usd: 0.0 }
+        Judgment { model: "jev".into(), task: Some(task.into()), task_confidence: Some(0.9), difficulty: Some(d), difficulty_confidence: Some(0.9), stakes: Some(stakes), stakes_confidence: Some(0.9), fresh: None, local: None, ms: 1, cost_usd: 0.0, ..Default::default() }
     }
 
     #[test]

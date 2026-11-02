@@ -149,7 +149,13 @@ async fn call(st: State<'_, Remote>, method: String, path: String, body: Option<
     let mut last = format!("{}에 연결할 수 없습니다", saved.pc_name);
     for host in order(&saved, good.as_ref()) {
         let url = format!("https://{host}:{}{path}", saved.port);
-        let req = if method == "POST" { http.post(&url).json(&body.clone().unwrap_or(json!({}))) } else { http.get(&url) };
+        let req = match method.as_str() {
+            "POST" => http.post(&url).json(&body.clone().unwrap_or(json!({}))),
+            "DELETE" => http.delete(&url),
+            _ => http.get(&url),
+        };
+        // 파일을 주고받는 요청은 느린 망에서도 끝나도록 시간을 넉넉히 준다.
+        let req = if path.starts_with("/api/attachments") { req.timeout(Duration::from_secs(300)) } else { req };
         match req.bearer_auth(&saved.token).send().await {
             Ok(r) => {
                 st.0.lock().unwrap().good = Some(host.clone());
