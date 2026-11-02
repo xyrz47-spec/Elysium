@@ -418,6 +418,29 @@ pub fn parse_parts(text: &str, n: usize) -> Option<Vec<Part>> {
     (parts.iter().map(|p| p.members).sum::<usize>() >= 2).then_some(parts)
 }
 
+/// 나누는 AI에게 적힌 팀 구성을 그대로 지키라고 알린다.
+pub fn teams_note(sizes: &[usize]) -> String {
+    let list = sizes.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
+    format!("반드시 작성된 팀 순서대로 정확히 {count}개의 하위 작업을 생성하고, 각 members 값은 {list}의 순서대로 지정하십시오. 팀을 병합하거나 추가해서는 안 됩니다.", count = sizes.len())
+}
+
+/// 요청문에 적힌 팀 크기대로 맞춘다. 팀보다 많은 하위 작업은 마지막 팀이 이어 맡는다.
+pub fn fit_to_teams(mut parts: Vec<Part>, sizes: &[usize]) -> Vec<Part> {
+    if parts.len() > sizes.len() && !sizes.is_empty() {
+        let extra: Vec<Part> = parts.drain(sizes.len()..).collect();
+        if let Some(last) = parts.last_mut() {
+            for e in extra {
+                last.task = format!("{}\n\n{}: {}", last.task, e.title, e.task);
+                last.files.extend(e.files);
+            }
+        }
+    }
+    for (p, n) in parts.iter_mut().zip(sizes) {
+        p.members = *n;
+    }
+    parts
+}
+
 /// 하위 작업으로 나누라는 요청(나누는 AI는 대화 모드로 돈다)
 pub fn split_prompt(request: &str, listing: &str, n: usize) -> String {
     format!(
@@ -694,6 +717,22 @@ run/
         assert!(m.apply.contains(&("shared.txt".into(), 0, false)));
         assert!(!m.apply.iter().any(|(_, i, _)| *i == 1));
         drop(failed);
+    }
+
+    #[test]
+    fn teams_note_states_count_and_sizes() {
+        let n = teams_note(&[2, 3]);
+        assert!(n.contains('2') && n.contains("2, 3") && n.contains("members"), "{n}");
+    }
+
+    #[test]
+    fn fit_to_teams_forces_written_sizes_and_keeps_every_task() {
+        let many = parse_parts("[{\"title\":\"a\",\"task\":\"x\"},{\"title\":\"b\",\"task\":\"y\",\"members\":3},{\"title\":\"c\",\"task\":\"z\"}]", 8).unwrap();
+        let fit = fit_to_teams(many, &[2, 2]);
+        assert_eq!(fit.iter().map(|p| p.members).collect::<Vec<_>>(), vec![2, 2]);
+        assert!(fit[1].task.contains('y') && fit[1].task.contains('z'), "넘친 작업은 버리지 않고 마지막 팀에 붙인다: {}", fit[1].task);
+        let few = parse_parts("[{\"title\":\"a\",\"task\":\"x\"},{\"title\":\"b\",\"task\":\"y\"}]", 8).unwrap();
+        assert_eq!(fit_to_teams(few, &[2, 1, 2]).iter().map(|p| p.members).collect::<Vec<_>>(), vec![2, 1]);
     }
 
     #[test]

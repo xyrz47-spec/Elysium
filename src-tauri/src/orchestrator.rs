@@ -166,6 +166,12 @@ pub struct Team {
     pub agent_effort: Option<String>,
     /// 요청 글에서 정한 팀이면 JEV가 AI를 다시 배정하지 않는다
     pub pinned: bool,
+    /// 요청 글에 적힌 팀별 인원. agents를 앞에서부터 이 수만큼 묶는다(없으면 비어 있다).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<usize>,
+    /// 요청 글에 적힌 자리별 노력치(agents와 같은 순서)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub member_efforts: Vec<Option<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -874,8 +880,17 @@ pub fn plan_with(text: &str, choice: Option<EngineId>, work_requested: bool, ins
         reasons.push(format!("요청하신 {m} 모델을 사용할 수 없어 사용 가능한 AI를 자동으로 선택했습니다"));
     }
     // 요청 글에 적힌 팀(워커 모델·수·총괄)은 JEV 판단과 설정보다 먼저다.
-    let ask = intent::requested_team(text, installed, work);
-    let lead = ask.as_ref().and_then(|a| a.lead.as_ref());
+    // 혼합 팀은 작업 모드에서만 받는다. 적힌 모델을 돌릴 수 없으면 다른 AI로 바꾸지 않고 멈춘다.
+    let roster = if work {
+        intent::requested_roster(text, installed, work).map_err(|e| match e {
+            intent::RosterError::Missing(name) => format!("{name} 모델을 사용할 수 없어 팀을 실행할 수 없으므로, 모델을 설치하거나 팀에서 제외해 주세요."),
+            intent::RosterError::TooMany(n) => format!("팀 인원이 {n}명이며, 최대 허용 인원은 {max}명입니다.", max = intent::MAX_AGENTS),
+        })?
+    } else {
+        None
+    };
+    let ask = if roster.is_some() { None } else { intent::requested_team(text, installed, work) };
+    let lead = roster.as_ref().and_then(|r| r.lead.as_ref()).or(ask.as_ref().and_then(|a| a.lead.as_ref()));
     let mut models: Vec<(EngineId, String)> = vec![];
     let picked = lead.or(wanted.picks.first()).map(|mp| match choice.and_then(|c| mp.alts.iter().find(|(e, _)| *e == c)) {
         Some((e, m)) => (*e, m.clone(), mp),
@@ -889,7 +904,8 @@ pub fn plan_with(text: &str, choice: Option<EngineId>, work_requested: bool, ins
         }
         // 같은 모델을 쓸 수 있는 다른 AI가 있으면 실패할 때 그쪽으로 넘어간다.
         let mut fb = vec![];
-        for (e, m) in mp.alts.iter().filter(|(e, _)| *e != engine) {
+        // 요청 글이 정한 총괄이 실패해도 고르지 않은 API로 넘어가지 않는다.
+        for (e, m) in mp.alts.iter().filter(|(e, _)| *e != engine && !(work && lead.is_some() && e.is_api())) {
             if let Some(m) = m {
                 models.push((*e, m.clone()));
             }
@@ -922,13 +938,16 @@ pub fn plan_with(text: &str, choice: Option<EngineId>, work_requested: bool, ins
     // agents 0: JEV가 정한다. 대화 답을 여럿 합치는 것은 효율이 나쁘므로 파일 작업을 나눌 수 있을 때만 병렬로 돈다.
     let jev_split = if agents == 0 && work && choice.is_none() { jev_parts(jev) } else { None };
     let setting = if agents == 0 { jev_split.unwrap_or(1) } else { agents };
-    let want = if let Some(a) = &ask { a.count } else if wanted.picks.len() >= 2 { wanted.picks.len() } else { asked_agents.unwrap_or(setting as usize) }.min(intent::MAX_AGENTS);
+    let seats: Vec<&intent::RosterMember> = roster.iter().flat_map(|r| r.teams.iter().flatten()).collect();
+    let want = if !seats.is_empty() { seats.len() } else if let Some(a) = &ask { a.count } else if wanted.picks.len() >= 2 { wanted.picks.len() } else { asked_agents.unwrap_or(setting as usize) }.min(intent::MAX_AGENTS);
     let team_from = reasons.len();
     let team = if want < 2 {
         None
     } else {
         let mut list: Vec<TeamAgent> = vec![];
-        if let Some(a) = &ask {
+        if !seats.is_empty() {
+            list = seats.iter().map(|m| TeamAgent { engine: m.pick.engine, model: m.pick.model.clone() }).collect();
+        } else if let Some(a) = &ask {
             list = vec![TeamAgent { engine: a.workers.engine, model: a.workers.model.clone() }; a.count];
         } else if wanted.picks.len() >= 2 {
             for mp in &wanted.picks {
@@ -938,8 +957,9 @@ pub fn plan_with(text: &str, choice: Option<EngineId>, work_requested: bool, ins
             list.push(TeamAgent { engine: primary, model: models.iter().find(|(e, _)| *e == primary).map(|(_, m)| m.clone()) });
             // 다른 회사의 AI → 다른 엔진 → (모자라면) 같은 엔진을 새 세션으로 더 띄운다. 작업 모드는 도구가 많은 CLI가 먼저다.
             let mut pool: Vec<EngineId> = order.iter().copied().filter(usable).collect();
-            if work {
-                pool.sort_by_key(|e| e.is_api());
+            // 작업 모드의 빈자리를 사용자가 고르지 않은 API로 채우지 않는다. CLI가 하나도 없을 때만 API로 돈다.
+            if work && pool.iter().any(|e| !e.is_api()) {
+                pool.retain(|e| !e.is_api());
             }
             for e in &pool {
                 if list.len() < want && !list.iter().any(|a| a.engine.vendor() == e.vendor()) {
@@ -964,7 +984,7 @@ pub fn plan_with(text: &str, choice: Option<EngineId>, work_requested: bool, ins
         let n = list.len();
         let names = list.iter().map(|a| match &a.model { Some(m) => format!("{}({m})", a.engine.label()), None => a.engine.label().to_string() }).collect::<Vec<_>>().join(", ");
         let synth_label = synth.label();
-        if ask.is_none() && asked_agents.is_none() && wanted.picks.len() < 2 {
+        if seats.is_empty() && ask.is_none() && asked_agents.is_none() && wanted.picks.len() < 2 {
             if jev_split.is_some() {
                 reasons.push(format!("JEV: {n}개 에이전트로 나눠 동시 진행"));
             } else {
@@ -976,7 +996,7 @@ pub fn plan_with(text: &str, choice: Option<EngineId>, work_requested: bool, ins
         } else {
             reasons.push(format!("{n}개 에이전트({names})의 개별 답변을 {synth_label}에서 하나로 종합하여 전달합니다."));
         }
-        Some(Team { agents: list, synth, agent_effort: ask.as_ref().and_then(|a| a.effort).map(str::to_string), pinned: ask.is_some() })
+        Some(Team { agents: list, synth, agent_effort: ask.as_ref().and_then(|a| a.effort).map(str::to_string), pinned: ask.is_some() || !seats.is_empty(), groups: roster.iter().flat_map(|r| r.teams.iter().map(Vec::len)).collect(), member_efforts: seats.iter().map(|m| m.effort.map(str::to_string)).collect() })
     };
 
     // 회의로 바뀌면 동시 에이전트 이유를 지울 수 있게 따로 둔다.
@@ -2676,6 +2696,12 @@ impl Drop for LeadEntry {
     }
 }
 
+/// 적힌 팀 크기대로 자리를 앞에서부터 묶는다. 하위 작업이 팀보다 적으면 그만큼만 돈다.
+fn written_units(agents: &[TeamAgent], sizes: &[usize], parts: usize) -> Vec<Vec<TeamAgent>> {
+    let mut seats = agents.iter().cloned();
+    sizes.iter().take(parts).map(|n| seats.by_ref().take(*n).collect()).collect()
+}
+
 async fn run_team_work(tw: &TeamWork<'_>, p: &mut Plan, team: &Team, ctx: &(dyn Fn(Option<&str>, &str) -> String + Sync), steps: &mut Vec<Step>) -> Option<(String, Value)> {
     let (app, st, conv, task, mid, s) = (tw.app, tw.st, tw.conv, tw.task, tw.mid, tw.settings);
     let act = |text: String| emit(app, "task:activity", json!({ "taskId": task, "conversationId": conv, "phase": "agents", "text": text }));
@@ -2723,6 +2749,9 @@ async fn run_team_work(tw: &TeamWork<'_>, p: &mut Plan, team: &Team, ctx: &(dyn 
         steer: None,
         attachments: tw.files.to_vec(),
     };
+    if !team.groups.is_empty() {
+        split.prompt = format!("{}\n\n{}", split.prompt, teamwork::teams_note(&team.groups));
+    }
     let jev_on_groups = if s.jev_enabled { secrets::get(SecretName::TypeSafe) } else { None };
     let (mut o, mut parts) = (Outcome::default(), None);
     for attempt in 0..2 {
@@ -2732,6 +2761,13 @@ async fn run_team_work(tw: &TeamWork<'_>, p: &mut Plan, team: &Team, ctx: &(dyn 
             return stopped(steps, p, Value::Null);
         }
         parts = o.ok.then(|| teamwork::parse_parts(&o.text, n)).flatten();
+        // 적힌 팀은 JEV에게 묻지 않고 수만 맞춘다. 다르면 한 번 더 나누게 하고, 그래도 다르면 아래에서 맞춘다.
+        if !team.groups.is_empty() {
+            if attempt == 0 && parts.as_ref().is_some_and(|f: &Vec<teamwork::Part>| f.len() != team.groups.len()) {
+                continue;
+            }
+            break;
+        }
         let (Some(found), Some(key), 0) = (&parts, &jev_on_groups, attempt) else { break };
         match groups_kept(&st.http, key, &p.prompt, found).await {
             Ok((kept, ms, cost)) => {
@@ -2748,6 +2784,10 @@ async fn run_team_work(tw: &TeamWork<'_>, p: &mut Plan, team: &Team, ctx: &(dyn 
         single(p, "독립된 하위 작업으로 분할할 수 없어 단일 에이전트가 전체 파일 수정을 진행합니다.".to_string());
         return None;
     };
+    let parts = if team.groups.is_empty() { parts } else { teamwork::fit_to_teams(parts, &team.groups) };
+    if !team.groups.is_empty() && parts.len() < team.groups.len() {
+        p.reasons.push(format!("작업이 {got}개로 분할되어 작성된 {want}개 팀 중 {got}개 팀만 실행됩니다.", got = parts.len(), want = team.groups.len()));
+    }
 
     // 3) 에이전트마다 폴더 사본
     let tmp = st.data_dir.join("teamwork").join(task);
@@ -2801,7 +2841,15 @@ async fn run_team_work(tw: &TeamWork<'_>, p: &mut Plan, team: &Team, ctx: &(dyn 
     let shared: std::sync::Arc<AppState> = app.state::<std::sync::Arc<AppState>>().inner().clone();
     let lead = std::sync::Arc::new(crate::leadrun::TaskLead::new(conv, task, mid, &p.prompt, team.synth, model_for(p, team.synth, s), root.clone(), jev_on_groups.clone(), tw.cancel.child_token(), o.session_id.clone()));
     let mut spare = team.agents.iter().cycle().skip(parts.len());
-    let units: Vec<Vec<TeamAgent>> = parts.iter().zip(&assigned).map(|(x, first)| std::iter::once(first.clone()).chain(spare.by_ref().take(x.members.saturating_sub(1)).cloned()).collect()).collect();
+    let units: Vec<Vec<TeamAgent>> = if team.groups.is_empty() {
+        parts.iter().zip(&assigned).map(|(x, first)| std::iter::once(first.clone()).chain(spare.by_ref().take(x.members.saturating_sub(1)).cloned()).collect()).collect()
+    } else {
+        written_units(&team.agents, &team.groups, parts.len())
+    };
+    // 기록에는 하위 작업마다 첫 자리가 남으므로 적힌 팀은 그 자리로 맞춘다.
+    let agents: Vec<&TeamAgent> = if team.groups.is_empty() { agents } else { units.iter().filter_map(|u| u.first()).collect() };
+    // 적힌 자리별 노력치를 찾는 시작 위치
+    let seat_from = |i: usize| team.groups.iter().take(i).sum::<usize>();
     let member_key = |i: usize, m: usize, unit: &[TeamAgent]| if unit.len() > 1 { format!("agent:{i}.{m}") } else { format!("agent:{i}") };
     {
         let mut workers = lead.workers.lock().unwrap_or_else(|e| e.into_inner());
@@ -2847,7 +2895,7 @@ async fn run_team_work(tw: &TeamWork<'_>, p: &mut Plan, team: &Team, ctx: &(dyn 
                             (Some(b), EngineId::Claude) => b.claude_model.map(str::to_string),
                             _ => model_for(pr, a.engine, s),
                         }),
-                        effort: team.agent_effort.clone().or_else(|| tiers[i].as_ref().map(|b| b.effort.to_string())).or_else(|| effort.clone()),
+                        effort: team.member_efforts.get(seat_from(i) + m).cloned().flatten().or_else(|| team.agent_effort.clone()).or_else(|| tiers[i].as_ref().map(|b| b.effort.to_string())).or_else(|| effort.clone()),
                         max_tokens: tiers[i].as_ref().map(|b| b.max_tokens).or(max_tokens),
                         extra_dirs: tw.extra_dirs.to_vec(),
                         steer: None,
@@ -2875,7 +2923,8 @@ async fn run_team_work(tw: &TeamWork<'_>, p: &mut Plan, team: &Team, ctx: &(dyn 
             (Some(b), _) => (Some(b.effort.to_string()), spec_model(p, a.engine, s)),
             (None, _) => (spec_effort(p), spec_model(p, a.engine, s)),
         };
-        steps.push(step(a.engine, "agent", o, &team.agent_effort.clone().or(effort), a.model.clone().or(model)));
+        let written = team.member_efforts.get(seat_from(i)).cloned().flatten();
+        steps.push(step(a.engine, "agent", o, &written.or(team.agent_effort.clone()).or(effort), a.model.clone().or(model)));
     }
 
     // 5) 바뀐 파일 찾기(실패·중지한 에이전트는 합치지 않는다)
@@ -3510,6 +3559,40 @@ mod tests {
         assert_eq!(p.primary, Claude);
         assert!(p.models.contains(&(Claude, "opus".to_string())), "{:?}", p.models);
         assert!(p.prompt.contains("Gemini 3.8 Flash"), "지시문은 그대로 넘긴다");
+    }
+
+    #[test]
+    fn written_mixed_teams_run_exactly_as_written() {
+        use EngineId::*;
+        let c = Catalog::default();
+        let all = [Claude, Antigravity, OpenCode, Nvidia, ClaudeApi, GeminiApi];
+        let text = "팀은 총관인 Opus 5.5 high 중심으로\n1팀 - Claude Haiku 5.5 high, Gemini flash 3.8 high\n2팀 - Claude Haiku 5.5 high, Gemini flash 3.8 low";
+        let p = plan_with(text, None, true, &all, &c, ReviewMode::Auto, None, 2).unwrap();
+        let t = p.team.clone().expect("적힌 팀");
+        let (h, g) = (TeamAgent { engine: Claude, model: Some("haiku".into()) }, TeamAgent { engine: Antigravity, model: Some("gemini-3.8-flash".into()) });
+        assert_eq!(t.agents, vec![h.clone(), g.clone(), h.clone(), g.clone()]);
+        assert_eq!(t.groups, vec![2, 2]);
+        assert_eq!(t.member_efforts[3].as_deref(), Some("low"));
+        assert!(t.pinned);
+        assert_eq!((p.primary, t.synth), (Claude, Claude));
+        assert!(p.models.contains(&(Claude, "opus".to_string())), "{:?}", p.models);
+        assert!(!p.fallbacks.iter().any(|e| e.is_api()), "{:?}", p.fallbacks);
+        assert!(plan_with(text, None, true, &[Antigravity, OpenCode], &c, ReviewMode::Auto, None, 2).is_err(), "돌릴 수 없으면 다른 AI로 바꾸지 않는다");
+        assert_eq!(written_units(&t.agents, &t.groups, 2), vec![vec![h.clone(), g.clone()], vec![h.clone(), g.clone()]], "페어가 흩어지지 않는다");
+        assert_eq!(written_units(&t.agents, &t.groups, 1), vec![vec![h, g]]);
+    }
+
+    #[test]
+    fn work_team_never_fills_seats_with_apis_while_a_cli_exists() {
+        use EngineId::*;
+        let c = Catalog::default();
+        let all = [Claude, Antigravity, OpenCode, Nvidia, ClaudeApi, GeminiApi, OpenAi];
+        let p = plan_with("에이전트 8개로 고쳐 줘", None, true, &all, &c, ReviewMode::Auto, None, 2).unwrap();
+        let t = p.team.expect("팀");
+        assert_eq!(t.agents.len(), 8);
+        assert!(t.agents.iter().all(|a| !a.engine.is_api()), "{:?}", t.agents);
+        let only_api = plan_with("에이전트 3개로 고쳐 줘", None, true, &[ClaudeApi, GeminiApi], &c, ReviewMode::Auto, None, 2).unwrap();
+        assert_eq!(only_api.team.expect("CLI가 없으면 API로 돈다").agents.len(), 3);
     }
 
     #[test]

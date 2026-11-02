@@ -218,7 +218,7 @@ pub struct TeamAsk {
 }
 
 const WORKER_WORDS: &[&str] = &["서브 에이전트", "서브에이전트", "하위 에이전트", "에이전트", "워커", "sub-agents", "sub-agent", "subagents", "subagent", "agents", "agent", "workers", "worker"];
-const LEAD_WORDS: &[&str] = &["총괄", "총관리", "관리자", "오케스트레이터", "리드", "감독", "orchestrator", "lead", "manager", "supervisor"];
+const LEAD_WORDS: &[&str] = &["총괄", "총관", "관리자", "오케스트레이터", "리드", "감독", "orchestrator", "lead", "manager", "supervisor"];
 const EFFORTS: &[&str] = &["xhigh", "max", "high", "medium", "low"];
 
 fn skip_marks(s: &str) -> &str {
@@ -249,7 +249,7 @@ fn bare_count(after: &str) -> Option<usize> {
         return None;
     }
     let tail = t[digits..].trim_start_matches(' ');
-    (marked || tail.starts_with(['개', '명', '대'])).then(|| t[..digits].parse().ok()).flatten()
+    (marked || tail.starts_with(['개', '명', '대', '기'])).then(|| t[..digits].parse().ok()).flatten()
 }
 
 /// 이 모델 언급이 지시하는 워커 수와 노력치
@@ -279,6 +279,168 @@ pub fn requested_team(text: &str, installed: &[EngineId], work: bool) -> Option<
     let workers = pick_of(worker, installed, work).ok()?;
     let lead = hits.iter().filter(|h| h.family != worker.family && names_lead(&low, h)).find_map(|h| pick_of(h, installed, work).ok());
     Some(TeamAsk { workers, effort, count, lead })
+}
+
+/// 요청 글이 팀별로 적은 워커 한 자리
+#[derive(Debug, Clone, PartialEq)]
+pub struct RosterMember {
+    pub pick: ModelPick,
+    pub effort: Option<&'static str>,
+}
+
+/// 요청 글에 적힌 혼합 팀 구성. 적힌 그대로 돌리며 다른 AI로 채우지 않는다.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Roster {
+    pub teams: Vec<Vec<RosterMember>>,
+    pub lead: Option<ModelPick>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RosterError {
+    /// 적힌 모델을 돌릴 엔진이 없다
+    Missing(String),
+    /// 적힌 자리 수가 MAX_AGENTS를 넘는다
+    TooMany(usize),
+}
+
+#[derive(Clone)]
+struct RosterEntry {
+    family: usize,
+    pick: Result<ModelPick, String>,
+    effort: Option<&'static str>,
+    count: usize,
+}
+
+/// 팀 줄에서 모델 이름 말고 이만큼의 글자가 더 있으면 구성표가 아니라 할 일을 적은 줄로 본다.
+const ROSTER_LINE_MAX_WORDS: usize = 6;
+const EACH_TEAM_WORDS: &[&str] = &["각 팀", "각팀", "각 그룹", "한 팀", "한 그룹", "팀당", "팀마다", "그룹마다", "each team", "per team", "each group", "per group"];
+/// "각각 4개씩" 뒤에 이 말이 있으면 모델 하나씩을 한 팀으로 묶는다.
+const PAIR_WORDS: &[&str] = &["그룹", "팀", "페어", "짝", "묶", "group", "team", "pair"];
+
+/// 이 언급이 워커가 아니라 총괄을 가리키는지("총관은 Opus", "Opus가 총괄")
+fn lead_mention(low: &str, h: &Hit, after: &str) -> bool {
+    let before = &low[low[..h.start].rfind('\n').map_or(0, |i| i + 1)..h.start];
+    let named_before = LEAD_WORDS.iter().any(|w| before.rfind(w).is_some_and(|i| before.len() - (i + w.len()) <= 12 && !before[i..].contains([',', '.'])));
+    let t = after.trim_start_matches(['가', '이', '는', '은', '를', '을', ' ', '*', ')']);
+    named_before || LEAD_WORDS.iter().any(|w| t.starts_with(w))
+}
+
+/// 모델 이름·수 말고 남은 글자 수. 이음말과 조사 정도면 구성표로 본다.
+fn word_chars(s: &str) -> usize {
+    s.chars().filter(|c| c.is_alphabetic() && !['기', '개', '명', '대', 'x', '×'].contains(c)).count()
+}
+
+/// 이 글의 모델 언급들과 그 밖에 남은 글자 수. "Claude Code (Haiku 5.5)"는 괄호 안의 모델만 센다.
+fn roster_entries(text: &str, installed: &[EngineId], work: bool) -> (Vec<RosterEntry>, usize) {
+    let low = text.to_ascii_lowercase();
+    let hits = scan(text);
+    let (mut out, mut rest, mut pos) = (vec![], 0, 0);
+    for (i, h) in hits.iter().enumerate() {
+        rest += word_chars(&low[pos..h.start.max(pos)]);
+        pos = h.end;
+        let names_inner = hits.get(i + 1).is_some_and(|n| n.start >= h.end && ["", "(", "-", ":"].contains(&low[h.end..n.start].trim_matches([' ', '`', '*'])));
+        if names_inner {
+            continue;
+        }
+        let (effort, used) = effort_after(&low[h.end..]);
+        pos = h.end + used;
+        if lead_mention(&low, h, &low[pos..]) {
+            continue;
+        }
+        let after = low[pos..].trim_start_matches([' ', '*', ')', '`']);
+        out.push(RosterEntry { family: h.family, pick: pick_of(h, installed, work), effort, count: bare_count(after).unwrap_or(1).max(1) });
+    }
+    (out, rest + word_chars(&low[pos.min(low.len())..]))
+}
+
+/// "1팀", "2 그룹", "Team 3" 꼴로 시작하는 줄이면 그 뒤의 글
+fn after_team_label(line: &str) -> Option<&str> {
+    let t = line.trim_start_matches([' ', '\t', '-', '*', '#', '|', '>', '`']);
+    let digits = t.len() - t.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let (label_end, words): (usize, &[&str]) = if digits > 0 { (digits, &["팀", "그룹"]) } else { (0, &["team", "group", "팀", "그룹"]) };
+    let r = t[label_end..].trim_start();
+    let word = words.iter().find(|w| r.starts_with(**w))?;
+    let r = &r[word.len()..];
+    if digits > 0 {
+        return (!r.starts_with(is_word)).then_some(r);
+    }
+    let r = r.trim_start();
+    let n = r.len() - r.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    (n > 0).then_some(&r[n..])
+}
+
+/// "각각 4개씩"의 수
+fn each_times(line: &str) -> Option<usize> {
+    let (_, r) = line.split_once("각각")?;
+    let t = r.trim_start();
+    let digits = t.len() - t.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    t[digits..].trim_start().starts_with('개').then(|| t[..digits].parse().ok()).flatten()
+}
+
+/// "4개 전담 팀", "4개 팀", "팀이 4개", "4 teams"에서 팀 수. 팀 이름 "4팀"과 헷갈리지 않게 단위가 있는 말만 본다.
+fn team_total(low: &str) -> Option<usize> {
+    let digits_at_end = |s: &str| -> Option<usize> {
+        let w = s.trim_end();
+        let n = w.len() - w.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+        w[w.len() - n..].parse().ok()
+    };
+    for (i, _) in low.match_indices('팀') {
+        let pre = low[..i].trim_end();
+        let pre = ["전담", "작업", "개발", "의"].iter().find_map(|w| pre.strip_suffix(w)).unwrap_or(pre).trim_end();
+        if let Some(n) = pre.strip_suffix('개').and_then(digits_at_end) {
+            return Some(n);
+        }
+        let post = low[i + '팀'.len_utf8()..].trim_start_matches(['이', '가', '은', '는', '을', '를', ' ', ':']);
+        let digits = post.len() - post.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if digits > 0 && post[digits..].trim_start().starts_with('개') {
+            return post[..digits].parse().ok();
+        }
+    }
+    low.match_indices("teams").find_map(|(i, _)| digits_at_end(&low[..i]))
+}
+
+/// 요청 글에 적힌 혼합 팀 구성("1팀 - Haiku high, Gemini flash high" 줄들, 또는 "각 팀은 Haiku 1기와 Gemini 1기" + "4개 팀").
+pub fn requested_roster(text: &str, installed: &[EngineId], work: bool) -> Result<Option<Roster>, RosterError> {
+    let mut teams: Vec<Vec<RosterEntry>> = text
+        .lines()
+        .filter_map(|line| {
+            let (entries, rest) = roster_entries(&after_team_label(&line.to_ascii_lowercase())?.to_string(), installed, work);
+            (!entries.is_empty() && rest <= ROSTER_LINE_MAX_WORDS).then_some(entries)
+        })
+        .collect();
+    if teams.is_empty() {
+        let low = text.to_ascii_lowercase();
+        let each = low.lines().filter(|l| EACH_TEAM_WORDS.iter().any(|w| l.contains(w))).map(|l| roster_entries(l, installed, work).0).find(|e| !e.is_empty());
+        if let (Some(each), Some(total)) = (each, team_total(&low)) {
+            teams = vec![each; total];
+        } else if let Some((times, entries)) = low.lines().filter_map(|l| Some((each_times(l)?, roster_entries(l, installed, work).0))).find(|(_, e)| e.len() >= 2) {
+            teams = if PAIR_WORDS.iter().any(|w| low.contains(w)) {
+                vec![entries; times]
+            } else {
+                (0..times).flat_map(|_| entries.iter().map(|e| vec![e.clone()])).collect()
+            };
+        }
+    }
+    let seats: usize = teams.iter().flatten().map(|e| e.count).sum();
+    if seats < 2 {
+        return Ok(None);
+    }
+    if seats > MAX_AGENTS {
+        return Err(RosterError::TooMany(seats));
+    }
+    let families: Vec<usize> = teams.iter().flatten().map(|e| e.family).collect();
+    let mut out = vec![];
+    for team in &teams {
+        let mut members = vec![];
+        for e in team {
+            let pick = e.pick.clone().map_err(RosterError::Missing)?;
+            members.extend(std::iter::repeat_n(RosterMember { pick, effort: e.effort }, e.count));
+        }
+        out.push(members);
+    }
+    let low = text.to_ascii_lowercase();
+    let lead = scan(text).iter().filter(|h| !families.contains(&h.family) && names_lead(&low, h)).find_map(|h| pick_of(h, installed, work).ok());
+    Ok(Some(Roster { teams: out, lead }))
 }
 
 const AGENT_WORDS: &[&str] = &["서브에이전트", "에이전트", "agents", "agent"];
@@ -431,7 +593,74 @@ mod tests {
 
     const ALL: &[EngineId] = &[Claude, Codex, Antigravity, OpenCode, ClaudeApi, OpenAi, GeminiApi, Nvidia];
 
-    const PLEXUS_REQUEST: &str = "당신은 본 프로젝트의 **총괄 분할자 및 관리자(Orchestrator & Lead Manager)**인 **Opus 5.5**입니다.\n아래 과제를 나눈 뒤, **4개의 Gemini 3.8 Flash (High) 하위 에이전트(Worker)**를 병렬 구동하여 작업을 지시·감독하십시오.\n- **병렬 실행 워커**: Gemini 3.8 Flash (High) × 4\n";
+    const PAIR_LINES: &str = "지금 전달이 잘못되었어 팀은 총관인 Opus 5.5 high 중심으로 \n1팀 - Claude Haiku 5.5 high, Gemini flash 3.8 high\n2팀 - Claude Haiku 5.5 high, Gemini flash 3.8 high\n3팀 - Claude Haiku 5.5 high, Gemini flash 3.8 high\n4팀 - Claude Haiku 5.5 high, Gemini flash 3.8 high\n이렇게 구성되어야 해 필요에 따라 아주 간단한 임무를 맞는 \n5팀 - OpenCode, Nvidia API 이 있어도 괜찮아";
+    const PAIR_PROSE: &str = "당신은 **총관리자(Lead Orchestrator, 모델: Claude Opus 5.5 High)**입니다.\n산하의 **8개 서브 에이전트(4개 전담 팀)**에게 분배하세요.\n\n## 1. 에이전트 팀 구성 (총 4개 팀 / 8개 에이전트 고정)\n각 팀은 반드시 **Claude Code (Haiku 5.5 High) 1기**와 **Gemini 3.8 Flash High 1기**가 1:1 페어(Pair)를 이룹니다.\n\n- **Team 1 ~ Team 4 공통 편성 (팀당 2기, 총 8기 가동)**:\n  - **Worker A (`Claude Code - Haiku 5.5 High`)**: 코드 수정 전담\n  - **Worker B (`Gemini 3.8 Flash High`)**: 검증 전담\n";
+
+    fn seats(r: &Roster) -> Vec<Vec<(EngineId, Option<String>, Option<&'static str>)>> {
+        r.teams.iter().map(|t| t.iter().map(|m| (m.pick.engine, m.pick.model.clone(), m.effort)).collect()).collect()
+    }
+
+    fn pair() -> Vec<(EngineId, Option<String>, Option<&'static str>)> {
+        vec![(Claude, Some("haiku".into()), Some("high")), (Antigravity, Some("gemini-3.8-flash".into()), Some("high"))]
+    }
+
+    #[test]
+    fn roster_reads_numbered_team_lines_and_the_lead() {
+        let r = requested_roster(PAIR_LINES, ALL, true).unwrap().expect("팀 구성");
+        assert_eq!(seats(&r), vec![pair(); 4], "허락만 한 5팀은 넣지 않는다");
+        let lead = r.lead.expect("총괄");
+        assert_eq!((lead.engine, lead.model.as_deref()), (Claude, Some("opus")));
+    }
+
+    #[test]
+    fn roster_reads_a_pair_repeated_for_each_team() {
+        let r = requested_roster(PAIR_PROSE, ALL, true).unwrap().expect("팀 구성");
+        assert_eq!(seats(&r), vec![pair(); 4]);
+        assert_eq!(r.lead.expect("총괄").model.as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn roster_reads_a_team_described_in_a_sentence() {
+        let text = "총관은 Opus 5.5 high야 Claude Code Haiku 5.5 high와 Gemini 3.8 flash high 각각 4개씩 한마디로 총 8개의 에이전트를 사용하여 작업을 진행해줘 각각 하나씩 그룹을 묶어 작업을 하게 해줘\n주의 사항으로 Haiku 5.5 high 1개와 Gemini 3.8 flash high 1개가 한 팀이고 이런 팀이 4개가 존재하면 좋겠어 그러니 총 에이전트는 8개가 돌아가야해";
+        let r = requested_roster(text, ALL, true).unwrap().expect("팀 구성");
+        assert_eq!(seats(&r), vec![pair(); 4]);
+        assert_eq!(r.lead.expect("총괄").model.as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn roster_reads_each_model_n_times_with_or_without_groups() {
+        let grouped = "총관은 Opus 5.5 high야 Claude Code Haiku 5.5 high와 Gemini 3.8 flash high 각각 4개씩 사용하고 하나씩 그룹으로 묶어 줘";
+        let r = requested_roster(grouped, ALL, true).unwrap().expect("팀 구성");
+        assert_eq!(seats(&r), vec![pair(); 4], "총관은 워커 자리에 들어가지 않는다");
+        assert_eq!(r.lead.expect("총괄").model.as_deref(), Some("opus"));
+        let flat = requested_roster("Claude Haiku와 Gemini flash 각각 2개씩 돌려 줘", ALL, true).unwrap().expect("팀 구성");
+        assert_eq!(flat.teams.iter().map(Vec::len).collect::<Vec<_>>(), vec![1, 1, 1, 1], "묶으라는 말이 없으면 따로 돈다");
+    }
+
+    #[test]
+    fn roster_keeps_each_written_model_effort_and_count() {
+        let r = requested_roster("Team 1: gemini-3.8-flash low x2 + Claude Sonnet\n**2팀**: Codex", ALL, true).unwrap().expect("팀 구성");
+        assert_eq!(seats(&r)[0].len(), 3);
+        assert_eq!(seats(&r)[0][1], (Antigravity, Some("gemini-3.8-flash".into()), Some("low")));
+        assert_eq!(seats(&r)[0][2], (Claude, Some("sonnet".into()), None));
+        assert_eq!(seats(&r)[1], vec![(Codex, None, None)]);
+    }
+
+    #[test]
+    fn roster_ignores_text_that_only_mentions_teams_or_models() {
+        for text in ["1팀: 실험 버전 승격\n2팀: 게임 창 테스트", "에이전트 4개로 조사해 줘", "1팀: Gemini API 연동 코드를 새로 구현하고 테스트를 추가\n2팀: Claude 호출 문서를 전부 다시 작성", "각 팀은 코드를 나눠 맡으세요. 4개 팀입니다.", "Claude Haiku로 고쳐 줘", "1팀 - Claude Haiku"] {
+            assert_eq!(requested_roster(text, ALL, true), Ok(None), "{text}");
+        }
+    }
+
+    #[test]
+    fn roster_refuses_a_model_it_cannot_run_or_too_many_seats() {
+        assert_eq!(requested_roster(PAIR_LINES, &[Antigravity], true), Err(RosterError::Missing("Claude Haiku".into())));
+        let big = "1팀: Claude Haiku x9, Gemini flash\n2팀: Claude Haiku x9";
+        assert_eq!(requested_roster(big, ALL, true), Err(RosterError::TooMany(19)));
+    }
+
+    const PLEXUS_REQUEST: &str ="당신은 본 프로젝트의 **총괄 분할자 및 관리자(Orchestrator & Lead Manager)**인 **Opus 5.5**입니다.\n아래 과제를 나눈 뒤, **4개의 Gemini 3.8 Flash (High) 하위 에이전트(Worker)**를 병렬 구동하여 작업을 지시·감독하십시오.\n- **병렬 실행 워커**: Gemini 3.8 Flash (High) × 4\n";
 
     #[test]
     fn team_request_names_lead_workers_effort_and_count() {
