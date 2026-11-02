@@ -817,6 +817,12 @@ pub fn plan(text: &str, choice: Option<EngineId>, work_requested: bool, installe
 /// agents: 설정의 기본 동시 에이전트 수(1이면 끔). 요청 글에서 수나 모델을 여럿 정하면 그쪽이 먼저다.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_with(text: &str, choice: Option<EngineId>, work_requested: bool, installed: &[EngineId], catalog: &Catalog, review: ReviewMode, jev: Option<&Judgment>, agents: u8) -> Result<Plan, String> {
+    plan_read(text, choice, work_requested, installed, catalog, review, jev, agents, None)
+}
+
+/// team_lines: AI가 요청 글에서 뽑은 팀 구성표(파서가 글을 못 읽었을 때만 있다)
+#[allow(clippy::too_many_arguments)]
+fn plan_read(text: &str, choice: Option<EngineId>, work_requested: bool, installed: &[EngineId], catalog: &Catalog, review: ReviewMode, jev: Option<&Judgment>, agents: u8, team_lines: Option<&str>) -> Result<Plan, String> {
     let mut reasons = vec![];
     // 1) 스킬
     let (skill, prompt): (Option<&Skill>, String) = match catalog.explicit(text) {
@@ -882,7 +888,11 @@ pub fn plan_with(text: &str, choice: Option<EngineId>, work_requested: bool, ins
     // 요청 글에 적힌 팀(워커 모델·수·총괄)은 JEV 판단과 설정보다 먼저다.
     // 혼합 팀은 작업 모드에서만 받는다. 적힌 모델을 돌릴 수 없으면 다른 AI로 바꾸지 않고 멈춘다.
     let roster = if work {
-        intent::requested_roster(text, installed, work).map_err(|e| match e {
+        match team_lines {
+            Some(lines) => intent::roster_from_answer(lines, text, installed, work),
+            None => intent::requested_roster(text, installed, work),
+        }
+        .map_err(|e| match e {
             intent::RosterError::Missing(name) => format!("{name} 모델을 사용할 수 없어 팀을 실행할 수 없으므로, 모델을 설치하거나 팀에서 제외해 주세요."),
             intent::RosterError::TooMany(n) => format!("팀 인원이 {n}명이며, 최대 허용 인원은 {max}명입니다.", max = intent::MAX_AGENTS),
         })?
@@ -2011,10 +2021,28 @@ async fn run_task(app: &AppHandle, st: &AppState, conv: &str, task: &str, text: 
         let _ = store::insert_message_as(&st.db, &mid, conv, "assistant", &content, Some(&data));
         emit(app, "message:created", json!({ "conversationId": conv, "messageId": mid, "taskId": task }));
     };
-    let mut p = match plan_with(text, choice, work_req, &st.installed(), &catalog, s.review, judgment.as_ref(), if s.agents_auto { 0 } else { s.agents }) {
+    // 팀을 적은 듯한데 파서가 못 읽었으면 AI에게 구성표만 뽑게 한다. 멋대로 채우기 전에 먼저 읽는다.
+    let (mut team_lines, mut team_unread) = (None, false);
+    if work_req && intent::needs_team_reading(text, &st.installed(), true) {
+        team_unread = true;
+        if let Some((engine, model)) = team_reader(&st.installed()) {
+            emit(app, "task:activity", json!({ "taskId": task, "conversationId": conv, "phase": "plan", "text": "작성된 팀 구성 확인 중" }));
+            let spec = RunSpec { engine, prompt: intent::team_reading_prompt(text), system: system_prompt(false, &ws, None), cwd: workspace.clone(), work: false, resume: None, plugin_dirs: vec![], model, effort: Some("low".into()), max_tokens: Some(1000), extra_dirs: vec![], steer: None, attachments: vec![] };
+            let o = run_engine_as(app, st, conv, task, &mid, "plan", spec, TEAM_READ_TIMEOUT, &cancel, false, "plan").await;
+            if o.ok {
+                // "없음"이면 팀을 적은 글이 아니다. 답을 읽을 수 없을 때만 알린다.
+                team_unread = !o.text.contains("없음") && matches!(intent::roster_from_answer(&o.text, text, &st.installed(), true), Ok(None));
+                team_lines = Some(o.text);
+            }
+        }
+    }
+    let mut p = match plan_read(text, choice, work_req, &st.installed(), &catalog, s.review, judgment.as_ref(), if s.agents_auto { 0 } else { s.agents }, team_lines.as_deref()) {
         Ok(p) => p,
         Err(e) => return finish(format!("⚠ {e}"), json!({ "error": e })),
     };
+    if team_unread {
+        p.reasons.insert(0, "작성된 팀 구성을 확인할 수 없어 에이전트를 자동으로 배정했습니다.".to_string());
+    }
     if let Some(e) = &jev_error {
         p.reasons.insert(0, format!("JEV를 쓰지 못해 규칙으로 정했습니다: {e}"));
     }
@@ -2661,6 +2689,7 @@ struct TeamWork<'a> {
 
 /// 나누는 AI 한 번에 기다리는 최대 시간
 const SPLIT_TIMEOUT: Duration = Duration::from_secs(300);
+const TEAM_READ_TIMEOUT: Duration = Duration::from_secs(90);
 /// 워커 하나를 기다리는 최소 시간. 큰 저장소의 하위 작업은 2026-11-02 실측 17~49분이 걸렸다.
 const TEAM_AGENT_TIMEOUT: Duration = Duration::from_secs(3600);
 
@@ -2694,6 +2723,17 @@ impl Drop for LeadEntry {
         self.lead.cancel.cancel();
         self.st.leads.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.lead.task);
     }
+}
+
+/// 팀 구성표를 뽑을 AI. 빠른 CLI만 쓴다(사용자가 고르지 않은 API를 부르지 않는다).
+fn team_reader(installed: &[EngineId]) -> Option<(EngineId, Option<String>)> {
+    if installed.contains(&EngineId::Claude) {
+        return Some((EngineId::Claude, Some("haiku".to_string())));
+    }
+    if installed.contains(&EngineId::Antigravity) {
+        return Some((EngineId::Antigravity, Some("gemini-3.8-flash".to_string())));
+    }
+    installed.iter().find(|e| !e.is_api()).map(|e| (*e, None))
 }
 
 /// 적힌 팀 크기대로 자리를 앞에서부터 묶는다. 하위 작업이 팀보다 적으면 그만큼만 돈다.
@@ -3580,6 +3620,28 @@ mod tests {
         assert!(plan_with(text, None, true, &[Antigravity, OpenCode], &c, ReviewMode::Auto, None, 2).is_err(), "돌릴 수 없으면 다른 AI로 바꾸지 않는다");
         assert_eq!(written_units(&t.agents, &t.groups, 2), vec![vec![h.clone(), g.clone()], vec![h.clone(), g.clone()]], "페어가 흩어지지 않는다");
         assert_eq!(written_units(&t.agents, &t.groups, 1), vec![vec![h, g]]);
+    }
+
+    #[test]
+    fn team_lines_read_by_an_ai_decide_the_team() {
+        use EngineId::*;
+        let c = Catalog::default();
+        let all = [Claude, Antigravity, OpenCode, ClaudeApi];
+        let lines = "총괄 - Claude Opus 5.5 high\n1팀 - Claude Haiku 5.5 high, Gemini 3.8 Flash high\n2팀 - Claude Haiku 5.5 high, Gemini 3.8 Flash high";
+        let p = plan_read("Haiku랑 Flash를 짝지어 두 쌍으로 해 줘", None, true, &all, &c, ReviewMode::Auto, None, 0, Some(lines)).unwrap();
+        let t = p.team.expect("구성표대로");
+        assert_eq!((t.agents.len(), t.groups), (4, vec![2, 2]));
+        assert_eq!(p.primary, Claude);
+        assert!(p.models.contains(&(Claude, "opus".to_string())));
+    }
+
+    #[test]
+    fn team_reader_never_picks_an_api() {
+        use EngineId::*;
+        assert_eq!(team_reader(&[ClaudeApi, Claude]), Some((Claude, Some("haiku".to_string()))));
+        assert_eq!(team_reader(&[GeminiApi, Antigravity]), Some((Antigravity, Some("gemini-3.8-flash".to_string()))));
+        assert_eq!(team_reader(&[ClaudeApi, OpenCode]), Some((OpenCode, None)));
+        assert_eq!(team_reader(&[ClaudeApi, GeminiApi]), None);
     }
 
     #[test]
