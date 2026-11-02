@@ -346,7 +346,7 @@ export default function SettingsDialog({ focusKeys = false }: { focusKeys?: bool
         <Section title={AGENT_TEXT.preset} i={4}>
           <Segmented
             label={AGENT_TEXT.preset}
-            className="wide"
+            className="wide dense"
             value={agentChoice.value(settings)}
             options={agentChoice.options}
             onChange={(v) => saveSettings(agentChoice.apply(settings, v))}

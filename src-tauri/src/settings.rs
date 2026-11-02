@@ -27,7 +27,7 @@ pub struct Settings {
     pub jev_enabled: bool,
     /// API 엔진별 모델 이름(engine id → model). 없으면 기본 모델.
     pub models: BTreeMap<String, String>,
-    /// 대화 요청마다 동시에 돌릴 에이전트 수(1이면 끔, 최대 5). 요청 글에서 따로 정하면 그 수를 쓴다.
+    /// 대화 요청마다 동시에 돌릴 에이전트 수(1이면 끔, 최대 16). 요청 글에서 따로 정하면 그 수를 쓴다.
     pub agents: u8,
     /// true면 JEV가 요청을 보고 동시 에이전트 수를 정한다(JEV를 못 쓰면 1개). false면 agents를 그대로 쓴다.
     pub agents_auto: bool,
@@ -101,11 +101,11 @@ mod tests {
         assert_eq!(back.review, ReviewMode::Off);
         // 빈 문자열은 기본 폴더로
         assert!(Settings { workspace_dir: Some("   ".into()), ..Default::default() }.sanitized().workspace_dir.is_none());
-        // 예전 설정(에이전트 수 없음)은 1개로, 범위 밖은 1~5로
+        // 예전 설정(에이전트 수 없음)은 1개로, 범위 밖은 1~16으로
         let old: Settings = serde_json::from_str(r#"{"review":"auto","jevEnabled":false,"models":{}}"#).unwrap();
         assert_eq!(old.agents, 1);
         assert!(old.agents_auto, "예전 설정도 JEV 자동 분배로 시작");
-        assert_eq!(Settings { agents: 9, ..Default::default() }.sanitized().agents, 5);
+        assert_eq!(Settings { agents: 99, ..Default::default() }.sanitized().agents, 16);
         assert_eq!(Settings { agents: 0, ..Default::default() }.sanitized().agents, 1);
         assert_eq!(old.test_slots, 1, "예전 설정의 테스트 동시 실행은 1개");
         assert_eq!(Settings { test_slots: 0, ..Default::default() }.sanitized().test_slots, 1);

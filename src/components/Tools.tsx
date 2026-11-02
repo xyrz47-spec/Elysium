@@ -67,7 +67,7 @@ const AGENT_AUTO = "auto";
 /** 동시 실행 수 고르기(도구 패널·설정 창이 같이 쓴다) */
 export const agentChoice = {
   value: (s: Settings) => (s.agentsAuto ? AGENT_AUTO : String(s.agents ?? 1)),
-  options: [AGENT_AUTO, "1", "2", "3", "4", "5"].map((v) => ({ value: v, label: v === AGENT_AUTO ? A.auto : v === "1" ? A.off : v })),
+  options: [AGENT_AUTO, ...Array.from({ length: 16 }, (_, i) => String(i + 1))].map((v) => ({ value: v, label: v === AGENT_AUTO ? A.auto : v === "1" ? A.off : v })),
   apply: (s: Settings, v: string): Settings => (v === AGENT_AUTO ? { ...s, agentsAuto: true } : { ...s, agentsAuto: false, agents: Number(v) }),
   help: (s: Settings) => (s.agentsAuto ? A.autoHelp : A.presetHelp),
 };
@@ -295,7 +295,7 @@ function AgentsTab({ onClose }: { onClose: () => void }) {
           <h4>{A.preset}</h4>
           <Segmented
             label={A.preset}
-            className="wide"
+            className="wide dense"
             value={agentChoice.value(settings)}
             options={agentChoice.options}
             onChange={(v) => saveSettings(agentChoice.apply(settings, v))}

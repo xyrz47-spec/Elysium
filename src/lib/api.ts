@@ -28,7 +28,7 @@ export interface Settings {
   review: ReviewMode;
   jevEnabled: boolean;
   models: Record<string, string>;
-  /** 대화 요청마다 동시에 돌릴 에이전트 수(1이면 끔, 최대 5) */
+  /** 대화 요청마다 동시에 돌릴 에이전트 수(1이면 끔, 최대 16) */
   agents: number;
   /** true면 JEV가 요청을 보고 에이전트 수를 정한다 */
   agentsAuto: boolean;

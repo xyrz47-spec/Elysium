@@ -64,6 +64,7 @@ input[type="password"] { font-family: var(--mono); font-size: 12.5px; }
 .seg button.on { background: var(--card); color: var(--ink); box-shadow: 0 2px 8px rgba(var(--shade-rgb), 0.12); }
 .seg.wide { display: flex; }
 .seg.wide button { flex: 1; justify-content: center; padding: 7px; }
+.seg.wide.dense button { flex: 1 1 auto; padding: 7px 0; min-width: 0; }
 .tag { display: inline-flex; align-items: center; gap: 4px; padding: 1px 8px; border-radius: 999px; font-size: 11px; color: var(--muted); background: var(--surface-2); border: 1px solid var(--line); font-style: normal; white-space: nowrap; }
 .tag.ok { color: var(--accent-ink); background: rgba(var(--hl-rgb), 0.16); border-color: transparent; }
 .tag.warn, .tag.work { color: var(--warn-ink); background: rgba(var(--accent-rgb), 0.12); border-color: transparent; }

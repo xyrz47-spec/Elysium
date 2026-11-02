@@ -286,9 +286,9 @@ const MANY_WORDS: &[&str] = &[
     "여러 에이전트", "에이전트 여러", "에이전트들", "멀티 에이전트", "멀티에이전트", "multi-agent", "multi agent", "multiple agents", "parallel agents", "in parallel", "병렬로", "병렬 에이전트", "동시에 여러",
 ];
 const NUM_WORDS: &[(&str, usize)] = &[("다섯", 5), ("두", 2), ("둘", 2), ("세", 3), ("셋", 3), ("네", 4), ("넷", 4), ("two", 2), ("three", 3), ("four", 4), ("five", 5)];
-pub const MAX_AGENTS: usize = 5;
+pub const MAX_AGENTS: usize = 16;
 
-/// 요청 글이 에이전트 여러 개를 동시에 돌려 달라고 하면 그 수(2~5). 숫자 없이 "여러·병렬"이면 3.
+/// 요청 글이 에이전트 여러 개를 동시에 돌려 달라고 하면 그 수(2~16). 숫자 없이 "여러·병렬"이면 3.
 pub fn requested_agents(text: &str) -> Option<usize> {
     let low = text.to_ascii_lowercase();
     if let Some((n, _, _)) = agent_count(&low) {
@@ -451,7 +451,7 @@ mod tests {
         let t = requested_team("워커: Gemini 3.8 Flash x 3 으로 고쳐", ALL, true).expect("x 3");
         assert_eq!((t.count, t.effort, t.lead.is_none()), (3, None, true));
         assert_eq!(requested_team("3개의 Gemini 에이전트로 나눠 줘", ALL, true).map(|t| t.count), Some(3));
-        assert_eq!(requested_team("gemini 워커 9개", ALL, true).map(|t| t.count), Some(MAX_AGENTS), "최대 5개");
+        assert_eq!(requested_team("gemini 워커 99개", ALL, true).map(|t| t.count), Some(MAX_AGENTS), "최대 16개");
     }
 
     #[test]
@@ -528,7 +528,7 @@ mod tests {
         assert_eq!(requested_agents("에이전트를 4개 돌려서"), Some(4));
         assert_eq!(requested_agents("세 개의 에이전트로"), Some(3));
         assert_eq!(requested_agents("use 2 agents"), Some(2));
-        assert_eq!(requested_agents("에이전트 9개"), Some(MAX_AGENTS), "최대 5개");
+        assert_eq!(requested_agents("에이전트 99개"), Some(MAX_AGENTS), "최대 16개");
         assert_eq!(requested_agents("여러 에이전트로 동시에 분석해"), Some(3));
         assert_eq!(requested_agents("병렬로 처리해 줘"), Some(3));
         assert_eq!(requested_agents("에이전트 1개만"), None);
