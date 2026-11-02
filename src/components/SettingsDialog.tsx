@@ -246,30 +246,35 @@ export default function SettingsDialog({ focusKeys = false }: { focusKeys?: bool
                     {e.id === "antigravity" && "Flash $0.10/$0.40 · Argon/Pro $1.25/$5.00 · Claude $3/$15 (1M 토큰)"}
                     {e.id === "opencode" && "무료 모델 전용 ($0)"}
                   </small>
-                  {e.id === "opencode" && e.installed && (
-                    <div className="opencode-model">
-                      <select
-                        value={settings.models.opencode ?? ""}
-                        aria-label={"OpenCode 무료 모델 선택"}
-                        onChange={(ev) => {
-                          const { opencode: _, ...rest } = settings.models;
-                          saveSettings({ ...settings, models: ev.target.value ? { ...rest, opencode: ev.target.value } : rest });
-                        }}
-                      >
-                        <option value="">{"자동 (JEV 선택)"}</option>
-                        {e.models.map((m) => (
-                          <option key={m} value={m}>
-                            {m.replace("opencode/", "")}
-                          </option>
-                        ))}
-                      </select>
-                      <small>{"요청은 OpenCode Zen으로 전송되며, DeepSeek 및 GLM 외 일부 무료 모델은 프롬프트를 보관하거나 모델 학습에 활용할 수 있습니다. 민감한 정보가 감지되면 프롬프트를 저장하지 않는 DeepSeek과 GLM만 사용됩니다."}</small>
-                    </div>
-                  )}
                 </div>
               </div>
             ))}
           </div>
+          {clis.some((e) => e.id === "opencode" && e.installed) && (
+            <div className="engine-option">
+              <label className="engine-option-row">
+                <span>{"OpenCode 무료 모델 선택"}</span>
+                <select
+                  className="select"
+                  value={settings.models.opencode ?? ""}
+                  onChange={(ev) => {
+                    const { opencode: _, ...rest } = settings.models;
+                    saveSettings({ ...settings, models: ev.target.value ? { ...rest, opencode: ev.target.value } : rest });
+                  }}
+                >
+                  <option value="">{"자동 (JEV 선택)"}</option>
+                  {clis
+                    .find((e) => e.id === "opencode")
+                    ?.models.map((m) => (
+                      <option key={m} value={m}>
+                        {m.replace("opencode/", "")}
+                      </option>
+                    ))}
+                </select>
+              </label>
+              <p className="help">{"요청은 OpenCode Zen으로 전송되며, DeepSeek 및 GLM 외 일부 무료 모델은 프롬프트를 보관하거나 모델 학습에 활용할 수 있습니다. 민감한 정보가 감지되면 프롬프트를 저장하지 않는 DeepSeek과 GLM만 사용됩니다."}</p>
+            </div>
+          )}
           <p className="help">CLI는 파일을 읽고(만들기에서는 만들고 고치고) 세션을 이어 씁니다. 로그인은 각 CLI에서 합니다.</p>
         </Section>
 
