@@ -559,16 +559,64 @@ pub fn worker_note(engine: EngineId) -> &'static str {
     }
 }
 
+/// 한 단계의 워커들. 차례를 끝낸 워커도 같은 단계의 다른 워커가 일하는 동안은 메시지를 기다렸다가 같은 세션으로 이어 간다.
+/// 모두가 끝내거나 쉬면 단계가 끝난다.
+pub struct Crew {
+    busy: tokio::sync::watch::Sender<usize>,
+}
+
+impl Crew {
+    pub fn new(units: usize) -> Self {
+        Crew { busy: tokio::sync::watch::channel(units).0 }
+    }
+    /// 워커(또는 그룹·이어 쓸 수 없는 워커) 하나가 일을 멈췄다.
+    pub fn rest(&self) {
+        self.busy.send_modify(|n| *n = n.saturating_sub(1));
+    }
+    fn wake(&self) {
+        self.busy.send_modify(|n| *n += 1);
+    }
+    async fn all_resting(&self) {
+        let mut rx = self.busy.subscribe();
+        let _ = rx.wait_for(|n| *n == 0).await;
+    }
+}
+
+/// 메시지 칸에 글이 있는가
+fn has_mail(st: &AppState, slot: &str) -> bool {
+    st.agent_inboxes.lock().unwrap_or_else(|p| p.into_inner()).get(slot).is_some_and(|m| !m.is_empty())
+}
+
+/// 끝낸 워커가 메시지를 기다린다. 메시지가 오면 true, 단계의 모두가 쉬거나 멈추면 false.
+async fn park(st: &AppState, slot: &str, crew: &Crew, stop: &CancellationToken) -> bool {
+    let all = crew.all_resting();
+    tokio::pin!(all);
+    loop {
+        if has_mail(st, slot) {
+            return true;
+        }
+        tokio::select! {
+            _ = &mut all => return has_mail(st, slot),
+            _ = stop.cancelled() => return false,
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+        }
+    }
+}
+
 /// 하위 작업을 맡은 워커 하나. 세션을 이어 쓸 수 없는 엔진은 요청 왕복 없이 한 번에 돈다.
-pub async fn run_part_worker(ctx: &Ctx, spec: RunSpec, key: &str, title: &str, budget: Duration, check_drift: bool) -> Outcome {
+pub async fn run_part_worker(ctx: &Ctx, spec: RunSpec, key: &str, title: &str, budget: Duration, check_drift: bool, crew: Option<&Crew>) -> Outcome {
     if spec.engine.resumable() {
         let reviewed = needs_review(spec.engine);
-        run_worker(ctx, spec, WorkerOpts { key, title, role: "agent", stream: false, budget, reviewed, check_drift }).await
+        run_worker(ctx, spec, WorkerOpts { key, title, role: "agent", stream: false, budget, reviewed, check_drift, crew }).await
     } else {
         let lead = &ctx.lead;
         let slot = orchestrator::agent_slot(&lead.task, key);
         let stop = ctx.st.agent_stops.lock().unwrap_or_else(|p| p.into_inner()).get(&slot).cloned().unwrap_or_else(|| lead.cancel.clone());
-        orchestrator::run_engine_as(&ctx.app, &ctx.st, &lead.conv, &lead.task, &lead.mid, "agent", spec, budget, &stop, false, key).await
+        let o = orchestrator::run_engine_as(&ctx.app, &ctx.st, &lead.conv, &lead.task, &lead.mid, "agent", spec, budget, &stop, false, key).await;
+        if let Some(c) = crew {
+            c.rest();
+        }
+        o
     }
 }
 
@@ -684,7 +732,7 @@ pub async fn run_group(ctx: &Ctx, index: usize, title: &str, members: Vec<(Strin
         }
         let runs = plan.run.iter().map(|&i| {
             let (spec, key, title) = (specs[i].clone(), keys[i].clone(), title.to_string());
-            async move { (i, run_part_worker(ctx, spec, &key, &title, budget, false).await) }
+            async move { (i, run_part_worker(ctx, spec, &key, &title, budget, false, None).await) }
         });
         let outs = futures_util::future::join_all(runs).await;
         let mut said: Vec<(usize, lead::GroupNote)> = vec![];
@@ -736,7 +784,7 @@ pub async fn run_group(ctx: &Ctx, index: usize, title: &str, members: Vec<(Strin
     };
     let mut spec = specs[writer].clone();
     spec.prompt = "그룹 작업이 끝났습니다. 그룹 전체가 바꾼 파일과 다른 AI가 알아야 할 것을 짧게 요약하세요. 이번에는 elysium-group 블록을 쓰지 마세요.".to_string();
-    let o = run_part_worker(ctx, spec, &keys[writer], title, budget, false).await;
+    let o = run_part_worker(ctx, spec, &keys[writer], title, budget, false, None).await;
     let (_, clean) = lead::parse_group(&o.text);
     merge_outcome(merged, &Outcome { text: clean, ..o })
 }
@@ -751,6 +799,8 @@ pub struct WorkerOpts<'a> {
     pub reviewed: bool,
     /// 차례가 끝날 때 JEV에게 막혔는지 묻는다. 그룹은 라운드마다 따로 묻는다.
     pub check_drift: bool,
+    /// 있으면 차례를 끝낸 뒤에도 단계가 끝날 때까지 메시지를 기다린다.
+    pub crew: Option<&'a Crew>,
 }
 
 /// 이 작업의 등록을 지운다. 차례 사이에도 멈추거나 말을 걸 수 있게 worker 수명 동안 살아 있다.
@@ -809,6 +859,7 @@ pub async fn run_worker(ctx: &Ctx, mut spec: RunSpec, opts: WorkerOpts<'_>) -> O
     let mut merged = Outcome::default();
     let mut pending: Vec<PendingTest> = vec![];
     let mut used = Duration::ZERO;
+    let mut resting = false;
     let wait_note = |note: &str| emit(&ctx.app, "task:agent-wait", json!({ "taskId": lead.task, "key": opts.key, "note": note }));
     for turn in 0..MAX_TURNS {
         if lead.holds.held(opts.key) {
@@ -887,8 +938,19 @@ pub async fn run_worker(ctx: &Ctx, mut spec: RunSpec, opts: WorkerOpts<'_>) -> O
                 wait_note("review");
                 consult_lead(ctx, format!("워커 '{}'가 막혔거나 계획에서 벗어난 것으로 보입니다. 워커의 마지막 글:\n{}", opts.title, cut(&parsed.clean, 4000)), Some(opts.key), &stop).await;
             }
-            let has_mail = st.agent_inboxes.lock().unwrap_or_else(|p| p.into_inner()).get(&slot).is_some_and(|m| !m.is_empty());
-            if !has_mail {
+            let mut mail = has_mail(st, &slot);
+            // 끝낸 뒤에 총괄·사용자가 보낸 지시도 받도록, 같은 단계의 다른 워커가 일하는 동안 기다린다.
+            if let (false, Some(crew)) = (mail, opts.crew) {
+                crew.rest();
+                resting = true;
+                wait_note("idle");
+                mail = park(st, &slot, crew, &stop).await;
+                if mail {
+                    crew.wake();
+                    resting = false;
+                }
+            }
+            if !mail {
                 break;
             }
             results.push("위 메시지를 반영해 이어 가세요.".to_string());
@@ -899,6 +961,9 @@ pub async fn run_worker(ctx: &Ctx, mut spec: RunSpec, opts: WorkerOpts<'_>) -> O
         }
         spec.resume = merged.session_id.clone().or(spec.resume.take());
         spec.prompt = results_prompt(&results);
+    }
+    if let (false, Some(crew)) = (resting, opts.crew) {
+        crew.rest();
     }
     merged
 }
@@ -935,6 +1000,17 @@ mod tests {
     fn merge_keeps_earlier_text_when_the_last_turn_wrote_none() {
         let a = Outcome { text: "요약".into(), ok: true, ..Default::default() };
         assert_eq!(merge_outcome(a, &Outcome { ok: true, ..Default::default() }).text, "요약");
+    }
+
+    #[tokio::test]
+    async fn crew_ends_only_when_everyone_rests_and_wakes_again() {
+        let c = Crew::new(2);
+        c.rest();
+        assert!(tokio::time::timeout(Duration::from_millis(50), c.all_resting()).await.is_err(), "한 명이 아직 일한다");
+        c.rest();
+        tokio::time::timeout(Duration::from_secs(1), c.all_resting()).await.unwrap();
+        c.wake();
+        assert!(tokio::time::timeout(Duration::from_millis(50), c.all_resting()).await.is_err(), "메시지로 깨어나면 다시 일하는 중");
     }
 
     #[tokio::test]

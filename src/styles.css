@@ -1201,14 +1201,75 @@ body { background-image: var(--vignette), var(--horizon), var(--sky); background
 
 /* 워커 별도 창: 메인 창과 같은 바탕 위에 패널과 같은 유리를 쓴다 */
 .worker-win { position: relative; height: 100vh; padding: 12px; }
-.worker-inner { position: relative; z-index: 1; height: 100%; display: flex; flex-direction: column; gap: 10px; padding: 14px; border-radius: 22px; background: var(--rail); backdrop-filter: blur(18px) saturate(1.2); border: 1px solid var(--line); overflow: hidden; }
-.worker-head .agent-dot.run { background: var(--accent); }
+.worker-inner { position: relative; z-index: 1; height: 100%; display: flex; flex-direction: column; gap: 12px; padding: 16px; border-radius: 22px; background: var(--rail); backdrop-filter: blur(18px) saturate(1.2); border: 1px solid var(--line); box-shadow: var(--shadow); overflow: hidden; animation: rise 0.45s var(--ease) both; }
+/* 일하는 동안 테두리에 청록 빛이 돈다 */
+.worker-inner.run { border-color: rgba(var(--accent-rgb), 0.35); box-shadow: var(--shadow), 0 0 0 1px rgba(var(--accent-rgb), 0.12), 0 0 32px rgba(var(--accent-rgb), 0.12); }
+.worker-head { display: grid; gap: 8px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+.worker-title { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.worker-title h1 { margin: 0; font-size: 17px; font-weight: 800; letter-spacing: -0.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.worker-title .agent-dot { width: 10px; height: 10px; margin: 0; }
+.worker-head .agent-dot.run { background: var(--accent); animation: ring 1.2s ease-out infinite; }
 .worker-head .agent-dot.ok { background: var(--hl); }
 .worker-head .agent-dot.fail { background: var(--err); }
-.worker-head { flex-wrap: wrap; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
-.worker-tabs { display: flex; gap: 6px; flex-wrap: wrap; }
-.worker-sec { display: flex; flex-direction: column; gap: 6px; min-height: 0; }
-.worker-sec.grow { flex: 1 1 auto; }
-.worker-sec h5 { margin: 0; font-size: 12px; color: var(--muted); font-weight: 700; }
-.worker-out { flex: 1 1 auto; min-height: 80px; max-height: none; overflow: auto; }
-.worker-talk, .worker-activity { max-height: 170px; overflow: auto; }
+.worker-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.worker-meta .agent-state { font-size: 11.5px; padding: 1px 9px; }
+.worker-inner.run .worker-meta .agent-state { color: var(--accent-ink); background: rgba(var(--accent-rgb), 0.14); }
+.worker-clock { flex: none; font-family: var(--mono); font-size: 11.5px; font-variant-numeric: tabular-nums; color: var(--muted); padding: 1px 8px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--line); }
+.worker-title .worker-clock { font-size: 12.5px; padding: 3px 10px; }
+
+.worker-body { flex: 1 1 auto; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, 300px); gap: 12px; }
+.worker-main, .worker-side { min-height: 0; display: flex; flex-direction: column; gap: 10px; }
+.worker-side { overflow: auto; scrollbar-width: thin; }
+.worker-card { display: flex; flex-direction: column; gap: 8px; min-height: 0; padding: 12px; border-radius: 16px; background: var(--surface); border: 1px solid var(--line); animation: pop 0.35s var(--spring) both; }
+.worker-card.grow { flex: 1 1 auto; }
+.worker-card h5 { margin: 0; font-size: 11.5px; font-weight: 700; color: var(--muted); letter-spacing: 0.02em; }
+.worker-empty { display: grid; place-items: center; flex: 1; min-height: 80px; color: var(--dim); font-size: 12.5px; }
+
+/* 지금 하는 일 */
+.worker-now { display: flex; align-items: center; gap: 7px; min-width: 0; padding: 6px 9px; border-radius: 10px; background: rgba(var(--accent-rgb), 0.08); border: 1px solid rgba(var(--accent-rgb), 0.18); font-size: 11.5px; }
+.worker-now.big { padding: 10px 12px; font-size: 13px; border-radius: 12px; }
+.worker-now.wait { background: rgba(var(--accent2-rgb), 0.1); border-color: rgba(var(--accent2-rgb), 0.22); }
+.worker-now-pulse { flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); animation: ring 1.2s ease-out infinite; }
+.worker-now.wait .worker-now-pulse { background: var(--accent-2); animation: pulse 1.6s ease-in-out infinite; }
+.worker-now-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); color: var(--ink); }
+.worker-now.wait .worker-now-text { font-family: var(--font); color: var(--muted); }
+.tag.tool { flex: none; font-family: var(--mono); font-size: 10.5px; font-weight: 700; color: var(--accent-ink); background: rgba(var(--accent-rgb), 0.16); border-color: transparent; }
+
+/* 실시간 출력 */
+.worker-live { position: relative; flex: 1 1 auto; min-height: 120px; display: flex; }
+.worker-out { flex: 1 1 auto; margin: 0; min-height: 0; overflow: auto; padding: 12px 14px; border-radius: 12px; background: var(--code-bg); color: var(--code-ink); font-family: var(--mono); font-size: 12px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; scrollbar-width: thin; }
+:root[data-theme="light"] .worker-out { background: #f6f8fa; color: var(--ink); border: 1px solid var(--line); }
+.worker-caret { display: inline-block; width: 7px; height: 1.05em; margin-left: 2px; vertical-align: text-bottom; border-radius: 2px; background: var(--accent); animation: pulse 1s steps(2) infinite; }
+.worker-jump { position: absolute; right: 12px; bottom: 12px; box-shadow: var(--shadow); animation: pop 0.25s var(--spring) both; }
+
+/* 활동 기록 */
+.worker-timeline { list-style: none; margin: 0; padding: 0 0 0 4px; display: grid; gap: 2px; max-height: 320px; overflow: auto; scrollbar-width: thin; }
+.worker-timeline li { position: relative; display: flex; align-items: center; gap: 6px; min-width: 0; padding: 4px 0 4px 16px; font-size: 11.5px; color: var(--dim); }
+.worker-timeline li::before { content: ""; position: absolute; left: 3px; top: 0; bottom: 0; width: 1px; background: var(--line-2); }
+.worker-timeline li > i { position: absolute; left: 0; top: 50%; width: 7px; height: 7px; margin-top: -3.5px; border-radius: 50%; background: var(--off); }
+.worker-timeline li.latest { color: var(--ink); }
+.worker-timeline li.latest > i { background: var(--accent); box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.18); }
+.worker-timeline-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); }
+.worker-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.worker-list li { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.worker-list code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.worker-talk { max-height: 220px; overflow: auto; }
+
+/* 보내기: 메인 입력 캡슐과 같은 모양 */
+.worker-foot { display: grid; gap: 6px; }
+.worker-compose { display: flex; align-items: center; gap: 8px; padding: 5px 5px 5px 6px; border-radius: 16px; background: var(--lg-ctl, var(--surface)); box-shadow: var(--lg-ctl-edge, none); border: 1px solid var(--line); }
+.worker-compose:focus-within { border-color: rgba(var(--accent-rgb), 0.45); box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.12); }
+.worker-compose input { flex: 1; min-width: 0; border: 0; outline: none; background: transparent; color: var(--ink); font-size: 13px; }
+.worker-compose .icon { flex: none; background: var(--grad); color: var(--on-grad); }
+.worker-compose .icon:disabled { background: var(--surface-2); color: var(--dim); }
+
+/* 메인 패널 워커 카드의 실시간 끝부분 */
+.live-tail { margin: 0; padding: 6px 9px; max-height: 4.9em; overflow: hidden; border-radius: 9px; background: rgba(var(--shade-rgb), 0.12); color: var(--muted); font-family: var(--mono); font-size: 10.5px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; -webkit-mask-image: linear-gradient(to bottom, transparent, #000 40%); mask-image: linear-gradient(to bottom, transparent, #000 40%); }
+:root[data-theme="light"] .live-tail { background: rgba(255, 255, 255, 0.5); }
+.lead-worker .lead-line .worker-clock { font-size: 10.5px; padding: 0 7px; }
+
+@media (max-width: 760px) {
+  .worker-body { grid-template-columns: minmax(0, 1fr); overflow: auto; }
+  .worker-side { overflow: visible; }
+  .worker-live { min-height: 240px; }
+}

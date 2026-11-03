@@ -2840,6 +2840,8 @@ async fn run_stage(tw: &TeamWork<'_>, p: &Plan, stage: &Stage, dirs: &[PathBuf],
     let effort = spec_effort(p);
     let max_tokens = p.budget.as_ref().map(|b| b.max_tokens);
     let budget = tw.timeout.max(TEAM_AGENT_TIMEOUT);
+    let crew = crate::leadrun::Crew::new(parts.len());
+    let crew = &crew;
     let runs = parts.iter().enumerate().map(|(i, part)| {
         let (unit, tier) = (&stage.units[i], &stage.tiers[i]);
         let specs: Vec<(String, RunSpec)> = unit
@@ -2870,10 +2872,12 @@ async fn run_stage(tw: &TeamWork<'_>, p: &Plan, stage: &Stage, dirs: &[PathBuf],
         let title = part.title.as_str();
         async move {
             if specs.len() > 1 {
-                crate::leadrun::run_group(lead_ctx, i, title, specs, budget).await
+                let o = crate::leadrun::run_group(lead_ctx, i, title, specs, budget).await;
+                crew.rest();
+                o
             } else {
                 let (key, spec) = specs.into_iter().next().expect("하위 작업에는 워커가 있다");
-                crate::leadrun::run_part_worker(lead_ctx, spec, &key, title, budget, true).await
+                crate::leadrun::run_part_worker(lead_ctx, spec, &key, title, budget, true, Some(crew)).await
             }
         }
     });
@@ -3138,7 +3142,7 @@ async fn run_team_work(tw: &TeamWork<'_>, p: &mut Plan, team: &Team, ctx: &(dyn 
         lead.integrating.store(true, std::sync::atomic::Ordering::Relaxed);
         let mut j = if team.synth.resumable() {
             let key = format!("synth:{}", team.synth.as_str());
-            crate::leadrun::run_worker(&lead_ctx, spec, crate::leadrun::WorkerOpts { key: &key, title: "통합", role: "synth", stream: true, budget: tw.timeout, reviewed: crate::leadrun::needs_review(team.synth), check_drift: false }).await
+            crate::leadrun::run_worker(&lead_ctx, spec, crate::leadrun::WorkerOpts { key: &key, title: "통합", role: "synth", stream: true, budget: tw.timeout, reviewed: crate::leadrun::needs_review(team.synth), check_drift: false, crew: None }).await
         } else {
             run_engine(app, st, conv, task, mid, "synth", spec, tw.timeout, tw.cancel).await
         };

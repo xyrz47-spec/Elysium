@@ -1,5 +1,5 @@
 // 병렬 작업의 총괄 화면: 총괄 카드, 워커·그룹 카드, 게임 테스트 대기열, 명령 판단 기록
-import { useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { api, errorText, type GroupNote, type LeadDecision } from "../lib/api";
 import { hideBlocks } from "../lib/panel";
 import { useApp, type AgentRun, type Live } from "../store";
@@ -53,15 +53,97 @@ export const LT = {
   winCut: "이전 출력 내용이 생략되었습니다.",
   winConnecting: "상태를 불러오는 중...",
   savedLog: "명령 검토 및 대화 내역",
+  waitMail: "메시지 대기 중",
+  winNow: "현재 작업",
+  winThinking: "생각하는 중",
+  winLive: "실시간 출력",
+  winToBottom: "최신으로 이동",
+  winToWorker: "워커에게",
+  winToLead: "총괄에게",
+  winWorkerPlaceholder: "워커에게 전달할 지시를 입력하세요",
+  winTimeline: "활동 내역",
+  winSendTarget: "메시지 수신 대상",
+  elapsed: "작업 시간",
 };
 
 
-const VERDICT: Record<LeadDecision["verdict"], string> = { once: LT.once, deny: LT.deny, similar: LT.similar, all: LT.all, ask_user: LT.once };
-const WAIT: Record<string, string> = { review: LT.waitReview, question: LT.waitQuestion, test: LT.waitTest, command: LT.waitCommand };
+export const VERDICT: Record<LeadDecision["verdict"], string> = { once: LT.once, deny: LT.deny, similar: LT.similar, all: LT.all, ask_user: LT.once };
+const WAIT: Record<string, string> = { review: LT.waitReview, question: LT.waitQuestion, test: LT.waitTest, command: LT.waitCommand, idle: LT.waitMail };
 
 export function runState(a: AgentRun): string {
   if (a.state === "run") return (a.wait && WAIT[a.wait]) || LT.working;
   return a.state === "ok" ? LT.finished : LT.failed;
+}
+
+/** 1초마다 다시 그려 경과 시간을 보여 준다(실행 중일 때만 돈다). */
+function useNow(on: boolean): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!on) return;
+    const t = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(t);
+  }, [on]);
+  return now;
+}
+
+function clock(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const two = (n: number) => String(n).padStart(2, "0");
+  return s >= 3600 ? `${Math.floor(s / 3600)}:${two(Math.floor(s / 60) % 60)}:${two(s % 60)}` : `${two(Math.floor(s / 60))}:${two(s % 60)}`;
+}
+
+/** 워커가 일한 시간. 끝났으면 걸린 시간에서 멈춘다. */
+export function Elapsed({ run }: { run: AgentRun }) {
+  const going = run.state === "run" && run.wait !== "idle";
+  const now = useNow(going);
+  // 일하는 모습을 본 뒤 멈췄으면 그 시각까지의 전체 시간으로 멈춘다(여러 차례 일한 워커). 처음부터 끝난 채로 봤으면 기록된 시간을 쓴다.
+  const stoppedAt = useRef<number | null>(null);
+  const saw = useRef(false);
+  if (going) {
+    saw.current = true;
+    stoppedAt.current = null;
+  } else if (saw.current) stoppedAt.current ??= now;
+  const end = stoppedAt.current;
+  const ms = going ? now - run.startedAt : end != null ? end - run.startedAt : (run.ms ?? 0);
+  return (
+    <span className="worker-clock" title={LT.elapsed} aria-label={`${LT.elapsed} ${clock(ms)}`}>
+      {clock(ms)}
+    </span>
+  );
+}
+
+/** "PowerShell · .\gradlew build" → 도구와 대상 */
+export function splitActivity(a: string): { tool: string | null; detail: string } {
+  const i = a.indexOf(" · ");
+  return i > 0 && i <= 24 ? { tool: a.slice(0, i), detail: a.slice(i + 3) } : { tool: null, detail: a };
+}
+
+/** 지금 하는 일: 기다리는 이유, 마지막 도구 사용, 아니면 생각하는 중 */
+export function NowLine({ run, big = false }: { run: AgentRun; big?: boolean }) {
+  if (run.state !== "run") return null;
+  const waiting = run.wait ? WAIT[run.wait] : null;
+  const last = run.activities[run.activities.length - 1];
+  const { tool, detail } = waiting ? { tool: null, detail: waiting } : last ? splitActivity(last) : { tool: null, detail: LT.winThinking };
+  return (
+    <div className={`worker-now ${big ? "big" : ""} ${waiting ? "wait" : ""}`} aria-live="polite">
+      <i className="worker-now-pulse" aria-hidden />
+      {tool && <span className="tag tool">{tool}</span>}
+      <span className="worker-now-text" title={detail}>
+        {detail}
+      </span>
+    </div>
+  );
+}
+
+/** 실시간 출력의 마지막 몇 줄(긴 글 전체를 매번 다루지 않게 끝부분만 본다) */
+export function tailLines(text: string | undefined, n: number): string {
+  if (!text) return "";
+  return hideBlocks(text.slice(-4000))
+    .split("\n")
+    .map((x) => x.trimEnd())
+    .filter(Boolean)
+    .slice(-n)
+    .join("\n");
 }
 
 function byLabel(by: LeadDecision["by"]): string | null {
@@ -176,17 +258,21 @@ function CardActions({ l, about, stopKeys, windowKey, title }: { l: Live; about:
 function WorkerCard({ l, a }: { l: Live; a: AgentRun }) {
   const title = l.parts[a.key]?.title ?? a.label;
   const last = a.activities[a.activities.length - 1];
+  const tail = a.state === "run" && a.wait !== "idle" ? tailLines(l.streams[a.key], 3) : "";
   return (
     <div className={`lead-worker ${a.state}`}>
       <div className="lead-line">
         <i className="agent-dot" aria-hidden />
         <b title={title}>{title}</b>
+        <div className="spacer" />
+        <Elapsed run={a} />
       </div>
       <div className="lead-line sub">
         <span className="agent-role">{[a.label, a.effort].filter(Boolean).join(" · ")}</span>
         <span className={`agent-state ${a.wait ? "wait" : ""}`}>{a.stopped ? LT.failed : runState(a)}</span>
       </div>
-      {last && <div className="agent-act">{last}</div>}
+      {a.state === "run" ? <NowLine run={a} /> : last && <div className="agent-act">{last}</div>}
+      {tail && <pre className="live-tail">{tail}</pre>}
       {a.state === "fail" && a.error && !a.stopped && <div className="agent-err">{a.error}</div>}
       {a.state !== "fail" && <CardActions l={l} about={a.key} stopKeys={[a.key]} windowKey={a.key} title={title} />}
     </div>

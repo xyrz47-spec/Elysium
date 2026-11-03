@@ -238,9 +238,22 @@ fn effort_after(rest: &str) -> (Option<&'static str>, usize) {
     (None, 0)
 }
 
-/// 모델 바로 뒤의 "× 4", "x4", "4개"
+/// 수 앞의 빈칸·닫는 괄호·굵게 표시(**)를 걷어 낸다. 곱하기로 쓴 '*' 하나("high * 3")는 남긴다.
+fn skip_to_count(s: &str) -> &str {
+    let mut t = s;
+    loop {
+        let n = t.trim_start_matches([' ', ')', '`']);
+        let n = n.strip_prefix("**").unwrap_or(n);
+        if n.len() == t.len() {
+            return t;
+        }
+        t = n;
+    }
+}
+
+/// 모델 바로 뒤의 "× 4", "x4", "* 4", "4개"
 fn bare_count(after: &str) -> Option<usize> {
-    let (marked, t) = match after.strip_prefix('×').or_else(|| after.strip_prefix('x')) {
+    let (marked, t) = match after.strip_prefix('×').or_else(|| after.strip_prefix('x')).or_else(|| after.strip_prefix('*')) {
         Some(t) => (true, t.trim_start_matches(' ')),
         None => (false, after),
     };
@@ -258,9 +271,14 @@ fn worker_count(low: &str, h: &Hit) -> Option<(usize, Option<&'static str>)> {
     let after = skip_marks(&low[h.end + used..]);
     let n = match WORKER_WORDS.iter().find(|w| after.starts_with(**w)) {
         Some(w) => count_after(&after[w.len()..]).map(|(n, _)| n).or_else(|| count_before(low[..h.start].trim_end_matches(['*', ' '])).map(|(n, _)| n)),
-        None => bare_count(after),
+        None => bare_count(skip_to_count(&low[h.end + used..])),
     }?;
     (n >= 2).then_some((n.min(MAX_AGENTS), effort))
+}
+
+/// 이름에 버전 숫자가 붙어 있는지("sonnet 5.5", "haiku-5-5")
+fn versioned(low: &str, h: &Hit) -> bool {
+    low[h.start..h.end].contains(|c: char| c.is_ascii_digit())
 }
 
 /// 같은 줄에서 총괄·관리자로 지목된 모델인지
@@ -275,7 +293,8 @@ fn names_lead(low: &str, h: &Hit) -> bool {
 pub fn requested_team(text: &str, installed: &[EngineId], work: bool) -> Option<TeamAsk> {
     let low = text.to_ascii_lowercase();
     let hits = scan(text);
-    let (worker, (count, effort)) = hits.iter().filter(|h| h.strong).find_map(|h| worker_count(&low, h).map(|c| (h, c)))?;
+    // 약한 이름도 버전을 붙여 적었으면("Sonnet 5.5") 모델로 본다.
+    let (worker, (count, effort)) = hits.iter().filter(|h| h.strong || versioned(&low, h)).find_map(|h| worker_count(&low, h).map(|c| (h, c)))?;
     let workers = pick_of(worker, installed, work).ok()?;
     let lead = hits.iter().filter(|h| h.family != worker.family && names_lead(&low, h)).find_map(|h| pick_of(h, installed, work).ok());
     Some(TeamAsk { workers, effort, count, lead })
@@ -347,8 +366,7 @@ fn roster_entries(text: &str, installed: &[EngineId], work: bool) -> (Vec<Roster
         if lead_mention(&low, h, &low[pos..]) {
             continue;
         }
-        let after = low[pos..].trim_start_matches([' ', '*', ')', '`']);
-        out.push(RosterEntry { family: h.family, pick: pick_of(h, installed, work), effort, count: bare_count(after).unwrap_or(1).max(1) });
+        out.push(RosterEntry { family: h.family, pick: pick_of(h, installed, work), effort, count: bare_count(skip_to_count(&low[pos..])).unwrap_or(1).max(1) });
     }
     (out, rest + word_chars(&low[pos.min(low.len())..]))
 }
@@ -501,6 +519,19 @@ fn team_total(low: &str) -> Option<usize> {
     low.match_indices("teams").find_map(|(i, _)| digits_at_end(&low[..i])).or_else(|| low.match_indices('팀').filter_map(|(i, _)| digits_at_end(&low[..i])).max().filter(|n| *n >= 2))
 }
 
+/// "워커들은 Sonnet 5.5 high * 3, Gemini 3.8 Flash high * 2"처럼 워커 줄에 모델 여럿을 나열한 구성. 자리마다 한 팀이다.
+/// 모델이 한 가지뿐이면 requested_team이 읽는다(나누는 AI가 하위 작업 수를 정할 수 있게).
+fn listed_workers(low: &str, installed: &[EngineId], work: bool) -> Option<Vec<Vec<RosterEntry>>> {
+    low.lines().filter(|l| WORKER_WORDS.iter().any(|w| l.contains(w))).find_map(|l| {
+        let entries = roster_entries(l, installed, work).0;
+        let mut families: Vec<usize> = entries.iter().map(|e| e.family).collect();
+        families.dedup();
+        families.sort_unstable();
+        families.dedup();
+        (families.len() >= 2).then(|| entries.iter().flat_map(|e| std::iter::repeat_n(vec![RosterEntry { count: 1, ..e.clone() }], e.count)).collect())
+    })
+}
+
 /// 요청 글에 적힌 혼합 팀 구성("1팀 - Haiku high, Gemini flash high" 줄들, 또는 "각 팀은 Haiku 1기와 Gemini 1기" + "4개 팀").
 pub fn requested_roster(text: &str, installed: &[EngineId], work: bool) -> Result<Option<Roster>, RosterError> {
     let mut teams = written_sections(text, installed, work);
@@ -515,6 +546,8 @@ pub fn requested_roster(text: &str, installed: &[EngineId], work: bool) -> Resul
             } else {
                 (0..times).flat_map(|_| entries.iter().map(|e| vec![e.clone()])).collect()
             };
+        } else if let Some(listed) = listed_workers(&low, installed, work) {
+            teams = listed;
         }
     }
     build_roster(teams, text, installed, work)
@@ -885,6 +918,33 @@ mod tests {
         assert_eq!((t.count, t.effort, t.lead.is_none()), (3, None, true));
         assert_eq!(requested_team("3개의 Gemini 에이전트로 나눠 줘", ALL, true).map(|t| t.count), Some(3));
         assert_eq!(requested_team("gemini 워커 99개", ALL, true).map(|t| t.count), Some(MAX_AGENTS), "최대 16개");
+    }
+
+    #[test]
+    fn times_after_effort_counts_workers() {
+        for text in ["총괄은 Opus 5.5 high, 워커는 Sonnet 5.5 high * 3으로 해 줘", "워커: **Sonnet 5.5** high *3", "워커 Sonnet 5.5 (high) × 3", "워커는 claude sonnet x3"] {
+            let t = requested_team(text, ALL, true).unwrap_or_else(|| panic!("{text}"));
+            assert_eq!((t.count, t.workers.engine, t.workers.model.as_deref()), (3, Claude, Some("sonnet")), "{text}");
+        }
+        assert_eq!(requested_team("총괄은 Opus 5.5 high, 워커는 Sonnet 5.5 high * 3", ALL, true).unwrap().effort, Some("high"));
+        let r = roster_from_answer("1팀 - Sonnet 5.5 high * 3
+2팀 - Gemini 3.8 Flash high * 2", "요청", ALL, true).unwrap().expect("구성표");
+        assert_eq!(r.teams.iter().map(Vec::len).collect::<Vec<_>>(), vec![3, 2], "구성표의 * 수도 센다");
+        assert!(requested_team("소네트 3개 써 줘", ALL, true).is_none(), "버전 없는 약한 이름은 여전히 받지 않는다");
+    }
+
+    #[test]
+    fn workers_listed_on_one_line_are_each_a_seat() {
+        let text = "총괄은 Opus 5.5 high를 사용해 주고 그 및 워커들은 Sonnet 5.5 high * 3, Gemini 3.8 Flash high * 2 이렇게 구성해줘";
+        let r = requested_roster(text, ALL, true).unwrap().expect("나열한 워커");
+        let s = seats(&r);
+        assert_eq!(s.len(), 5, "자리마다 한 팀");
+        assert_eq!(s[0], vec![(Claude, Some("sonnet".into()), Some("high"))]);
+        assert_eq!(s[4], vec![(Antigravity, Some("gemini-3.8-flash".into()), Some("high"))]);
+        assert_eq!(r.lead.expect("총괄").model.as_deref(), Some("opus"));
+        let repeated = "총괄은 Opus 5.5 high를 사용해 주고 그 및 워커들은 Sonnet 5.5 high,Sonnet 5.5 high,Sonnet 5.5 high, Gemini 3.8 Flash high,Gemini 3.8 Flash high,Gemini 3.8 Flash high 이렇게 구성해줘";
+        assert_eq!(seats(&requested_roster(repeated, ALL, true).unwrap().expect("되풀이한 워커")).len(), 6);
+        assert_eq!(requested_roster("워커는 Sonnet 5.5 high * 3", ALL, true), Ok(None), "모델이 하나면 requested_team이 읽는다");
     }
 
     #[test]
