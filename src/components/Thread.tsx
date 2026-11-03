@@ -27,7 +27,7 @@ interface RibbonNode {
   title: string;
   sub: string;
   state: NodeState;
-  kind: "jev" | "draft" | "review" | "debate" | "rebuttal" | "judge" | "agent" | "synth" | "council" | "plan" | "finish";
+  kind: "jev" | "draft" | "review" | "debate" | "rebuttal" | "judge" | "agent" | "synth" | "council" | "plan" | "roadmap" | "finish";
 }
 
 export const ROLE_LABEL: Record<Step["role"], string> = {
@@ -40,6 +40,7 @@ export const ROLE_LABEL: Record<Step["role"], string> = {
   agent: "답변",
   synth: "종합",
   plan: "분할자",
+  roadmap: "배정자",
   finish: "보완",
 };
 
@@ -105,13 +106,21 @@ function stepNodes(steps: Step[], council?: MessageData["council"], work = false
     const how = council.agreed ? "합의" : ROLE_LABEL.synth;
     out.push({ key: "council", kind: "council", title: councilTitle(council.agents.length), sub: `${roundOf(last, council.maxRounds)} · ${how}`, state: ok ? "ok" : "fail" });
   }
-  const agents = steps.filter((x) => x.role === "agent");
-  if (agents.length) {
-    const ok = agents.filter((x) => x.ok).length;
-    out.push({ key: "team", kind: "agent", title: work ? workTitle(agents.length) : agentsTitle(agents.length), sub: `${ok}/${agents.length} · ${secs(Math.max(...agents.map((x) => x.ms)))}`, state: ok ? "ok" : "fail" });
-  }
+  // 이어진 에이전트 실행은 한 칸으로 묶는다(로드맵 단계마다 한 칸).
+  let run: Step[] = [];
+  const flush = (i: number) => {
+    if (!run.length) return;
+    const ok = run.filter((x) => x.ok).length;
+    out.push({ key: `team${i}`, kind: "agent", title: work ? workTitle(run.length) : agentsTitle(run.length), sub: `${ok}/${run.length} · ${secs(Math.max(...run.map((x) => x.ms)))}`, state: ok ? "ok" : "fail" });
+    run = [];
+  };
   steps.forEach((s, i) => {
-    if (s.role === "agent" || s.role === "council") return;
+    if (s.role === "council") return;
+    if (s.role === "agent") {
+      run.push(s);
+      return;
+    }
+    flush(i);
     // OpenCode는 노력치를 쓰지 않으므로 모델 이름만 보여 준다.
     const t = s.engine === "opencode" ? tune(s.model?.replace("opencode/", ""), null) : tune(s.engine === "claude" || s.engine === "antigravity" ? s.model : null, s.effort);
     const prev = out[out.length - 1];
@@ -124,6 +133,7 @@ function stepNodes(steps: Step[], council?: MessageData["council"], work = false
     const role = work && s.role === "synth" ? INTEGRATE : ROLE_LABEL[s.role];
     out.push({ key: `s${i}`, kind: s.role, title: s.label, sub: `${role} · ${s.ok ? secs(s.ms) : "실패"}${t ? ` · ${t}` : ""}`, state: s.ok ? "ok" : "fail" });
   });
+  flush(steps.length);
   return out;
 }
 
@@ -157,8 +167,10 @@ function teamNodes(l: Live): RibbonNode[] {
   const state: NodeState = runs.length === 0 ? "wait" : done < total ? "run" : ok ? "ok" : "fail";
   const synth = Object.values(l.agents).find((a) => a.role === "synth");
   const plan = Object.values(l.agents).find((a) => a.role === "plan");
+  const roadmap = Object.values(l.agents).filter((a) => a.role === "roadmap");
   const out: RibbonNode[] = [];
   if (l.work) out.push({ key: "plan", kind: "plan", title: ENGINE_LABEL[t.synth], sub: ROLE_LABEL.plan, state: plan ? plan.state : "wait" });
+  if (roadmap.length) out.push({ key: "roadmap", kind: "roadmap", title: ENGINE_LABEL.opencode, sub: ROLE_LABEL.roadmap, state: roadmap.some((a) => a.state === "run") ? "run" : roadmap[roadmap.length - 1].state });
   out.push({ key: "team", kind: "agent", title: l.work ? workTitle(total) : agentsTitle(total), sub: `${ok}/${total} · ${t.agents.map((a) => ENGINE_LABEL[a.engine]).filter((v, i, x) => x.indexOf(v) === i).join(" · ")}`, state });
   out.push({ key: "synth", kind: "synth", title: ENGINE_LABEL[t.synth], sub: l.work ? INTEGRATE : ROLE_LABEL.synth, state: synth ? (synth.state === "run" ? "run" : synth.state) : "wait" });
   return out;

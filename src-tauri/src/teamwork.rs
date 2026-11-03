@@ -227,19 +227,29 @@ fn sync_to_base(root: &Path, dir: &Path, base: &Snapshot) -> Result<(), String> 
     Ok(())
 }
 
+/// 폴더마다 같은 일을 동시에 한다(폴더끼리 겹치지 않는 일만). 하나라도 실패하면 첫 오류를 돌려준다.
+fn each_dir(dirs: &[PathBuf], f: impl Fn(&Path) -> Result<(), String> + Sync) -> Result<(), String> {
+    std::thread::scope(|s| {
+        let jobs: Vec<_> = dirs.iter().map(|d| s.spawn(|| f(d))).collect();
+        jobs.into_iter().map(|j| j.join().unwrap_or_else(|_| Err("작업 폴더 복사 실패".into()))).collect()
+    })
+}
+
 fn make_worktrees(root: &Path, tmp: &Path, n: usize, base: &Snapshot) -> Result<Vec<PathBuf>, String> {
     let prefix = git_output(git_in(root).args(["rev-parse", "--show-prefix"]))?;
-    (0..n)
+    // 등록은 저장소를 잠그므로 하나씩 하고, 커밋 전 변경을 옮기는 일(파일 해시)은 동시에 한다.
+    let dirs = (0..n)
         .map(|i| {
             let top = tmp.join(format!("agent-{}", i + 1));
             git_output(git_in(root).args(["worktree", "add", "--detach"]).arg(&top).arg("HEAD"))?;
             // 작업 폴더가 저장소의 하위 폴더면 에이전트도 같은 하위 폴더에서 일한다.
             let dir = prefix.split('/').filter(|s| !s.is_empty()).fold(top, |p, part| p.join(part));
             std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-            sync_to_base(root, &dir, base)?;
             Ok(dir)
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()?;
+    each_dir(&dirs, |d| sync_to_base(root, d, base))?;
+    Ok(dirs)
 }
 
 /// 에이전트 작업 공간을 만든다: 전부 복사할 수 있으면 사본, 너무 크면 git worktree, git을 못 쓰면 무시된 파일을 뺀 사본.
@@ -251,7 +261,7 @@ pub fn prepare_dirs(root: &Path, tmp: &Path, n: usize, base: &Snapshot) -> Resul
         }
     }
     let dirs: Vec<PathBuf> = (0..n).map(|i| tmp.join(format!("agent-{}", i + 1))).collect();
-    dirs.iter().try_for_each(|d| copy_tree(root, d, base))?;
+    each_dir(&dirs, |d| copy_tree(root, d, base))?;
     Ok(AgentDirs { dirs, how: Prepared::Copy })
 }
 

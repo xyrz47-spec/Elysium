@@ -4,6 +4,9 @@ import { useTauriEvent } from "./lib/events";
 import { emit } from "@tauri-apps/api/event";
 import { ACTIVITY_KEEP, STREAM_KEEP } from "./lib/panel";
 
+/** 글자 조각을 화면에 반영하는 간격(ms) */
+const DELTA_FLUSH_MS = 50;
+
 export interface Toast {
   id: number;
   text: string;
@@ -264,6 +267,41 @@ export function AppProvider({ children }: { children: ReactNode }) {
   useEffect(() => loadMessages(conversationId), [conversationId, loadMessages]);
 
   const patch = (taskId: string, f: (l: Live) => Live) => setLive((m) => (m[taskId] ? { ...m, [taskId]: f(m[taskId]) } : m));
+  // 글자 조각은 모아 두었다가 짧은 간격마다 한 번에 반영한다. 병렬 에이전트가 많으면 조각마다 다시 그려 화면이 느려진다.
+  const pending = useRef<{ text: Record<string, string>; streams: Record<string, Record<string, string>>; timer: number | null }>({ text: {}, streams: {}, timer: null });
+  const flushDeltas = useCallback(() => {
+    const q = pending.current;
+    if (q.timer != null) window.clearTimeout(q.timer);
+    q.timer = null;
+    const { text, streams } = q;
+    if (!Object.keys(text).length && !Object.keys(streams).length) return;
+    q.text = {};
+    q.streams = {};
+    setLive((m) => {
+      const out = { ...m };
+      for (const [id, d] of Object.entries(text)) if (out[id]) out[id] = { ...out[id], text: out[id].text + d };
+      for (const [id, keys] of Object.entries(streams)) {
+        const l = out[id];
+        if (!l) continue;
+        const next = { ...l.streams };
+        for (const [k, d] of Object.entries(keys)) {
+          const t = (next[k] ?? "") + d;
+          next[k] = l.council || t.length <= STREAM_KEEP ? t : t.slice(-STREAM_KEEP);
+        }
+        out[id] = { ...l, streams: next };
+      }
+      return out;
+    });
+  }, []);
+  const queueDeltas = () => {
+    if (pending.current.timer == null) pending.current.timer = window.setTimeout(flushDeltas, DELTA_FLUSH_MS);
+  };
+  useEffect(
+    () => () => {
+      if (pending.current.timer != null) window.clearTimeout(pending.current.timer);
+    },
+    [],
+  );
 
   useTauriEvent<{ taskId: string; conversationId: string; messageId: string; primary: EngineId; reviewer: EngineId | null; work: boolean; skill: SkillRef | null; reasons: string[]; jev: Judgment | null; budget: Budget | null; debate: DebatePlan | null; team: TeamPlan | null; council: CouncilPlan | null; model: string | null }>("task:started", (p) =>
     setLive((m) => ({
@@ -331,13 +369,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
       return a ? { ...l, agents: { ...l.agents, [p.key]: { ...a, sent: [...a.sent, p.text] } } } : l;
     }),
   );
-  useTauriEvent<{ taskId: string; key: string; delta: string }>("task:agent-delta", (p) =>
-    // 회의 창과 에이전트 탭이 실행마다 지금까지 쓴 글을 보여 준다.
-    patch(p.taskId, (l) => {
-      const next = (l.streams[p.key] ?? "") + p.delta;
-      return { ...l, streams: { ...l.streams, [p.key]: l.council || next.length <= STREAM_KEEP ? next : next.slice(-STREAM_KEEP) } };
-    }),
-  );
+  // 회의 창과 에이전트 탭이 실행마다 지금까지 쓴 글을 보여 준다.
+  useTauriEvent<{ taskId: string; key: string; delta: string }>("task:agent-delta", (p) => {
+    const keys = (pending.current.streams[p.taskId] ??= {});
+    keys[p.key] = (keys[p.key] ?? "") + p.delta;
+    queueDeltas();
+  });
   useTauriEvent<{ taskId: string; conversationId: string; parts: ({ key: string } & PartInfo)[] }>("task:parts", (p) =>
     setLive((m) => {
       const l = m[p.taskId] ?? blank(p.taskId, p.conversationId, true);
@@ -349,10 +386,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
   useTauriEvent<{ taskId: string; engine: EngineId; role: string; state: "run" | "ok" | "fail" }>("task:debate", (p) =>
     patch(p.taskId, (l) => ({ ...l, debateState: { ...l.debateState, [`${p.engine}:${p.role}`]: p.state } })),
   );
-  useTauriEvent<{ taskId: string; phase: "draft" | "review"; label: string; effort: string | null; model: string | null }>("task:phase", (p) =>
-    patch(p.taskId, (l) => ({ ...l, phase: p.phase, label: p.label, effort: p.effort, model: p.model, text: "", draft: p.phase === "review" ? l.text : l.draft })),
-  );
-  useTauriEvent<{ taskId: string; delta: string }>("task:delta", (p) => patch(p.taskId, (l) => ({ ...l, text: l.text + p.delta })));
+  useTauriEvent<{ taskId: string; phase: "draft" | "review"; label: string; effort: string | null; model: string | null }>("task:phase", (p) => {
+    // 앞 단계의 글자가 새 단계에 붙지 않게 먼저 반영한다.
+    flushDeltas();
+    patch(p.taskId, (l) => ({ ...l, phase: p.phase, label: p.label, effort: p.effort, model: p.model, text: "", draft: p.phase === "review" ? l.text : l.draft }));
+  });
+  useTauriEvent<{ taskId: string; delta: string }>("task:delta", (p) => {
+    pending.current.text[p.taskId] = (pending.current.text[p.taskId] ?? "") + p.delta;
+    queueDeltas();
+  });
   useTauriEvent<{ taskId: string; text: string }>("task:activity", (p) => patch(p.taskId, (l) => ({ ...l, activities: [...l.activities, p.text].slice(-12) })));
   useTauriEvent<Approval>("task:approval", (a) => setApprovals((x) => [...x.filter((y) => y.id !== a.id), a]));
   useTauriEvent<Approval>("approval:decided", (a) => setApprovals((x) => x.filter((y) => y.id !== a.id)));

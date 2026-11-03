@@ -140,20 +140,9 @@ export const SearchIcon = () => (
     <path d="m20 20-4.2-4.2" />
   </Svg>
 );
-export const BookmarkIcon = () => (
-  <Svg>
-    <path d="M7 4.5h10v15l-5-3.5-5 3.5z" />
-  </Svg>
-);
 export const DownloadIcon = () => (
   <Svg>
     <path d="M12 4.5v10M7.5 10.5 12 15l4.5-4.5M5 19.5h14" />
-  </Svg>
-);
-export const KeyboardIcon = () => (
-  <Svg>
-    <rect x="3" y="6.5" width="18" height="11" rx="2.5" />
-    <path d="M7 10.5h.01M10.5 10.5h.01M14 10.5h.01M17.5 10.5h.01M8 14h8" />
   </Svg>
 );
 export const ArrowUpIcon = () => (

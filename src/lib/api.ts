@@ -98,7 +98,7 @@ export const TIER_LABEL: Record<Budget["tier"], string> = { light: "가볍게", 
 export interface Step {
   engine: EngineId;
   label: string;
-  role: "draft" | "review" | "debate" | "rebuttal" | "judge" | "agent" | "synth" | "council" | "plan" | "finish";
+  role: "draft" | "review" | "debate" | "rebuttal" | "judge" | "agent" | "synth" | "council" | "plan" | "roadmap" | "finish";
   effort: string | null;
   model: string | null;
   ok: boolean;

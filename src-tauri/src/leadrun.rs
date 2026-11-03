@@ -5,7 +5,7 @@ use crate::db::new_id;
 use crate::engines::{EngineId, Outcome, RunSpec};
 use crate::jev;
 use crate::lead::{self, Asked, Kind, Matched, Policy, Verdict, WorkerRequest};
-use crate::orchestrator::{self, emit, AppState};
+use crate::orchestrator::{self, add_opt, cut, emit, AppState};
 use crate::store;
 use crate::testqueue::TestItem;
 use serde_json::{json, Value};
@@ -226,15 +226,9 @@ fn queued_note(command: &str, position: Option<usize>) -> String {
 }
 
 fn merge_outcome(mut a: Outcome, b: &Outcome) -> Outcome {
-    fn add<T: std::ops::Add<Output = T> + Copy>(x: Option<T>, y: Option<T>) -> Option<T> {
-        match (x, y) {
-            (Some(p), Some(q)) => Some(p + q),
-            (p, q) => p.or(q),
-        }
-    }
-    a.cost_usd = add(a.cost_usd, b.cost_usd);
-    a.input_tokens = add(a.input_tokens, b.input_tokens);
-    a.output_tokens = add(a.output_tokens, b.output_tokens);
+    a.cost_usd = add_opt(a.cost_usd, b.cost_usd);
+    a.input_tokens = add_opt(a.input_tokens, b.input_tokens);
+    a.output_tokens = add_opt(a.output_tokens, b.output_tokens);
     a.latency_ms += b.latency_ms;
     a.activities.extend(b.activities.iter().cloned());
     if !b.text.trim().is_empty() {
@@ -256,9 +250,6 @@ async fn wait_or_stop<T>(f: impl Future<Output = T>, stop: &CancellationToken) -
     }
 }
 
-fn cut(text: &str, n: usize) -> String {
-    text.chars().take(n).collect()
-}
 
 fn jev_used(ctx: &Ctx, role: &'static str, ms: u64, cost: f64) {
     let _ = store::record_usage(&ctx.st.db, &store::Usage { engine: "jev", role, ok: true, latency_ms: ms, input_tokens: None, output_tokens: None, cost_usd: Some(cost) });

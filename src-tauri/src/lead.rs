@@ -44,7 +44,7 @@ pub struct Parsed {
 }
 
 /// 본문에서 이 이름의 펜스 블록을 모두 빼고 (안의 글, 닫히지 않은 블록이 있었는지, 남은 본문)을 돌려준다.
-fn take_blocks(text: &str, fence: &str) -> (Vec<String>, bool, String) {
+pub(crate) fn take_blocks(text: &str, fence: &str) -> (Vec<String>, bool, String) {
     let open = format!("```{fence}");
     let (mut bodies, mut clean, mut rest, mut unterminated) = (vec![], String::new(), text, false);
     while let Some(at) = rest.find(&open) {

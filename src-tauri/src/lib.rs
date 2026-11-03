@@ -16,6 +16,7 @@ mod memory;
 mod orchestrator;
 mod pricing;
 mod remote;
+mod roadmap;
 mod secrets;
 mod settings;
 mod skills;

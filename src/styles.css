@@ -851,8 +851,8 @@ input[type="text"].rail-search { height: 36px; margin-top: 10px; }
 .agent-out { margin: 0; max-height: 220px; overflow: auto; padding: 8px 10px; border-radius: 10px; background: rgba(var(--shade-rgb), 0.1); font-family: var(--mono); font-size: 11px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--muted); scrollbar-width: thin; }
 :root[data-theme="light"] .agent-out { background: rgba(255, 255, 255, 0.25); }
 .agent-run.fail .agent-state { background: rgba(var(--err-rgb), 0.1); }
-.ribbon-node.plan .ribbon-dot { background: conic-gradient(var(--c3), var(--accent), var(--c3)); }
-.ribbon-node.plan.ok .ribbon-dot { background: var(--grad-ai); }
+.ribbon-node.plan .ribbon-dot, .ribbon-node.roadmap .ribbon-dot { background: conic-gradient(var(--c3), var(--accent), var(--c3)); }
+.ribbon-node.plan.ok .ribbon-dot, .ribbon-node.roadmap.ok .ribbon-dot { background: var(--grad-ai); }
 .part-files { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin: 8px 0 6px; font-size: 11.5px; }
 .part-files b { margin-right: 4px; color: var(--muted); font-size: 11.5px; }
 @media (prefers-reduced-motion: reduce) { .app::before { animation: none; } .dock::after, .card::after, .composer::after { transition: none; } }
