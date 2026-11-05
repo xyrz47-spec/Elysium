@@ -49,6 +49,7 @@ pub fn run() {
                 eprintln!("예시 스킬을 만들지 못했습니다: {e}");
             }
             let s = settings::load(&db)?;
+            settings::set_prefs(&s);
             // 일부 API 게이트웨이(NVIDIA 등)는 User-Agent 없는 요청을 막는다.
             let http = reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(10))
@@ -112,6 +113,9 @@ pub fn run() {
             commands::conversation_list,
             commands::conversation_messages,
             commands::conversation_rename,
+            commands::conversation_search,
+            commands::window_attention,
+            commands::ui_zoom,
             commands::conversation_delete,
             commands::conversation_set_workspace,
             commands::attachment_pick,

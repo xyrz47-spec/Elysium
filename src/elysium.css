@@ -500,3 +500,70 @@ button.live-tail:hover, button.live-tail:focus-visible { border-color: rgba(var(
 .org-room { grid-column: 1 / -1; display: grid; gap: 4px; padding: 8px 10px; border-radius: 12px; background: var(--surface); border: 1px solid var(--line); }
 .org-room h5 { margin: 0; font-size: 11.5px; color: var(--muted); }
 .lead-member .tag { margin-left: 4px; padding: 0 5px; font-size: 10px; }
+
+/* ---- 표: 좁은 대화 칸에서 한국어가 한 글자씩 끊기지 않게 칸 최소 폭을 두고 가로로 넘긴다 ---- */
+.md table { width: max-content; min-width: 100%; }
+.md th, .md td { min-width: 6em; max-width: 36em; overflow-wrap: normal; word-break: keep-all; }
+.md td code, .md th code { overflow-wrap: anywhere; word-break: normal; }
+
+/* ---- 대화 폭: 넓게(표·코드가 많은 답) ---- */
+:root[data-chat-width="wide"] { --col: min(1400px, calc(100% - 56px)); }
+:root[data-chat-width="wide"] .app.tools-open { --col: min(1400px, calc(100vw - 168px - var(--tools-w, 560px) - 12px - 52px)); }
+
+/* ---- 세션 머리: 긴 제목은 말줄임, 작은 상태 구와 글자가 겹치지 않게 ---- */
+.head-title-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.head-orb { margin-right: 4px; }
+
+/* ---- 입력창 아래 단축키: 한 줄, 좁으면 뒤쪽부터 숨긴다 ---- */
+.composer-note { display: flex; justify-content: center; flex-wrap: wrap; gap: 2px 12px; height: 18px; overflow: hidden; white-space: nowrap; }
+.composer-note span { display: inline-flex; align-items: center; gap: 4px; }
+.composer-note kbd { font-family: var(--mono); font-size: 10px; padding: 0 5px; border-radius: 5px; border: 1px solid var(--line); background: var(--surface); color: var(--muted); }
+.composer textarea::placeholder { text-overflow: ellipsis; }
+
+/* ---- 자주 쓰는 프롬프트 메뉴(입력창 위) ---- */
+.composer-wrap > .prompt-menu { width: 340px; }
+.prompt-menu button[role="menuitem"] span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.menu-empty { padding: 6px 11px 10px; font-size: 12px; color: var(--muted); line-height: 1.5; }
+.menu-actions { display: flex; justify-content: space-between; gap: 6px; padding: 6px 4px 2px; border-top: 1px solid var(--line); margin-top: 4px; }
+.attach-btn.on { color: var(--accent-ink); background: rgba(var(--accent-rgb), 0.14); }
+
+/* ---- 세션 목록: 고정, 찾은 내용, 이름 바꾸기 ---- */
+.rail-search-wrap { position: relative; }
+.rail-search-wrap .rail-search { width: 100%; padding-right: 30px; }
+.rail-search-x { position: absolute; right: 6px; top: 50%; transform: translateY(-35%); display: grid; place-items: center; width: 22px; height: 22px; border: 0; border-radius: 6px; background: transparent; color: var(--dim); cursor: pointer; }
+.rail-search-x:hover { color: var(--ink); background: var(--surface-2); }
+.rail-label { padding: 8px 4px 4px; font-size: 10.5px; font-weight: 800; letter-spacing: 0.04em; color: var(--dim); }
+.session-slot { display: grid; }
+.session-title svg { margin-right: 4px; vertical-align: -2px; color: var(--accent-ink); }
+.session-snippet { margin-top: 3px; font-size: 11.5px; line-height: 1.45; color: var(--muted); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.session-rename { width: calc(100% - 22px); padding: 3px 8px; border-radius: 8px; border: 1px solid rgba(var(--accent-rgb), 0.55); background: var(--card); color: var(--ink); font: inherit; font-size: 13.5px; font-weight: 600; outline: none; }
+.ctx-menu [role="menuitem"] kbd { margin-left: auto; font-family: var(--mono); font-size: 10px; color: var(--dim); }
+
+/* ---- 설정: 맨 위 바로 가기, 새 항목 ---- */
+.settings-modal .modal-scroll { padding-top: 0; }
+.set-top { position: sticky; top: 0; z-index: 3; margin: 0 -24px; padding: 20px 24px 10px; background: #1c1e23; border-bottom: 1px solid var(--line); }
+:root[data-theme="light"] .set-top { background: #ffffff; }
+.set-nav { display: flex; gap: 4px; margin-top: 8px; overflow-x: auto; scrollbar-width: none; mask-image: linear-gradient(90deg, #000 92%, transparent); }
+.set-nav::-webkit-scrollbar { display: none; }
+.set-nav button { flex: none; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--line); background: var(--surface); color: var(--muted); font-size: 11.5px; white-space: nowrap; cursor: pointer; transition: color 0.2s, border-color 0.2s; }
+.set-nav button:hover { color: var(--ink); border-color: rgba(var(--accent-rgb), 0.5); }
+.modal section[id^="set-"] { scroll-margin-top: 100px; }
+.set-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+.set-row > span { font-size: 13px; }
+.set-field { display: grid; gap: 6px; margin-top: 10px; }
+.set-field > span { display: flex; justify-content: space-between; font-size: 13px; }
+.set-field small { color: var(--dim); font-variant-numeric: tabular-nums; }
+.set-field textarea, .prompt-list textarea { width: 100%; resize: vertical; min-height: 64px; padding: 8px 10px; border-radius: 10px; border: 1px solid var(--line); background: var(--surface); color: var(--ink); font: inherit; font-size: 13px; line-height: 1.5; }
+.set-field textarea:focus, .prompt-list textarea:focus, .prompt-list input:focus { outline: none; border-color: rgba(var(--accent-rgb), 0.55); }
+.help.grow { flex: 1; margin: 0; }
+.prompt-list { list-style: none; margin: 0 0 8px; padding: 0; display: grid; gap: 8px; }
+.prompt-list li { display: grid; grid-template-columns: 160px minmax(0, 1fr) auto; gap: 8px; align-items: start; }
+.prompt-list input { padding: 7px 10px; border-radius: 10px; border: 1px solid var(--line); background: var(--surface); color: var(--ink); font-size: 13px; }
+.prompt-list textarea { min-height: 40px; }
+@media (max-width: 640px) { .prompt-list li { grid-template-columns: minmax(0, 1fr) auto; } .prompt-list li textarea { grid-column: 1 / -1; grid-row: 2; } }
+
+/* 입력창 단추 줄: 좁아지면 폴더 칩만 줄이고(말줄임) 다른 단추는 겹치지 않게 제 크기를 지킨다 */
+.composer-bar > :not(.folder-chip):not(.spacer) { flex-shrink: 0; }
+.composer-bar .folder-chip { flex: 0 1 auto; min-width: 72px; }
+.composer-bar .folder-chip .pill { min-width: 0; max-width: 100%; }
+.composer-bar .folder-chip .pill-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

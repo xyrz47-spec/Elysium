@@ -37,11 +37,98 @@ pub struct Settings {
     pub test_slots: u8,
     /// 병렬 작업에서 워커가 끝낼 때마다 총괄이 변경을 검토·보정한 뒤 그 파일만 커밋한다(git 저장소일 때만).
     pub lead_commit: bool,
+    /// 모든 AI에게 미리 알려 두는 말(나에 대해·답변 방식). 시스템 지시 끝에 붙는다.
+    pub instructions: String,
+    /// 답변 언어: auto(요청 글의 언어, 기본은 한국어)·ko·en·ja·zh
+    pub answer_lang: String,
+    /// 답변 길이: auto·brief·detailed
+    pub answer_length: String,
+    /// 자주 쓰는 프롬프트(입력창에서 골라 넣는다)
+    pub prompts: Vec<SavedPrompt>,
+    /// 작업이 끝났을 때 창이 앞에 없으면 작업 표시줄에서 알린다
+    pub notify_done: bool,
+}
+
+/// 자주 쓰는 프롬프트 하나
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SavedPrompt {
+    pub title: String,
+    pub text: String,
+}
+
+/// 사용자 지시의 최대 글자 수(매 요청에 붙으므로 길면 토큰이 든다)
+pub const INSTRUCTIONS_MAX: usize = 2000;
+const PROMPTS_MAX: usize = 50;
+const PROMPT_TEXT_MAX: usize = 8000;
+const LANGS: &[&str] = &["auto", "ko", "en", "ja", "zh"];
+const LENGTHS: &[&str] = &["auto", "brief", "detailed"];
+
+/// 지금 설정의 답변 방식. 시스템 지시를 만드는 곳은 설정을 받지 않는 곳이 많아 여기서 읽는다.
+static PREFS: std::sync::RwLock<Option<Prefs>> = std::sync::RwLock::new(None);
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Prefs {
+    pub lang: String,
+    pub length: String,
+    pub instructions: String,
+}
+
+/// 설정을 읽거나 바꿀 때마다 부른다.
+pub fn set_prefs(s: &Settings) {
+    *PREFS.write().unwrap_or_else(|p| p.into_inner()) = Some(Prefs { lang: s.answer_lang.clone(), length: s.answer_length.clone(), instructions: s.instructions.clone() });
+}
+
+pub fn prefs() -> Prefs {
+    PREFS.read().unwrap_or_else(|p| p.into_inner()).clone().unwrap_or_default()
+}
+
+impl Prefs {
+    /// 시스템 지시 첫 줄의 언어 안내
+    pub fn lang_line(&self) -> &'static str {
+        match self.lang.as_str() {
+            "en" => "Answer in English unless the user asks for another language.",
+            "ja" => "ユーザーが別の言語を求めない限り、日本語で答えてください。",
+            "zh" => "除非用户要求其他语言，请用简体中文回答。",
+            "ko" => "사용자가 다른 언어를 요청하지 않으면 한국어로 답하세요.",
+            _ => "사용자는 한국어를 씁니다. 사용자가 다른 언어로 쓰거나 요청하지 않으면 한국어로 답하세요.",
+        }
+    }
+
+    /// 시스템 지시 끝에 붙는 답변 길이와 사용자 지시(고른 것이 없으면 빈 글)
+    pub fn tail(&self) -> String {
+        let mut s = String::new();
+        match self.length.as_str() {
+            "brief" => s.push_str("\n[답변 길이] 결론부터 짧게 답하세요. 꼭 필요한 설명만 쓰고, 코드·숫자·경고는 줄이지 마세요.\n"),
+            "detailed" => s.push_str("\n[답변 길이] 배경, 이유, 예시, 주의할 점까지 자세히 설명하세요.\n"),
+            _ => {}
+        }
+        let t = self.instructions.trim();
+        if !t.is_empty() {
+            s.push_str(&format!("\n[사용자가 미리 알려 둔 것] 사용자가 모든 요청에 적용해 달라고 적어 둔 정보와 선호입니다. 이번 요청과 어긋나면 이번 요청을 따르세요.\n{t}\n"));
+        }
+        s
+    }
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { workspace_dir: None, review: ReviewMode::Auto, jev_enabled: false, models: BTreeMap::new(), agents: 1, agents_auto: true, jev_suggest: true, test_slots: 1, lead_commit: true }
+        Settings {
+            workspace_dir: None,
+            review: ReviewMode::Auto,
+            jev_enabled: false,
+            models: BTreeMap::new(),
+            agents: 1,
+            agents_auto: true,
+            jev_suggest: true,
+            test_slots: 1,
+            lead_commit: true,
+            instructions: String::new(),
+            answer_lang: "auto".into(),
+            answer_length: "auto".into(),
+            prompts: vec![],
+            notify_done: true,
+        }
     }
 }
 
@@ -58,6 +145,21 @@ impl Settings {
         self.models = self.models.into_iter().map(|(k, v)| (k, v.trim().to_string())).filter(|(_, v)| !v.is_empty()).collect();
         self.agents = self.agents.clamp(1, crate::intent::MAX_AGENTS as u8);
         self.test_slots = self.test_slots.clamp(1, 8);
+        self.instructions = self.instructions.trim().chars().take(INSTRUCTIONS_MAX).collect();
+        if !LANGS.contains(&self.answer_lang.as_str()) {
+            self.answer_lang = "auto".into();
+        }
+        if !LENGTHS.contains(&self.answer_length.as_str()) {
+            self.answer_length = "auto".into();
+        }
+        self.prompts = self
+            .prompts
+            .into_iter()
+            .map(|p| SavedPrompt { title: p.title.trim().chars().take(60).collect(), text: p.text.trim().chars().take(PROMPT_TEXT_MAX).collect() })
+            .filter(|p| !p.text.is_empty())
+            .map(|p| if p.title.is_empty() { SavedPrompt { title: p.text.chars().take(24).collect(), ..p } } else { p })
+            .take(PROMPTS_MAX)
+            .collect();
         // OpenCode는 무료 모델만: 다른 값은 저장하지 않는다.
         if self.models.get("opencode").is_some_and(|m| !crate::engines::is_free_model(m)) {
             self.models.remove("opencode");
@@ -116,5 +218,25 @@ mod tests {
         let mut models = BTreeMap::new();
         models.insert("opencode".to_string(), "anthropic/claude-opus-5-5".to_string());
         assert!(Settings { models, ..Default::default() }.sanitized().models.is_empty(), "유료 모델은 저장하지 않는다");
+        assert!(old.notify_done && old.prompts.is_empty() && old.answer_lang == "auto", "예전 설정은 새 항목의 기본값으로");
+    }
+
+    #[test]
+    fn answer_prefs_are_cleaned_and_rendered() {
+        let s = Settings {
+            answer_lang: "xx".into(),
+            answer_length: "brief".into(),
+            instructions: format!("  저는 백엔드 개발자입니다 {}", "가".repeat(INSTRUCTIONS_MAX)),
+            prompts: vec![SavedPrompt { title: " ".into(), text: " 이 코드를 리뷰해 줘 ".into() }, SavedPrompt { title: "빈 글".into(), text: "  ".into() }],
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(s.answer_lang, "auto", "모르는 언어는 자동");
+        assert_eq!(s.instructions.chars().count(), INSTRUCTIONS_MAX);
+        assert_eq!(s.prompts, vec![SavedPrompt { title: "이 코드를 리뷰해 줘".into(), text: "이 코드를 리뷰해 줘".into() }], "빈 프롬프트는 버리고 제목이 없으면 본문 앞부분");
+        let p = Prefs { lang: "en".into(), length: "brief".into(), instructions: "백엔드 개발자".into() };
+        assert!(p.lang_line().contains("English"));
+        assert!(p.tail().contains("짧게") && p.tail().contains("백엔드 개발자"));
+        assert!(Prefs { lang: "auto".into(), length: "auto".into(), instructions: " ".into() }.tail().is_empty(), "고른 것이 없으면 아무것도 붙이지 않는다");
     }
 }

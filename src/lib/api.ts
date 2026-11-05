@@ -38,7 +38,34 @@ export interface Settings {
   testSlots: number;
   /** 병렬 작업에서 워커가 끝낼 때마다 총괄이 변경을 검토·보정한 뒤 커밋한다 */
   leadCommit: boolean;
+  /** 모든 AI에게 미리 알려 두는 말(나에 대해·답변 방식) */
+  instructions: string;
+  /** 답변 언어 */
+  answerLang: AnswerLang;
+  /** 답변 길이 */
+  answerLength: AnswerLength;
+  /** 자주 쓰는 프롬프트 */
+  prompts: SavedPrompt[];
+  /** 작업이 끝났을 때 창이 앞에 없으면 작업 표시줄에서 알린다 */
+  notifyDone: boolean;
 }
+
+export type AnswerLang = "auto" | "ko" | "en" | "ja" | "zh";
+export type AnswerLength = "auto" | "brief" | "detailed";
+
+export interface SavedPrompt {
+  title: string;
+  text: string;
+}
+
+/** 모든 세션에서 찾은 결과: 세션과 찾은 곳의 앞뒤 글(제목에서 찾았으면 빈 글) */
+export interface SearchHit {
+  conversationId: string;
+  snippet: string;
+}
+
+/** 백엔드 settings::INSTRUCTIONS_MAX와 같다 */
+export const INSTRUCTIONS_MAX = 2000;
 
 /** 채팅에 붙은 파일(사용자가 올렸거나 에이전트가 답에 붙임) */
 export interface Attachment {
@@ -395,6 +422,11 @@ export const api = {
   conversationList: () => invoke<Conversation[]>("conversation_list"),
   conversationMessages: (conversationId: string) => invoke<Message[]>("conversation_messages", { conversationId }),
   conversationRename: (conversationId: string, title: string) => invoke<void>("conversation_rename", { conversationId, title }),
+  conversationSearch: (query: string) => invoke<SearchHit[]>("conversation_search", { query }),
+  /** 창이 앞에 없으면 작업 표시줄 단추를 깜박여 알린다 */
+  windowAttention: () => invoke<void>("window_attention"),
+  /** 화면 전체 배율(0.8~1.4) */
+  uiZoom: (scale: number) => invoke<void>("ui_zoom", { scale }),
   conversationDelete: (conversationId: string) => invoke<void>("conversation_delete", { conversationId }),
   conversationSetWorkspace: (conversationId: string, path: string | null) => invoke<void>("conversation_set_workspace", { conversationId, path }),
   pickFolder: () => invoke<string | null>("pick_folder"),

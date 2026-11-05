@@ -4,8 +4,8 @@ const PANEL_MIN = 360;
 /** 양쪽 도크(84px씩) */
 export const DOCK = 84;
 const DOCKS = DOCK * 2;
-/** 창을 넓혀도 대화가 이만큼은 남게 한다 */
-const CHAT_MIN = 420;
+/** 창을 넓혀도 대화가 이만큼은 남게 한다(좁으면 표·코드가 한 글자씩 끊겨 읽기 어렵다) */
+const CHAT_MIN = 560;
 
 /** 워커가 지금까지 쓴 글은 끝부분만 둔다. 늦게 연 별도 창도 이만큼은 보여 준다. */
 export const STREAM_KEEP = 300000;

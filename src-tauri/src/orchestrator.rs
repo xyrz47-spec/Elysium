@@ -1104,9 +1104,11 @@ pub enum TeamText {
 const NO_NESTED_AI: &str = "다른 AI는 Elysium이 직접 실행합니다. 명령 도구로 AI CLI(agy, gemini, codex, opencode, claude, just-code-claude, agy_call)를 실행하거나 백그라운드 워커를 띄우지 마세요. 요청이 하위 에이전트·워커를 말해도 지금 당신에게 그 일이 맡겨졌다면 Elysium이 한 AI로 돌리기로 한 것이니, 직접 처리하고 답에 그렇게 했다고 밝히세요.\n";
 
 pub fn system_prompt(work: bool, workspace: &str, skill: Option<&(SkillRef, String)>) -> String {
-    let mut s = String::from(
-        "당신은 데스크톱 AI 클라이언트 Elysium 안에서 일하는 AI입니다. 사용자는 한국어를 씁니다. 한국어로 답하세요.\n\
+    let prefs = crate::settings::prefs();
+    let mut s = format!(
+        "당신은 데스크톱 AI 클라이언트 Elysium 안에서 일하는 AI입니다. {}\n\
          결과는 바로 쓸 수 있게 완성된 형태로 주고, 필요하면 마크다운 제목·목록·코드 블록으로 정리하세요. 모르는 것은 추측하지 말고 모른다고 밝히세요.\n",
+        prefs.lang_line()
     );
     s.push_str(&format!("작업 폴더: {workspace}\n"));
     if work {
@@ -1119,6 +1121,7 @@ pub fn system_prompt(work: bool, workspace: &str, skill: Option<&(SkillRef, Stri
     if let Some((r, body)) = skill {
         s.push_str(&format!("\n[스킬: {}]\n{}\n", r.name, body));
     }
+    s.push_str(&prefs.tail());
     s
 }
 

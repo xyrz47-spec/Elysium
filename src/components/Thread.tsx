@@ -8,7 +8,7 @@ import { LiveBrief } from "./LeadPanel";
 import { SavedLeadLog } from "./LeadPanel";
 import { hideBlocks } from "../lib/panel";
 import { MessageAttachments } from "./Attachments";
-import { ChevronIcon, CopyIcon, CouncilIcon, FolderIcon, SparkIcon, WrenchIcon } from "./Icons";
+import { ChevronIcon, CopyIcon, CouncilIcon, EditIcon, FolderIcon, RedoIcon, SparkIcon, WrenchIcon } from "./Icons";
 
 /** 첫 화면 예시: 눌러서 입력창에 넣고, 만들기(또는 Enter)로 보낸다 */
 const SUGGESTIONS: { title: string; text: string; tone: string }[] = [
@@ -430,8 +430,8 @@ export function pair(messages: Message[]): Exchange[] {
 }
 
 /** 결과 카드: 요청(머리) → 릴레이 리본 → 결과(본문) → 과정·복사(꼬리) */
-function Card({ ex, live, approvals, index }: { ex: Exchange; live?: Live; approvals: Approval[]; index: number }) {
-  const { toast } = useApp();
+function Card({ ex, live, approvals, index, busy, onPick }: { ex: Exchange; live?: Live; approvals: Approval[]; index: number; busy: boolean; onPick: (t: string) => void }) {
+  const { toast, send } = useApp();
   const a = ex.answer;
   const data = a?.data ?? null;
   const failed = !!a && a.content.startsWith("⚠");
@@ -505,6 +505,21 @@ function Card({ ex, live, approvals, index }: { ex: Exchange; live?: Live; appro
           <button className="foot-btn" onClick={() => navigator.clipboard.writeText(a.content).then(() => toast("복사했습니다."))}>
             <CopyIcon /> 복사
           </button>
+          {ex.user && (
+            <>
+              <button
+                className="foot-btn"
+                disabled={busy}
+                title={busy ? "이 세션의 작업이 끝난 뒤에 다시 보낼 수 있습니다" : "같은 질문을 같은 방식으로 다시 보냅니다(첨부 파일은 빼고)"}
+                onClick={() => send(ex.user!.content, "auto", !!work && !council, build && !council, council, [])}
+              >
+                <RedoIcon /> 다시 보내기
+              </button>
+              <button className="foot-btn" title="이 질문을 입력창에 넣어 고친 뒤 보냅니다" onClick={() => onPick(ex.user!.content)}>
+                <EditIcon /> 고쳐서 보내기
+              </button>
+            </>
+          )}
         </footer>
       )}
     </article>
@@ -578,7 +593,7 @@ export default function Thread({ onPick }: { onPick: (t: string) => void }) {
     >
       <div className="thread-inner">
         {exchanges.map((ex, i) => (
-          <Card key={ex.key} ex={ex} index={i} live={i === lastOpen ? mine[0] : undefined} approvals={i === lastOpen ? pending : []} />
+          <Card key={ex.key} ex={ex} index={i} live={i === lastOpen ? mine[0] : undefined} approvals={i === lastOpen ? pending : []} busy={mine.length > 0} onPick={onPick} />
         ))}
       </div>
     </div>

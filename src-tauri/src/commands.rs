@@ -45,6 +45,7 @@ pub fn settings_get(st: S) -> Settings {
 pub fn settings_update(app: AppHandle, st: S, settings: Settings) -> AppResult<Settings> {
     let s = settings.sanitized();
     settings::save(&st.db, &s)?;
+    settings::set_prefs(&s);
     *st.settings.write().unwrap_or_else(|p| p.into_inner()) = s.clone();
     st.tests.set_capacity(s.test_slots as usize);
     // API 엔진에 보여 주는 모델 이름을 바로 맞춘다.
@@ -127,6 +128,30 @@ pub fn conversation_list(st: S) -> AppResult<Vec<Conversation>> {
 #[tauri::command]
 pub fn conversation_messages(st: S, conversation_id: String) -> AppResult<Vec<Message>> {
     store::list_messages(&st.db, &conversation_id)
+}
+
+/// 메인 창이 앞에 없으면 작업 표시줄 단추를 깜박여 알린다(작업이 끝났을 때).
+#[tauri::command]
+pub fn window_attention(app: AppHandle) -> AppResult<()> {
+    if let Some(w) = app.get_webview_window("main") {
+        if !w.is_focused().unwrap_or(true) {
+            let _ = w.request_user_attention(Some(tauri::UserAttentionType::Informational));
+        }
+    }
+    Ok(())
+}
+
+/// 이 창의 화면 배율(글자·컨트롤 크기). 0.8~1.4로 자른다.
+#[tauri::command]
+pub fn ui_zoom(window: tauri::WebviewWindow, scale: f64) -> AppResult<()> {
+    let s = if scale.is_finite() { scale.clamp(0.8, 1.4) } else { 1.0 };
+    window.set_zoom(s).map_err(|e| AppError::Msg(e.to_string()))
+}
+
+/// 모든 세션의 제목과 대화 내용에서 찾는다(세션마다 처음 찾은 곳의 앞뒤 글).
+#[tauri::command]
+pub fn conversation_search(st: S, query: String) -> AppResult<Vec<store::SearchHit>> {
+    store::search_conversations(&st.db, &query)
 }
 
 #[tauri::command]

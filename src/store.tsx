@@ -155,6 +155,7 @@ interface AppCtx {
   conversationId: string | null;
   openConversation: (id: string | null) => void;
   deleteConversation: (id: string) => Promise<void>;
+  renameConversation: (id: string, title: string) => Promise<void>;
   messages: Message[];
   live: Live[];
   approvals: Approval[];
@@ -291,6 +292,8 @@ function progressOf(l: Live, queue: QueueView): string {
 export function AppProvider({ children }: { children: ReactNode }) {
   const [engines, setEngines] = useState<EngineInfo[]>([]);
   const [settings, setSettings] = useState<Settings | null>(null);
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -538,6 +541,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
   useTauriEvent<{ taskId: string }>("task:done", (p) => {
     setLive(({ [p.taskId]: _, ...rest }) => rest);
     refreshConversations();
+    // 다른 창을 보고 있으면 작업 표시줄에서 알린다(창이 앞에 있으면 Rust 쪽에서 건너뛴다).
+    if (settingsRef.current?.notifyDone !== false) api.windowAttention().catch(() => {});
   });
   const patchSide = useCallback((id: string, f: (t: SideTurn) => SideTurn) => {
     setSideThreads((m) => Object.fromEntries(Object.entries(m).map(([k, v]) => [k, v.map((t) => (t.id === id ? f(t) : t))])));
@@ -671,6 +676,18 @@ export function AppProvider({ children }: { children: ReactNode }) {
     [conversationId, refreshConversations, toast],
   );
 
+  const renameConversation = useCallback(
+    async (id: string, title: string) => {
+      try {
+        await api.conversationRename(id, title);
+        refreshConversations();
+      } catch (e) {
+        toast(errorText(e), "error");
+      }
+    },
+    [refreshConversations, toast],
+  );
+
   const saveSettings = useCallback(
     async (s: Settings) => {
       try {
@@ -700,6 +717,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       conversationId,
       openConversation: setConversationId,
       deleteConversation,
+      renameConversation,
       messages,
       live: Object.values(live),
       approvals,
@@ -719,7 +737,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       toasts,
       toast,
     }),
-    [queue, testLogs, loadTestLog, engines, newFolder, chooseFolder, resetFolder, refreshEngines, settings, saveSettings, conversations, conversationId, deleteConversation, messages, live, approvals, decide, send, cancel, cancelAgent, cancelAll, side, askSide, stopSide, clearSide, skills, refreshSkills, dialog, toasts, toast],
+    [queue, testLogs, loadTestLog, engines, newFolder, chooseFolder, resetFolder, refreshEngines, settings, saveSettings, conversations, conversationId, deleteConversation, renameConversation, messages, live, approvals, decide, send, cancel, cancelAgent, cancelAll, side, askSide, stopSide, clearSide, skills, refreshSkills, dialog, toasts, toast],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

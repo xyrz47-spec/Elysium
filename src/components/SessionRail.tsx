@@ -1,10 +1,10 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { applyTheme, loadTheme, watchSystem, type ThemeChoice } from "../lib/theme";
-import { baseName, type Conversation } from "../lib/api";
+import { api, baseName, type Conversation } from "../lib/api";
 import { ask } from "../lib/confirm";
 import { useApp } from "../store";
-import { AutoIcon, ChartIcon, FolderIcon, GearIcon, MoonIcon, PanelIcon, PlusIcon, PuzzleIcon, SleepIcon, SunIcon, TrashIcon } from "./Icons";
+import { AutoIcon, ChartIcon, CloseIcon, EditIcon, FolderIcon, GearIcon, MoonIcon, PanelIcon, PinIcon, PlusIcon, PuzzleIcon, SleepIcon, SunIcon, TrashIcon } from "./Icons";
 import { setSleep } from "../lib/sleep";
 
 const SLEEP_TIP = "취침 모드: 화면 끄고 AI 작업 유지";
@@ -127,12 +127,67 @@ function ContextMenu({ x, y, label, onClose, children }: { x: number; y: number;
   );
 }
 
-/** 세션 패널: 세션마다 카드 한 장. 카드에 그 세션의 작업 폴더가 보인다. */
+const PIN_KEY = "elysium.pinned";
+/** 내용까지 찾기 시작하는 글자 수와 기다리는 시간 */
+const DEEP_MIN = 2;
+const DEEP_DELAY_MS = 250;
+
+/** 고정한 세션(이 PC에만 기억한다) */
+function usePins(): [Set<string>, (id: string) => void] {
+  const [pins, setPins] = useState<Set<string>>(() => {
+    try {
+      return new Set(JSON.parse(localStorage.getItem(PIN_KEY) ?? "[]") as string[]);
+    } catch {
+      return new Set();
+    }
+  });
+  const toggle = (id: string) =>
+    setPins((cur) => {
+      const next = new Set(cur);
+      if (!next.delete(id)) next.add(id);
+      localStorage.setItem(PIN_KEY, JSON.stringify([...next]));
+      return next;
+    });
+  return [pins, toggle];
+}
+
+/** 제목·폴더에 더해 대화 내용에서도 찾는다. 늦게 온 답은 버린다. */
+function useDeepSearch(q: string): Map<string, string> {
+  const [hits, setHits] = useState<Map<string, string>>(new Map());
+  useEffect(() => {
+    const t = q.trim();
+    if (t.length < DEEP_MIN) {
+      setHits(new Map());
+      return;
+    }
+    let stale = false;
+    const timer = setTimeout(() => {
+      api
+        .conversationSearch(t)
+        .then((list) => !stale && setHits(new Map(list.map((h) => [h.conversationId, h.snippet]))))
+        .catch(() => {});
+    }, DEEP_DELAY_MS);
+    return () => {
+      stale = true;
+      clearTimeout(timer);
+    };
+  }, [q]);
+  return hits;
+}
+
+/** 세션 패널: 세션마다 카드 한 장. 고정한 세션이 위에 오고, 찾기는 대화 내용까지 본다. */
 export default function SessionPanel({ open, onPicked }: { open: boolean; onPicked: () => void }) {
-  const { conversations, conversationId, openConversation, deleteConversation, live } = useApp();
+  const { conversations, conversationId, openConversation, deleteConversation, renameConversation, live } = useApp();
   const [q, setQ] = useState("");
+  const [pins, togglePin] = usePins();
+  const [editing, setEditing] = useState<string | null>(null);
+  const deep = useDeepSearch(q);
   const busy = new Set(live.map((l) => l.conversationId));
-  const list = useMemo(() => conversations.filter((c) => !q || c.title.toLowerCase().includes(q.toLowerCase()) || (c.workspaceDir ?? "").toLowerCase().includes(q.toLowerCase())), [conversations, q]);
+  const list = useMemo(() => {
+    const t = q.trim().toLowerCase();
+    const found = conversations.filter((c) => !t || c.title.toLowerCase().includes(t) || (c.workspaceDir ?? "").toLowerCase().includes(t) || deep.has(c.id));
+    return [...found.filter((c) => pins.has(c.id)), ...found.filter((c) => !pins.has(c.id))];
+  }, [conversations, q, deep, pins]);
   const [menu, setMenu] = useState<{ c: Conversation; x: number; y: number } | null>(null);
   const remove = async (c: Conversation) => {
     const ok = await ask({
@@ -143,6 +198,11 @@ export default function SessionPanel({ open, onPicked }: { open: boolean; onPick
     });
     if (ok) deleteConversation(c.id);
   };
+  const pick = (c: Conversation) => {
+    openConversation(c.id);
+    onPicked();
+  };
+  const firstUnpinned = list.findIndex((c) => !pins.has(c.id));
 
   return (
     <aside className={`panel ${open ? "open" : ""}`} aria-label="세션" aria-hidden={!open} inert={!open}>
@@ -154,59 +214,113 @@ export default function SessionPanel({ open, onPicked }: { open: boolean; onPick
           </span>
           <span className="panel-count">{conversations.length}개 세션</span>
         </div>
-        <input type="text" className="rail-search" placeholder="세션·폴더 검색" value={q} onChange={(e) => setQ(e.target.value)} aria-label="세션 검색" />
+        <div className="rail-search-wrap">
+          <input
+            type="text"
+            className="rail-search"
+            placeholder="제목·폴더·대화 내용 검색"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            onKeyDown={(e) => e.key === "Escape" && q && (e.stopPropagation(), setQ(""))}
+            aria-label="세션 검색"
+          />
+          {q && (
+            <button type="button" className="rail-search-x" onClick={() => setQ("")} aria-label="검색어 지우기" title="검색어 지우기">
+              <CloseIcon />
+            </button>
+          )}
+        </div>
         <nav className="sessions">
           {list.length === 0 && <div className="rail-empty">{q ? "찾는 세션이 없습니다" : "첫 세션을 시작해 보세요"}</div>}
-          {list.map((c, i) => (
-            <div
-              key={c.id}
-              className={`session ${c.id === conversationId ? "on" : ""} ${busy.has(c.id) ? "busy" : ""}`}
-              style={{ "--i": i } as CSSProperties}
-              onClick={() => {
-                openConversation(c.id);
-                onPicked();
-              }}
-              onContextMenu={(e) => {
-                e.preventDefault();
-                setMenu({ c, x: e.clientX, y: e.clientY });
-              }}
-              role="button"
-              tabIndex={0}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  openConversation(c.id);
-                  onPicked();
-                } else if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) {
-                  e.preventDefault();
-                  const r = e.currentTarget.getBoundingClientRect();
-                  setMenu({ c, x: r.left + 16, y: r.top + r.height / 2 });
-                }
-              }}
-            >
-              <div className="session-title">{c.title}</div>
-              <div className="session-meta">
-                <span className="session-folder" title={c.workspaceDir ?? "기본 작업 폴더"}>
-                  <FolderIcon /> {c.workspaceDir ? baseName(c.workspaceDir) : "기본 폴더"}
-                </span>
-                <span>{busy.has(c.id) ? "작업 중" : ago(c.updatedAt)}</span>
+          {list.map((c, i) => {
+            const pinned = pins.has(c.id);
+            const snippet = q ? deep.get(c.id) : undefined;
+            return (
+              <div key={c.id} className="session-slot">
+                {i === 0 && pinned && <div className="rail-label">고정됨</div>}
+                {i === firstUnpinned && firstUnpinned > 0 && <div className="rail-label">최근</div>}
+                <div
+                  className={`session ${c.id === conversationId ? "on" : ""} ${busy.has(c.id) ? "busy" : ""} ${pinned ? "pinned" : ""}`}
+                  style={{ "--i": i } as CSSProperties}
+                  onClick={() => editing !== c.id && pick(c)}
+                  onDoubleClick={() => setEditing(c.id)}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    setMenu({ c, x: e.clientX, y: e.clientY });
+                  }}
+                  role="button"
+                  tabIndex={0}
+                  onKeyDown={(e) => {
+                    if (editing === c.id) return;
+                    if (e.key === "Enter") pick(c);
+                    else if (e.key === "F2") setEditing(c.id);
+                    else if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) {
+                      e.preventDefault();
+                      const r = e.currentTarget.getBoundingClientRect();
+                      setMenu({ c, x: r.left + 16, y: r.top + r.height / 2 });
+                    }
+                  }}
+                >
+                  {editing === c.id ? (
+                    <RenameBox
+                      title={c.title}
+                      onDone={(t) => {
+                        setEditing(null);
+                        if (t && t !== c.title) renameConversation(c.id, t);
+                      }}
+                    />
+                  ) : (
+                    <div className="session-title" title={c.title}>
+                      {pinned && <PinIcon />}
+                      {c.title}
+                    </div>
+                  )}
+                  {snippet && <div className="session-snippet">{snippet}</div>}
+                  <div className="session-meta">
+                    <span className="session-folder" title={c.workspaceDir ?? "기본 작업 폴더"}>
+                      <FolderIcon /> {c.workspaceDir ? baseName(c.workspaceDir) : "기본 폴더"}
+                    </span>
+                    <span>{busy.has(c.id) ? "작업 중" : ago(c.updatedAt)}</span>
+                  </div>
+                  <button
+                    className="session-del"
+                    aria-label={DEL_LABEL}
+                    title={DEL_TIP}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      remove(c);
+                    }}
+                  >
+                    <TrashIcon />
+                  </button>
+                </div>
               </div>
-              <button
-                className="session-del"
-                aria-label={DEL_LABEL}
-                title={DEL_TIP}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  remove(c);
-                }}
-              >
-                <TrashIcon />
-              </button>
-            </div>
-          ))}
+            );
+          })}
         </nav>
       </div>
       {menu && (
         <ContextMenu x={menu.x} y={menu.y} label={menu.c.title} onClose={() => setMenu(null)}>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              togglePin(menu.c.id);
+              setMenu(null);
+            }}
+          >
+            <PinIcon /> {pins.has(menu.c.id) ? "고정 해제" : "맨 위에 고정"}
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              setEditing(menu.c.id);
+              setMenu(null);
+            }}
+          >
+            <EditIcon /> 이름 바꾸기 <kbd>F2</kbd>
+          </button>
           <button
             type="button"
             role="menuitem"
@@ -222,5 +336,34 @@ export default function SessionPanel({ open, onPicked }: { open: boolean; onPick
         </ContextMenu>
       )}
     </aside>
+  );
+}
+
+/** 세션 이름 바꾸기: Enter·바깥 누르기로 저장, Esc로 취소 */
+function RenameBox({ title, onDone }: { title: string; onDone: (t: string | null) => void }) {
+  const [v, setV] = useState(title);
+  const done = useRef(false);
+  const finish = (t: string | null) => {
+    if (done.current) return;
+    done.current = true;
+    onDone(t);
+  };
+  return (
+    <input
+      className="session-rename"
+      autoFocus
+      value={v}
+      maxLength={80}
+      aria-label="세션 이름"
+      onFocus={(e) => e.currentTarget.select()}
+      onChange={(e) => setV(e.target.value)}
+      onClick={(e) => e.stopPropagation()}
+      onBlur={() => finish(v.trim() || null)}
+      onKeyDown={(e) => {
+        e.stopPropagation();
+        if (e.key === "Enter" && !e.nativeEvent.isComposing) finish(v.trim() || null);
+        else if (e.key === "Escape") finish(null);
+      }}
+    />
   );
 }

@@ -80,6 +80,52 @@ pub fn list_conversations(db: &Db) -> AppResult<Vec<Conversation>> {
     })
 }
 
+/// 세션 찾기 결과: 세션과 찾은 곳의 앞뒤 글(제목에서 찾았으면 비어 있다)
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHit {
+    pub conversation_id: String,
+    pub snippet: String,
+}
+
+/// 찾은 곳 앞뒤로 보여 줄 글자 수
+const SNIPPET_SIDE: usize = 40;
+
+fn snippet(text: &str, needle: &str) -> String {
+    let low = text.to_lowercase();
+    let Some(at) = low.find(&needle.to_lowercase()) else { return String::new() };
+    // to_lowercase는 바이트 길이를 바꿀 수 있으므로 글자 수로 다시 센다.
+    let start = low[..at].chars().count();
+    let chars: Vec<char> = text.chars().collect();
+    let from = start.saturating_sub(SNIPPET_SIDE);
+    let to = (start + needle.chars().count() + SNIPPET_SIDE).min(chars.len());
+    let body: String = chars[from.min(chars.len())..to].iter().collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
+    format!("{}{body}{}", if from > 0 { "…" } else { "" }, if to < chars.len() { "…" } else { "" })
+}
+
+/// 제목이나 대화 내용에 찾는 말이 있는 세션(최근 것부터, 최대 50개)
+pub fn search_conversations(db: &Db, query: &str) -> AppResult<Vec<SearchHit>> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(vec![]);
+    }
+    let like = format!("%{}%", q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+    db.with(|c| {
+        let mut st = c.prepare(
+            "SELECT c.id, c.title, (SELECT m.content FROM messages m WHERE m.conversation_id = c.id AND m.content LIKE ?1 ESCAPE '\\' ORDER BY m.created_at LIMIT 1)
+             FROM conversations c
+             WHERE c.title LIKE ?1 ESCAPE '\\' OR EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = c.id AND m.content LIKE ?1 ESCAPE '\\')
+             ORDER BY c.updated_at DESC LIMIT 50",
+        )?;
+        let rows = st.query_map([&like], |r| {
+            let (id, title, body): (String, String, Option<String>) = (r.get(0)?, r.get(1)?, r.get(2)?);
+            let in_title = title.to_lowercase().contains(&q.to_lowercase());
+            Ok(SearchHit { conversation_id: id, snippet: if in_title { String::new() } else { body.map(|b| snippet(&b, q)).unwrap_or_default() } })
+        })?;
+        rows.collect()
+    })
+}
+
 pub fn rename_conversation(db: &Db, id: &str, title: &str) -> AppResult<()> {
     let n = db.with(|c| c.execute("UPDATE conversations SET title = ?2 WHERE id = ?1", rusqlite::params![id, title_from(title)]))?;
     if n == 0 {
@@ -447,6 +493,24 @@ pub fn delete_all(db: &Db) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_finds_titles_and_message_text_across_sessions() {
+        let db = Db::open_in_memory().unwrap();
+        let a = create_conversation(&db, "러스트 웹 서버", None).unwrap();
+        let b = create_conversation(&db, "여행 계획", None).unwrap();
+        insert_message(&db, &b, "assistant", &format!("{}교토에서는 Fushimi Inari를 아침 일찍 가세요{}", "앞 ".repeat(30), " 뒤".repeat(30)), None).unwrap();
+        insert_message(&db, &a, "user", "100% 완료", None).unwrap();
+        let hits = search_conversations(&db, "fushimi").unwrap();
+        assert_eq!(hits.len(), 1, "대소문자와 상관없이 본문에서 찾는다");
+        assert_eq!(hits[0].conversation_id, b);
+        assert!(hits[0].snippet.contains("Fushimi") && hits[0].snippet.starts_with('…') && hits[0].snippet.ends_with('…'), "{}", hits[0].snippet);
+        let t = search_conversations(&db, "러스트").unwrap();
+        assert_eq!((t.len(), t[0].snippet.as_str()), (1, ""), "제목에서 찾으면 앞뒤 글은 없다");
+        assert_eq!(search_conversations(&db, "100%").unwrap().len(), 1, "%는 글자로 찾는다");
+        assert!(search_conversations(&db, "0%완").unwrap().is_empty());
+        assert!(search_conversations(&db, "  ").unwrap().is_empty());
+    }
 
     #[test]
     fn conversation_flow_and_sessions() {

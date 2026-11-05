@@ -189,3 +189,26 @@ export function ImageIcon({ size = 15 }: { size?: number }) {
     </svg>
   );
 }
+export const PinIcon = () => (
+  <Svg size={14}>
+    <path d="M9 4h6l-1 6 3 3v1H7v-1l3-3zM12 14v6" />
+  </Svg>
+);
+export const EditIcon = () => (
+  <Svg size={15}>
+    <path d="M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16z" />
+    <path d="M13.5 6.5l4 4" />
+  </Svg>
+);
+export const RedoIcon = () => (
+  <Svg size={15}>
+    <path d="M20 11a8 8 0 1 0-2.3 5.7" />
+    <path d="M20 4v7h-7" />
+  </Svg>
+);
+export const BookIcon = () => (
+  <Svg size={16}>
+    <path d="M12 6.5C10.5 5.2 8.3 4.5 4 4.5v13c4.3 0 6.5.7 8 2 1.5-1.3 3.7-2 8-2v-13c-4.3 0-6.5.7-8 2z" />
+    <path d="M12 6.5v13" />
+  </Svg>
+);

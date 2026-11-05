@@ -3,7 +3,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { api, baseName, errorText, toBase64, type Attachment, type EngineChoice, type Suggestion } from "../lib/api";
 import { useApp } from "../store";
 import { DraftAttachments } from "./Attachments";
-import { ChatIcon, ChevronIcon, ClipIcon, CloseIcon, CouncilIcon, FolderIcon, SendIcon, SparkIcon, StopIcon, WrenchIcon } from "./Icons";
+import { BookIcon, ChatIcon, ChevronIcon, ClipIcon, CloseIcon, CouncilIcon, FolderIcon, SendIcon, SparkIcon, StopIcon, WrenchIcon } from "./Icons";
 import Segmented from "./Segmented";
 
 /** 한 메시지에 붙일 수 있는 파일 수(백엔드 attachments::MAX_PER_MESSAGE와 같다) */
@@ -17,7 +17,7 @@ const SUGGEST_MIN_CHARS = 8;
 const SEND_MORE = "전송 방식 선택";
 
 export default function Composer({ draft, onDraftUsed }: { draft?: string | null; onDraftUsed?: () => void }) {
-  const { send, engines, live, conversationId, cancel, skills, conversations, newFolder, chooseFolder, resetFolder, toast, settings } = useApp();
+  const { send, engines, live, conversationId, cancel, skills, conversations, newFolder, chooseFolder, resetFolder, toast, settings, saveSettings, setDialog } = useApp();
   const [text, setText] = useState("");
   const [files, setFiles] = useState<Attachment[]>([]);
   const [dropping, setDropping] = useState(false);
@@ -27,6 +27,7 @@ export default function Composer({ draft, onDraftUsed }: { draft?: string | null
   const [work, setWork] = useState(false);
   const [menu, setMenu] = useState(false);
   const [sendMenu, setSendMenu] = useState(false);
+  const [promptMenu, setPromptMenu] = useState(false);
   const [pick, setPick] = useState(0);
   const ref = useRef<HTMLTextAreaElement>(null);
 
@@ -196,6 +197,21 @@ export default function Composer({ draft, onDraftUsed }: { draft?: string | null
   }
 
   const engineLabel = engine === "auto" ? "자동" : (engines.find((e) => e.id === engine)?.label ?? engine);
+  const prompts = settings?.prompts ?? [];
+  // 자주 쓰는 프롬프트: 비어 있으면 그대로 넣고, 쓰던 글이 있으면 다음 줄에 붙인다.
+  const usePrompt = (t: string) => {
+    setText((cur) => (cur.trim() ? `${cur.trimEnd()}\n${t}` : t));
+    setPromptMenu(false);
+    ref.current?.focus();
+  };
+  const savePrompt = async () => {
+    const t = text.trim();
+    if (!t || !settings) return;
+    if (prompts.some((p) => p.text === t)) return toast("이미 저장된 프롬프트입니다.");
+    await saveSettings({ ...settings, prompts: [...prompts, { title: t.split("\n")[0].slice(0, 24), text: t }] });
+    setPromptMenu(false);
+    toast("자주 쓰는 프롬프트에 저장했습니다.");
+  };
   return (
     <div className="composer-wrap">
       {matches.length > 0 && (
@@ -230,6 +246,33 @@ export default function Composer({ draft, onDraftUsed }: { draft?: string | null
             </b>
             <span>{buildHint}</span>
           </button>
+        </div>
+      )}
+      {promptMenu && (
+        <div className="menu prompt-menu" role="menu" onMouseLeave={() => setPromptMenu(false)}>
+          <div className="menu-title">자주 쓰는 프롬프트</div>
+          {prompts.length === 0 && <div className="menu-empty">저장한 프롬프트가 없습니다. 입력창에 쓴 글을 아래에서 저장해 두세요.</div>}
+          {prompts.map((p, i) => (
+            <button key={`${i}-${p.title}`} role="menuitem" onClick={() => usePrompt(p.text)} title={p.text}>
+              <b>{p.title}</b>
+              <span>{p.text.replace(/\s+/g, " ").slice(0, 80)}</span>
+            </button>
+          ))}
+          <div className="menu-actions">
+            <button type="button" className="btn sm ghost" disabled={!text.trim()} onClick={savePrompt}>
+              지금 입력한 글 저장
+            </button>
+            <button
+              type="button"
+              className="btn sm ghost"
+              onClick={() => {
+                setPromptMenu(false);
+                setDialog("settings");
+              }}
+            >
+              관리
+            </button>
+          </div>
         </div>
       )}
       {/* .composer가 backdrop-filter의 경계라 그 안에 두면 유리가 뒤 화면을 보지 못한다: slash-menu처럼 밖에 둔다 */}
@@ -308,10 +351,10 @@ export default function Composer({ draft, onDraftUsed }: { draft?: string | null
             !installed.length
               ? "먼저 설정에서 AI CLI 연결을 확인하세요"
               : running
-                ? "Enter를 누르면 실행 중인 에이전트에 전달되어 이어서 반영됩니다"
-              : work
-                ? "고칠 내용을 적고 Enter로 보내세요. 파일을 고치기 전에 허락을 받습니다"
-                : "만들 것을 적고 만들기를 누르세요. 질문은 Enter로 보냅니다"
+                ? "작업 중인 AI에게 전할 말 (Enter)"
+                : work
+                  ? "고칠 내용을 적으세요. 고치기 전에 허락을 받습니다"
+                  : "무엇이든 물어보세요. 만들기는 Ctrl+Enter"
           }
           aria-label="메시지 입력"
         />
@@ -323,6 +366,16 @@ export default function Composer({ draft, onDraftUsed }: { draft?: string | null
             title={"클릭, 드래그 또는 붙여넣기로 파일(개당 최대 50MB, 최대 10개)을 첨부할 수 있습니다."}
           >
             <ClipIcon />
+          </button>
+          <button
+            className={`pill attach-btn ${promptMenu ? "on" : ""}`}
+            onClick={() => setPromptMenu((m) => !m)}
+            aria-haspopup="menu"
+            aria-expanded={promptMenu}
+            aria-label="자주 쓰는 프롬프트"
+            title="자주 쓰는 프롬프트"
+          >
+            <BookIcon />
           </button>
           <div className="pill-menu">
             <button className="pill" onClick={() => setMenu((m) => !m)} aria-haspopup="menu" aria-expanded={menu} title="답할 AI">
@@ -381,7 +434,27 @@ export default function Composer({ draft, onDraftUsed }: { draft?: string | null
           )}
         </div>
       </div>
-      <div className="composer-note">Enter {work ? "작업(허락 후 수정)" : "질문"} · Ctrl+Enter 만들기 · Ctrl+Shift+Enter 회의 · / 스킬 — AI는 실수할 수 있으니 결과를 확인하세요.</div>
+      <div className="composer-note" title="AI는 실수할 수 있으니 결과를 확인하세요.">
+        <span>
+          <kbd>Enter</kbd> {running ? "AI에게 전달" : work ? "작업" : "질문"}
+        </span>
+        <span>
+          <kbd>Shift+Enter</kbd> 줄바꿈
+        </span>
+        {!running && (
+          <>
+            <span>
+              <kbd>Ctrl+Enter</kbd> 만들기
+            </span>
+            <span>
+              <kbd>Ctrl+Shift+Enter</kbd> 회의
+            </span>
+            <span>
+              <kbd>/</kbd> 스킬
+            </span>
+          </>
+        )}
+      </div>
     </div>
   );
 }

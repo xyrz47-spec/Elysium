@@ -26,7 +26,9 @@ function SessionHead() {
       <div className="head-title">
         {/* 대화 중에는 배경의 구가 이 자리로 줄어들어 AI 상태(대기·처리 중·허락 대기·오류)를 보여 준다 */}
         {c ? <span className="head-orb" data-orb-anchor="mini" aria-hidden /> : <span className={`head-dot ${busy ? "busy" : ""}`} aria-hidden />}
-        {c ? c.title : "새 세션"}
+        <span className="head-title-text" title={c?.title}>
+          {c ? c.title : "새 세션"}
+        </span>
       </div>
       {c && (
         <button className="head-folder" onClick={() => chooseFolder(c.id)} title={`${c.workspaceDir ?? "기본 작업 폴더"} — 눌러서 이 세션의 폴더 바꾸기`}>
