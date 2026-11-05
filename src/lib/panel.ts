@@ -25,5 +25,5 @@ export function tailText(text: string, keep: number): string {
 
 /** Elysium과 주고받는 블록은 사람에게 보이지 않는다. 아직 닫히지 않은 블록도 가린다. */
 export function hideBlocks(text: string): string {
-  return text.replace(/```elysium-(?:request|group)[\s\S]*?(?:```\r?\n?|$)/g, "");
+  return text.replace(/```elysium-[a-z]+[\s\S]*?(?:```\r?\n?|$)/g, "");
 }

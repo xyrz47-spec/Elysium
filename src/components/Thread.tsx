@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
+import TokenMeter from "./TokenMeter";
+import { sumUsage } from "../lib/usage";
 import { ENGINE_LABEL, TIER_LABEL, stripFileMarkers, type Approval, type Budget, type CouncilTurn, type EngineId, type Judgment, type Message, type MessageData, type Step } from "../lib/api";
 import { useApp, type Live } from "../store";
 import Markdown from "./Markdown";
+import { LiveBrief } from "./LeadPanel";
 import { SavedLeadLog } from "./LeadPanel";
 import { hideBlocks } from "../lib/panel";
 import { MessageAttachments } from "./Attachments";
@@ -342,7 +345,7 @@ function Details({ data }: { data: MessageData }) {
               ))}
             </div>
           )}
-          <SavedLeadLog decisions={data.team?.decisions} groupLog={data.team?.groupLog} />
+          <SavedLeadLog decisions={data.team?.decisions} groupLog={data.team?.groupLog} leadLog={data.team?.leadLog} orgLog={data.team?.orgLog} />
           {data.team?.agents.map((a, i) =>
             a.text || (a.files && a.files.length) ? (
               <details key={`t${i}`} className="draft">
@@ -463,6 +466,8 @@ function Card({ ex, live, approvals, index }: { ex: Exchange; live?: Live; appro
         </header>
       )}
       <Ribbon nodes={nodes} />
+      {live && <TokenMeter t={sumUsage(live.usage)} live />}
+      {live && <LiveBrief l={live} />}
       {live?.council && <CouncilWindows seats={liveSeats(live)} max={live.council.rounds} />}
       {!live && data?.council && (
         <details className="council-log">

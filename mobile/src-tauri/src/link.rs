@@ -7,6 +7,8 @@ pub struct Link {
     pub fingerprint: String,
     pub code: String,
     pub name: String,
+    /// PC의 터널 공개키(다른 네트워크에서 연결할 때)
+    pub node: Option<String>,
 }
 
 pub fn parse(link: &str) -> Result<Link, String> {
@@ -23,10 +25,11 @@ pub fn parse(link: &str) -> Result<Link, String> {
     let port: u16 = get("p").parse().map_err(|_| bad())?;
     let fingerprint = get("f").to_ascii_lowercase();
     let code = get("c");
-    if hosts.is_empty() || fingerprint.len() != 64 || !fingerprint.bytes().all(|b| b.is_ascii_hexdigit()) || code.is_empty() {
+    let node = Some(get("i").to_ascii_lowercase()).filter(|n| n.len() == 64 && n.bytes().all(|b| b.is_ascii_hexdigit()));
+    if (hosts.is_empty() && node.is_none()) || fingerprint.len() != 64 || !fingerprint.bytes().all(|b| b.is_ascii_hexdigit()) || code.is_empty() {
         return Err(bad());
     }
-    Ok(Link { hosts, port, fingerprint, code, name: get("n") })
+    Ok(Link { hosts, port, fingerprint, code, name: get("n"), node })
 }
 
 #[cfg(test)]
@@ -41,5 +44,10 @@ mod tests {
         assert_eq!((l.port, l.code.as_str(), l.name.as_str()), (47820, "abc", "HOYA-PC"));
         assert!(parse("https://example.com").is_err());
         assert!(parse(&format!("elysium://pair?h=1.2.3.4&p=1&f=short&c=x")).is_err());
+        assert_eq!(l.node, None);
+        let id = "b".repeat(64);
+        let l = parse(&format!("elysium://pair?v=1&h=&p=47820&f={fp}&c=abc&n=PC&i={id}")).unwrap();
+        assert_eq!((l.hosts.len(), l.node), (0, Some(id)));
+        assert!(parse(&format!("elysium://pair?v=1&h=&p=47820&f={fp}&c=abc&n=PC&i=zz")).is_err());
     }
 }

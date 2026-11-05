@@ -3,18 +3,23 @@
 mod api_agent;
 mod apis;
 mod audit;
+mod bgjobs;
 mod commands;
 mod db;
 mod engines;
 mod error;
+mod gitops;
 mod intent;
 mod attachments;
 mod jev;
 mod lead;
 mod leadrun;
+mod livesnap;
 mod memory;
 mod orchestrator;
+mod power;
 mod pricing;
+mod relay;
 mod remote;
 mod roadmap;
 mod secrets;
@@ -66,6 +71,7 @@ pub fn run() {
                 agent_stops: Mutex::new(HashMap::new()),
                 agent_inboxes: Mutex::new(HashMap::new()),
                 questions: leadrun::QuestionBoard::default(),
+                bg: bgjobs::Jobs::default(),
             });
             app.manage(state.clone());
             let handle = app.handle().clone();
@@ -124,12 +130,17 @@ pub fn run() {
             commands::task_steer,
             commands::agent_message,
             commands::worker_window_open,
+            commands::power_sleep,
             commands::lead_send,
             commands::lead_answer,
             commands::lead_questions,
             commands::lead_revoke,
             commands::test_cancel,
             commands::queue_get,
+            commands::test_log,
+            commands::bg_jobs,
+            commands::bg_read,
+            commands::bg_stop,
             commands::side_ask,
             commands::cancel_all,
             commands::approval_list,

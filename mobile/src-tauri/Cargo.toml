@@ -15,12 +15,14 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2.12", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "handshake", "__rustls-tls"] }
 futures-util = "0.3"
 sha2 = "0.10"
+# 다른 네트워크에서 PC에 붙는 터널(홀펀칭, 안 되면 암호화된 채 릴레이 경유)
+iroh = { version = "1.4", default-features = false, features = ["tls-ring", "portmapper"] }
 
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 tauri-plugin-barcode-scanner = "2"

@@ -8,6 +8,7 @@ import "pretendard/dist/web/variable/pretendardvariable-dynamic-subset.css";
 import "@fontsource-variable/orbitron";
 import "@fontsource-variable/jetbrains-mono";
 import "./styles.css";
+import "./elysium.css";
 import { applyTheme, loadTheme, watchStorage } from "./lib/theme";
 
 // 첫 화면이 그려지기 전에 테마를 정해 깜빡임을 막는다.

@@ -10,6 +10,27 @@ export interface Connection {
   hosts: string[];
   port: number;
   fingerprint: string;
+  /** 다른 네트워크에서도 붙을 수 있는지(PC 터널 키를 받았는지) */
+  relay?: boolean;
+}
+
+/** PC가 따라가는 작업·에이전트 상태(늦게 붙어도 한 번에 받는다) */
+export interface TaskSnap {
+  taskId: string;
+  conversationId: string;
+  work: boolean;
+  lead: boolean;
+  parts: Record<string, string>;
+  agents: Record<string, { key: string; engine: string | null; label: string; role: string; state: "run" | "ok" | "fail"; wait: string | null; last: string | null; stopped: boolean; done: { input: number; output: number; cost: number }; cur: { input: number; output: number; cost: number }; tail: string; tools: number; bg: number }>;
+  /** 총괄이 한 일(최근 몇 개) */
+  timeline: LeadNoteLite[];
+  commits: number;
+}
+
+export interface LeadNoteLite {
+  kind: string;
+  text: string;
+  at: string;
 }
 
 export interface PcInfo {
@@ -28,6 +49,7 @@ export const remote = {
   pair: (link: string, device: string) => invoke<Connection>("pair", { link, device }),
   forget: () => invoke<void>("forget"),
   eventsStart: () => invoke<void>("events_start"),
+  reconnect: () => invoke<void>("reconnect"),
   info: () => get<PcInfo>("/api/info"),
   engines: () => get<EngineInfo[]>("/api/engines"),
   conversations: () => get<Conversation[]>("/api/conversations"),
@@ -43,6 +65,12 @@ export const remote = {
   answerQuestion: (id: string, text: string) => post<{ answered: boolean }>(`/api/questions/${encodeURIComponent(id)}`, { text }),
   decide: (id: string, approve: boolean) => post<Approval>(`/api/approvals/${encodeURIComponent(id)}`, { approve }),
   usage: (range: string) => get<UsageSummary>(`/api/usage?range=${encodeURIComponent(range)}`),
+  agents: () => get<TaskSnap[]>("/api/agents"),
+  taskMessage: (taskId: string, text: string) => post<{ sent: number }>(`/api/tasks/${encodeURIComponent(taskId)}/message`, { text }),
+  agentCancel: (taskId: string, key: string) => post<{ cancelled: boolean }>(`/api/tasks/${encodeURIComponent(taskId)}/agents/${encodeURIComponent(key)}/cancel`),
+  agentMessage: (taskId: string, key: string, text: string) => post<{ sent: boolean }>(`/api/tasks/${encodeURIComponent(taskId)}/agents/${encodeURIComponent(key)}/message`, { text }),
+  leadSend: (taskId: string, text: string, about: string | null) => post<{ sent: boolean }>(`/api/tasks/${encodeURIComponent(taskId)}/lead`, { text, about }),
+  side: (sideId: string, conversationId: string | null, question: string, thread: { role: string; text: string }[]) => post<{ started: boolean }>("/api/side", { sideId, conversationId, question, thread }),
 };
 
 export function errorText(e: unknown): string {

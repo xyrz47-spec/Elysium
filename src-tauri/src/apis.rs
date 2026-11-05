@@ -327,13 +327,24 @@ pub async fn run(http: &reqwest::Client, spec: &RunSpec, model: &str, timeout: D
     };
     let Some(a) = api(spec.engine) else { return done(out, Some("API 엔진이 아닙니다".into())) };
     let Some(key) = secrets::get(a.secret) else { return done(out, Some(format!("{} 키가 없습니다. 설정 → API 키에서 넣으세요", spec.engine.label()))) };
+    // timeout은 무응답 한도: 출력·도구 사용이 이어지는 동안은 기다린다.
+    let idle = crate::engines::idle_limit(spec, timeout);
+    let stall = crate::engines::stalled_error(idle);
+    let pulse = crate::engines::Pulse::new();
     // 작업 모드: 모델이 부른 도구(파일·PowerShell)를 이 PC에서 실행하며 끝날 때까지 주고받는다.
     if spec.work {
         let mut usage = Usage::default();
+        let mut beat = |ev: &Event| {
+            pulse.beat();
+            on_event(ev)
+        };
         let r = tokio::select! {
-            r = tokio::time::timeout(timeout, crate::api_agent::run(http, spec, &a, &key, model, &mut out, &mut usage, on_event)) => r.unwrap_or_else(|_| Err(format!("{}초 안에 끝나지 않았습니다", timeout.as_secs()))),
+            r = crate::api_agent::run(http, spec, &a, &key, model, &mut out, &mut usage, &mut beat) => r,
+            _ = pulse.stalled(idle) => Err(stall.clone()),
+            _ = tokio::time::sleep(crate::engines::RUN_CAP) => Err(crate::engines::capped_error()),
             _ = cancel.cancelled() => Err("사용자가 중지했습니다".into()),
         };
+        out.stalled = r.as_ref().err() == Some(&stall);
         if let Ok(t) = &r {
             out.text = t.clone();
         }
@@ -360,6 +371,7 @@ pub async fn run(http: &reqwest::Client, spec: &RunSpec, model: &str, timeout: D
                 let mut sse = SseBuffer::default();
                 while let Some(chunk) = stream.next().await {
                     let chunk = chunk.map_err(|e| format!("스트림이 끊겼습니다: {e}"))?;
+                    pulse.beat();
                     for data in sse.push(&chunk) {
                         let Ok(v) = serde_json::from_str::<Value>(&data) else { continue };
                         // 일부 공급자(NVIDIA 무료 서버 등)는 200 응답의 스트림 안에 오류를 보낸다.
@@ -393,9 +405,12 @@ pub async fn run(http: &reqwest::Client, spec: &RunSpec, model: &str, timeout: D
         }
     };
     let r = tokio::select! {
-        r = tokio::time::timeout(timeout, send) => r.unwrap_or_else(|_| Err(format!("{}초 안에 끝나지 않았습니다", timeout.as_secs()))),
+        r = send => r,
+        _ = pulse.stalled(idle) => Err(stall.clone()),
+        _ = tokio::time::sleep(crate::engines::RUN_CAP) => Err(crate::engines::capped_error()),
         _ = cancel.cancelled() => Err("사용자가 중지했습니다".into()),
     };
+    out.stalled = r.as_ref().err() == Some(&stall);
     out.input_tokens = acc.input;
     out.output_tokens = acc.output;
     out.cost_usd = acc.input.map(|input| {

@@ -238,12 +238,16 @@ fn effort_after(rest: &str) -> (Option<&'static str>, usize) {
     (None, 0)
 }
 
-/// 수 앞의 빈칸·닫는 괄호·굵게 표시(**)를 걷어 낸다. 곱하기로 쓴 '*' 하나("high * 3")는 남긴다.
+/// 수 앞에 붙는 조사("소네트를 3대", "high를 3대"). '로·으로'는 뒤에 동사가 와서 넣지 않는다.
+const COUNT_PARTICLES: &[&str] = &["을", "를", "이", "가", "은", "는", "도"];
+
+/// 수 앞의 빈칸·괄호·굵게 표시(**)·조사를 걷어 낸다. 곱하기로 쓴 '*' 하나("high * 3")는 남긴다.
 fn skip_to_count(s: &str) -> &str {
     let mut t = s;
     loop {
-        let n = t.trim_start_matches([' ', ')', '`']);
+        let n = t.trim_start_matches([' ', ')', '(', '`', ',']);
         let n = n.strip_prefix("**").unwrap_or(n);
+        let n = COUNT_PARTICLES.iter().find_map(|p| n.strip_prefix(p).filter(|r| r.starts_with([' ', '('].as_slice()) || r.starts_with(|c: char| c.is_ascii_digit()))).unwrap_or(n);
         if n.len() == t.len() {
             return t;
         }
@@ -311,6 +315,8 @@ pub struct RosterMember {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Roster {
     pub teams: Vec<Vec<RosterMember>>,
+    /// 팀마다 위에 있는 부서 이름들(바깥 → 안쪽). 묶지 않은 팀은 비어 있다.
+    pub depts: Vec<Vec<String>>,
     pub lead: Option<ModelPick>,
 }
 
@@ -425,6 +431,68 @@ fn is_optional(s: &str) -> bool {
     OPTIONAL_WORDS.iter().any(|w| s.contains(w))
 }
 
+/// 팀 여럿을 묶는 상위 부서를 뜻하는 말("프론트엔드 본부:", "## 개발 부서")
+const DEPT_WORDS: &[&str] = &["본부", "부서", "사업부", "부문", "상위 그룹", "상위그룹", "상위 팀", "상위팀", "division", "department", "dept"];
+const DEPT_LINE_MAX_CHARS: usize = 40;
+
+/// 줄의 들여쓰기. 목록 표시("- ")는 한 칸 더 들인 것으로 보고, 제목(#)은 늘 가장 바깥이다.
+fn indent_of(raw: &str) -> isize {
+    let t = raw.trim_start();
+    if let Some(h) = t.strip_prefix('#') {
+        return (h.len() - h.trim_start_matches('#').len()) as isize - 10;
+    }
+    let lead: isize = raw[..raw.len() - t.len()].chars().map(|c| if c == '\t' { 4 } else { 1 }).sum();
+    lead + isize::from(t.starts_with(['-', '*', '•']))
+}
+
+/// 부서 줄이면 그 이름들("개발 본부/프론트 부서"는 둘). 모델이 적힌 줄·팀 이름표 줄은 부서가 아니다.
+fn dept_names(raw: &str, low: &str, installed: &[EngineId], work: bool) -> Option<Vec<String>> {
+    let t = raw.trim().trim_start_matches(['#', ' ']).trim_start_matches(LIST_MARKS).trim_matches(['*', '`', ' ']);
+    let lt = low.trim();
+    if t.is_empty() || t.chars().count() > DEPT_LINE_MAX_CHARS || team_label(low).is_some() || !DEPT_WORDS.iter().any(|w| lt.contains(w)) || !roster_entries(t, installed, work).0.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = t.trim_end_matches([':', '：', '-', ' ', '*']).split(['/', '>', '›']).map(|n| n.trim_matches(['*', '`', ' ', '[', ']']).to_string()).filter(|n| !n.is_empty()).collect();
+    // 이름이 부서 낱말로 끝나야 한다("역할: 본부 보고서"처럼 낱말이 들어만 있는 줄은 아니다).
+    let ends = names.last().is_some_and(|n| DEPT_WORDS.iter().any(|w| n.to_ascii_lowercase().ends_with(w)));
+    ends.then_some(names)
+}
+
+/// 지금 줄이 들어 있는 부서들. 같거나 덜 들인 부서 줄이 오면 앞 부서는 닫힌다.
+#[derive(Default)]
+struct DeptStack {
+    open: Vec<(isize, String)>,
+    /// true면 부서보다 더 들여 쓴 팀만 그 부서에 든다(AI가 쓴 구성표는 팀을 들여 쓴다).
+    strict: bool,
+}
+
+impl DeptStack {
+    /// 부서 줄이면 true. 부서가 아닌 제목은 같은 깊이의 부서를, 구분선은 모든 부서를 닫는다(이때는 false).
+    fn feed(&mut self, raw: &str, low: &str, installed: &[EngineId], work: bool) -> bool {
+        let d = indent_of(raw);
+        if let Some(names) = dept_names(raw, low, installed, work) {
+            if names.len() > 1 {
+                self.open.clear();
+            }
+            self.open.retain(|(i, _)| *i < d);
+            self.open.extend(names.into_iter().map(|n| (d, n)));
+            return true;
+        }
+        let t = low.trim();
+        if t.starts_with("---") {
+            self.open.clear();
+        } else if t.starts_with('#') && team_label(low).is_none() {
+            self.open.retain(|(i, _)| *i < d);
+        }
+        false
+    }
+
+    /// 이 들여쓰기의 팀이 속한 부서(바깥 → 안쪽)
+    fn path(&self, indent: isize) -> Vec<String> {
+        self.open.iter().filter(|(i, _)| *i < indent || (!self.strict && *i == indent)).map(|(_, n)| n.clone()).collect()
+    }
+}
+
 /// 팀 이름표 아래 줄의 모델들. "Worker A (Haiku): 할 일"과 "구성: A, B"는 콜론 앞뒤로 나눠 할 일에 나온 이름을 세지 않는다.
 fn body_entries(line: &str, installed: &[EngineId], work: bool) -> Vec<RosterEntry> {
     let body = line.trim_start_matches(LIST_MARKS);
@@ -444,31 +512,37 @@ fn body_entries(line: &str, installed: &[EngineId], work: bool) -> Vec<RosterEnt
     }
 }
 
-/// 팀 이름표로 나뉜 구성표. 이름표 줄에 모델을 적었거나 그 아래 줄에 적은 꼴을 모두 받는다. 허락만 한 팀은 뺀다.
-fn written_sections(text: &str, installed: &[EngineId], work: bool) -> Vec<Vec<RosterEntry>> {
+/// 팀 이름표로 나뉜 구성표와 팀마다의 부서. 이름표 줄에 모델을 적었거나 그 아래 줄에 적은 꼴을 모두 받는다. 허락만 한 팀은 뺀다.
+fn written_sections(text: &str, installed: &[EngineId], work: bool) -> Vec<(Vec<RosterEntry>, Vec<String>)> {
     struct Section {
         entries: Vec<RosterEntry>,
         first: usize,
         last: usize,
         optional: bool,
+        dept: Vec<String>,
     }
+    type Teams = std::collections::BTreeMap<usize, (Vec<RosterEntry>, Vec<String>)>;
     // 같은 번호를 다시 적으면 나중 것이 이긴다. 한 글에 같은 팀을 두 번 적어도 늘어나지 않는다.
-    fn close(open: &mut Option<Section>, teams: &mut std::collections::BTreeMap<usize, Vec<RosterEntry>>) {
+    fn close(open: &mut Option<Section>, teams: &mut Teams) {
         if let Some(s) = open.take().filter(|s| !s.optional && !s.entries.is_empty()) {
             for n in (s.first..=s.last).take(MAX_AGENTS + 1) {
-                teams.insert(n, s.entries.clone());
+                teams.insert(n, (s.entries.clone(), s.dept.clone()));
             }
         }
     }
     let low = text.to_ascii_lowercase();
-    let (mut teams, mut open, mut pending) = (std::collections::BTreeMap::new(), None, false);
-    for line in low.lines() {
+    let (mut teams, mut open, mut pending) = (Teams::new(), None, false);
+    let mut depts = DeptStack::default();
+    // to_ascii_lowercase는 줄을 바꾸지 않으므로 원래 줄(부서 이름의 대소문자)과 짝이 맞는다.
+    for (line, raw) in low.lines().zip(text.lines()) {
         let t = line.trim();
         if let Some((rest, first, last)) = team_label(line) {
             close(&mut open, &mut teams);
             let (entries, words) = roster_entries(rest, installed, work);
-            open = Some(Section { entries: if words <= ROSTER_LINE_MAX_WORDS { entries } else { vec![] }, first, last, optional: pending || is_optional(rest) });
+            open = Some(Section { entries: if words <= ROSTER_LINE_MAX_WORDS { entries } else { vec![] }, first, last, optional: pending || is_optional(rest), dept: depts.path(indent_of(raw)) });
             pending = false;
+        } else if depts.feed(raw, line, installed, work) {
+            close(&mut open, &mut teams);
         } else if t.starts_with('#') || t.starts_with("---") {
             close(&mut open, &mut teams);
             pending = is_optional(t);
@@ -532,9 +606,68 @@ fn listed_workers(low: &str, installed: &[EngineId], work: bool) -> Option<Vec<V
     })
 }
 
+/// 워커 번호 사이에 오는 말("1·2·3", "1, 2", "1/2", "1와 2", "1 and 2")
+const NUMBER_JOINERS: &[&str] = &["·", ",", "，", "、", "/", "&", "및", "와", "과", "and", " "];
+const NUMBER_RANGES: &[&str] = &["~", "–", "—", "-"];
+
+/// "워커 1·2·3: …", "Worker 1-3 - …", "워커 4: …"로 시작하는 줄이면 (워커 번호들, 뒤의 글)
+fn worker_numbers(line: &str) -> Option<(Vec<usize>, &str)> {
+    let t = line.trim_start_matches(LIST_MARKS).trim_start_matches(['#', ' ']).trim_start_matches(LIST_MARKS);
+    let w = WORKER_WORDS.iter().find(|w| t.starts_with(**w))?;
+    let mut rest = t[w.len()..].trim_start_matches(['s', ' ']);
+    let mut nums: Vec<usize> = vec![];
+    loop {
+        let (n, after) = leading_number(rest);
+        let Some(n) = n else { break };
+        rest = after.trim_start();
+        // 범위 "1~3"
+        if let Some(r) = NUMBER_RANGES.iter().find_map(|m| rest.strip_prefix(m)) {
+            if let (Some(end), after) = leading_number(r.trim_start()) {
+                nums.extend(n..=end.min(n + MAX_AGENTS));
+                rest = after.trim_start();
+            } else {
+                nums.push(n);
+                break;
+            }
+        } else {
+            nums.push(n);
+        }
+        match NUMBER_JOINERS.iter().find_map(|j| rest.strip_prefix(j)) {
+            Some(r) if r.trim_start().starts_with(|c: char| c.is_ascii_digit()) => rest = r.trim_start(),
+            _ => break,
+        }
+    }
+    if nums.is_empty() {
+        return None;
+    }
+    let body = rest.trim_start_matches(['*', ' ', '`']);
+    let body = [":", "：", "-", "–", "—", ")", "=", "→"].iter().find_map(|m| body.strip_prefix(m))?;
+    Some((nums, body))
+}
+
+/// 번호를 붙여 적은 워커들("워커 1·2·3: Claude Sonnet 5.5 High", "워커 4·5·6: Gemini 3.8 Flash High"). 워커 하나가 한 자리다.
+/// 같은 번호를 다시 적으면 나중 것이 이긴다. 뒤의 설명에 나오는 다른 모델 이름은 세지 않는다.
+fn numbered_workers(low: &str, installed: &[EngineId], work: bool) -> Vec<Vec<RosterEntry>> {
+    let mut seats: std::collections::BTreeMap<usize, RosterEntry> = std::collections::BTreeMap::new();
+    for line in low.lines() {
+        let Some((nums, body)) = worker_numbers(line) else { continue };
+        let entries = roster_entries(body, installed, work).0;
+        let Some(first) = entries.first() else { continue };
+        for (i, n) in nums.iter().enumerate() {
+            // "워커 1·2: Sonnet, Gemini"처럼 번호마다 모델을 하나씩 적었으면 차례로 맞춘다.
+            let e = if entries.len() == nums.len() { &entries[i] } else { first };
+            seats.insert(*n, RosterEntry { count: 1, ..e.clone() });
+        }
+    }
+    seats.into_values().map(|e| vec![e]).collect()
+}
+
 /// 요청 글에 적힌 혼합 팀 구성("1팀 - Haiku high, Gemini flash high" 줄들, 또는 "각 팀은 Haiku 1기와 Gemini 1기" + "4개 팀").
 pub fn requested_roster(text: &str, installed: &[EngineId], work: bool) -> Result<Option<Roster>, RosterError> {
-    let mut teams = written_sections(text, installed, work);
+    let (mut teams, depts): (Vec<Vec<RosterEntry>>, Vec<Vec<String>>) = written_sections(text, installed, work).into_iter().unzip();
+    if teams.is_empty() {
+        teams = numbered_workers(&text.to_ascii_lowercase(), installed, work);
+    }
     if teams.is_empty() {
         let low = text.to_ascii_lowercase();
         let each = low.lines().filter(|l| describes_each_team(l)).map(|l| roster_entries(l, installed, work).0).find(|e| !e.is_empty());
@@ -550,14 +683,25 @@ pub fn requested_roster(text: &str, installed: &[EngineId], work: bool) -> Resul
             teams = listed;
         }
     }
-    build_roster(teams, text, installed, work)
+    build_roster(teams, depts, text, installed, work)
 }
 
 /// AI가 뽑은 구성표를 읽는다. 이름표 모양과 상관없이 모델이 적힌 줄 하나가 한 팀이다. 답에 총괄이 없으면 요청 글에서 찾는다.
 pub fn roster_from_answer(answer: &str, request: &str, installed: &[EngineId], work: bool) -> Result<Option<Roster>, RosterError> {
     let low = answer.to_ascii_lowercase();
-    let teams: Vec<Vec<RosterEntry>> = low.lines().map(|l| roster_entries(l, installed, work).0).filter(|e| !e.is_empty()).collect();
-    let mut roster = build_roster(teams.clone(), answer, installed, work)?;
+    let (mut teams, mut depts) = (vec![], vec![]);
+    let mut stack = DeptStack { strict: true, ..Default::default() };
+    for (line, raw) in low.lines().zip(answer.lines()) {
+        if stack.feed(raw, line, installed, work) {
+            continue;
+        }
+        let e = roster_entries(line, installed, work).0;
+        if !e.is_empty() {
+            teams.push(e);
+            depts.push(stack.path(indent_of(raw)));
+        }
+    }
+    let mut roster = build_roster(teams.clone(), depts, answer, installed, work)?;
     if let Some(r) = roster.as_mut().filter(|r| r.lead.is_none()) {
         r.lead = written_lead(request, &teams, installed, work);
     }
@@ -571,7 +715,7 @@ fn written_lead(text: &str, teams: &[Vec<RosterEntry>], installed: &[EngineId], 
     scan(text).iter().filter(|h| !families.contains(&h.family) && names_lead(&low, h)).find_map(|h| pick_of(h, installed, work).ok())
 }
 
-fn build_roster(teams: Vec<Vec<RosterEntry>>, text: &str, installed: &[EngineId], work: bool) -> Result<Option<Roster>, RosterError> {
+fn build_roster(teams: Vec<Vec<RosterEntry>>, mut depts: Vec<Vec<String>>, text: &str, installed: &[EngineId], work: bool) -> Result<Option<Roster>, RosterError> {
     let seats: usize = teams.iter().flatten().map(|e| e.count).sum();
     if seats < 2 {
         return Ok(None);
@@ -588,7 +732,8 @@ fn build_roster(teams: Vec<Vec<RosterEntry>>, text: &str, installed: &[EngineId]
         }
         out.push(members);
     }
-    Ok(Some(Roster { teams: out, lead: written_lead(text, &teams, installed, work) }))
+    depts.resize(out.len(), vec![]);
+    Ok(Some(Roster { teams: out, depts, lead: written_lead(text, &teams, installed, work) }))
 }
 
 /// 파서가 못 읽은 글에서 팀을 적은 듯한지 보는 말
@@ -609,9 +754,79 @@ pub fn needs_team_reading(text: &str, installed: &[EngineId], work: bool) -> boo
 }
 
 /// 요청 글에서 팀 구성표만 뽑게 하는 지시. 답은 requested_roster가 그대로 읽는다.
+/// 요청 글에 팀·여러 모델·에이전트 수가 적혀 있는지. 있으면 그것이 '지금 돌릴 팀'인지 '글의 내용'인지 AI에게 먼저 묻는다.
+pub fn team_signals(text: &str, installed: &[EngineId], work: bool) -> bool {
+    let low = text.to_ascii_lowercase();
+    let counted = scan(text).iter().any(|h| bare_count(skip_to_count(&low[h.end + effort_after(&low[h.end..]).1..])).is_some_and(|n| n >= 2));
+    counted
+        || !matches!(requested_roster(text, installed, work), Ok(None))
+        || requested_team(text, installed, work).is_some()
+        || needs_team_reading(text, installed, work)
+        || requested_models(text, installed, work).picks.len() >= 2
+        || requested_agents(text).is_some()
+}
+
+/// 적힌 팀을 지금 돌릴지와 그 구성표
+#[derive(Debug, Clone, PartialEq)]
+pub struct TeamIntent {
+    pub run_now: bool,
+    /// 지금 돌릴 구성표(team_reading_prompt와 같은 꼴). 돌리지 않으면 빈 글.
+    pub roster: String,
+    pub why: String,
+}
+
+/// 적힌 팀이 이 요청을 처리하려고 지금 돌릴 팀인지, 만들어 달라는 글의 내용인지 묻는 글
+pub fn team_intent_prompt(text: &str) -> String {
+    format!(
+        "[요청]\n{text}\n\n\
+         위 요청을 받은 Elysium(여러 AI를 동시에 돌리는 앱)이 지금 무엇을 할지 정하세요. 요청을 수행하지 말고 판단만 하세요.\n\
+         - run_now: 사용자가 '이 요청을 처리하려고 지금' 여러 AI 워커·팀·총괄을 돌리라고 지시했으면 true입니다. 팀 구성이 만들어 달라는 글(프롬프트·계획서·문서·예시)의 내용이거나 다음 세션·나중에 쓸 계획이면 false입니다.\n\
+         - roster: run_now가 true일 때만 지금 돌릴 구성을 한 줄에 한 팀씩 씁니다. 같은 모델 여러 대는 그 수만큼 되풀이합니다. 총괄을 적었으면 첫 줄에 '총괄 - 모델 노력치'를 씁니다. 예: '총괄 - Claude Opus 5.5 high' / '1팀 - Claude Sonnet 5.5 high' / '2팀 - Gemini 3.8 Flash high'. 팀을 본부·부서로 묶었으면 '이름 본부:' 줄 아래에 그 팀 줄을 두 칸 들여 씁니다. false면 빈 글입니다.\n\
+         - why: 한 줄 이유.\n\
+         파일을 열지 말고 도구도 쓰지 말고, 설명 없이 아래 JSON 하나만 답하세요.\n\
+         {{\"run_now\": false, \"roster\": \"\", \"why\": \"\"}}"
+    )
+}
+
+/// 모델이 JSON 문자열 안에 그대로 넣은 줄바꿈·탭을 이스케이프한다(문자열 밖은 그대로).
+fn escape_controls_in_strings(s: &str) -> String {
+    let (mut out, mut inside, mut escaped) = (String::with_capacity(s.len()), false, false);
+    for c in s.chars() {
+        match c {
+            '\\' if inside && !escaped => {
+                escaped = true;
+                out.push(c);
+                continue;
+            }
+            '"' if !escaped => inside = !inside,
+            '\n' if inside => {
+                out.push_str("\\n");
+                continue;
+            }
+            '\r' if inside => continue,
+            '\t' if inside => {
+                out.push_str("\\t");
+                continue;
+            }
+            _ => {}
+        }
+        escaped = false;
+        out.push(c);
+    }
+    out
+}
+
+/// OpenCode의 답에서 판단을 읽는다. 읽을 수 없으면 None.
+pub fn parse_team_intent(answer: &str) -> Option<TeamIntent> {
+    let (a, b) = (answer.find('{')?, answer.rfind('}')?);
+    let raw = answer.get(a..=b)?;
+    let v: serde_json::Value = serde_json::from_str(raw).or_else(|_| serde_json::from_str(&escape_controls_in_strings(raw))).ok()?;
+    Some(TeamIntent { run_now: v["run_now"].as_bool()?, roster: v["roster"].as_str().unwrap_or("").to_string(), why: v["why"].as_str().unwrap_or("").trim().to_string() })
+}
+
 pub fn team_reading_prompt(text: &str) -> String {
-    let instruction = "사용자 요청을 직접 수행하지 말고 요청에서 언급된 팀 구성 정보만 한 줄에 한 팀씩 아래 형식에 맞춰 정확히 추출하십시오. 모델명과 작업 강도는 사용자가 기재한 표현을 그대로 유지하고 팀장을 명시했을 때만 팀장 줄을 추가하며 선택 사항으로 언급된 팀은 제외하고 임의로 지어내지 마십시오. 사용자가 지정한 팀 구성이 전혀 없다면 어떤 부가 설명도 없이 오직 없음 단어 하나만 출력하십시오.";
-    format!("{instruction}\n\n총괄 - Claude Opus 5.5 high\n1팀 - Claude Haiku 5.5 high, Gemini 3.8 Flash high\n2팀 - Codex x2\n\n[요청]\n{text}")
+    let instruction = "사용자 요청을 직접 수행하지 말고 요청에서 언급된 팀 구성 정보만 한 줄에 한 팀씩 아래 형식에 맞춰 정확히 추출하십시오. 모델명과 작업 강도는 사용자가 기재한 표현을 그대로 유지하고 팀장을 명시했을 때만 팀장 줄을 추가하며 팀을 본부·부서로 묶었으면 '이름 본부:' 줄을 먼저 쓰고 그 팀 줄을 두 칸 들여 쓰며 선택 사항으로 언급된 팀은 제외하고 임의로 지어내지 마십시오. 사용자가 지정한 팀 구성이 전혀 없다면 어떤 부가 설명도 없이 오직 없음 단어 하나만 출력하십시오.";
+    format!("{instruction}\n\n총괄 - Claude Opus 5.5 high\n프론트엔드 본부:\n  1팀 - Claude Haiku 5.5 high, Gemini 3.8 Flash high\n  2팀 - Codex x2\n3팀 - Claude Sonnet 5.5 high\n\n[요청]\n{text}")
 }
 
 const AGENT_WORDS: &[&str] = &["서브에이전트", "에이전트", "agents", "agent"];
@@ -854,6 +1069,28 @@ mod tests {
     }
 
     #[test]
+    fn roster_reads_departments_that_group_teams() {
+        let text = "프론트엔드 본부:\n- 1팀 - Claude Haiku high x2\n- 2팀 - Gemini flash high x2\n백엔드 본부:\n- 3팀 - Codex x2\n4팀 - Claude Sonnet\n";
+        let r = requested_roster(text, ALL, true).unwrap().expect("팀 구성");
+        assert_eq!(r.teams.iter().map(Vec::len).collect::<Vec<_>>(), vec![2, 2, 2, 1]);
+        let d = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(r.depts, vec![d(&["프론트엔드 본부"]), d(&["프론트엔드 본부"]), d(&["백엔드 본부"]), d(&["백엔드 본부"])]);
+        let nested = "## 개발 본부\n  화면 부서:\n    1팀 - Claude Haiku x2\n  서버 부서:\n    2팀 - Codex x2\n---\n3팀 - Gemini flash\n";
+        let n = requested_roster(nested, ALL, true).unwrap().expect("팀 구성");
+        assert_eq!(n.depts[0], d(&["개발 본부", "화면 부서"]));
+        assert_eq!(n.depts[1], d(&["개발 본부", "서버 부서"]));
+        assert!(n.depts[2].is_empty(), "구분선 뒤의 팀은 부서 밖이다");
+        assert!(requested_roster(PAIR_LINES, ALL, true).unwrap().unwrap().depts.iter().all(Vec::is_empty));
+        assert!(requested_roster(SECTIONS, ALL, true).unwrap().unwrap().depts.iter().all(Vec::is_empty));
+    }
+
+    #[test]
+    fn team_reading_answer_keeps_departments() {
+        let r = roster_from_answer("총괄 - Claude Opus 5.5 high\n앱 본부:\n  1팀 - Claude Haiku 5.5 high, Gemini 3.8 Flash high\n  2팀 - Codex x2\n3팀 - Claude Sonnet 5.5 high\n", "요청", ALL, true).unwrap().expect("구성표");
+        assert_eq!(r.depts, vec![vec!["앱 본부".to_string()], vec!["앱 본부".to_string()], vec![]]);
+    }
+
+    #[test]
     fn team_reading_answer_needs_no_team_label() {
         let opus = "총관은 Opus 5.5 high로 하고 Haiku 5.5 high랑 Gemini 3.8 Flash high를 짝지어서 네 쌍 만들어 일을 나눠 줘";
         let unlabeled = "총관 - Opus 5.5 high\nHaiku 5.5 high, Gemini 3.8 Flash high\nHaiku 5.5 high, Gemini 3.8 Flash high\nHaiku 5.5 high, Gemini 3.8 Flash high\nHaiku 5.5 high, Gemini 3.8 Flash high\n";
@@ -934,6 +1171,22 @@ mod tests {
     }
 
     #[test]
+    fn numbered_workers_are_each_a_seat() {
+        let text = "총괄: Claude Opus 5.5 High\n- 워커 1·2·3: Claude Sonnet 5.5 High. 강도 높은 코딩, 원인 분석, 테스트 수정\n- 워커 4·5·6: Gemini 3.8 Flash High";
+        let r = requested_roster(text, ALL, true).unwrap().expect("번호를 붙인 워커");
+        let s = seats(&r);
+        assert_eq!(s.len(), 6, "워커 여섯 명: {s:?}");
+        assert!(s[..3].iter().all(|t| t == &vec![(Claude, Some("sonnet".into()), Some("high"))]), "{s:?}");
+        assert!(s[3..].iter().all(|t| t == &vec![(Antigravity, Some("gemini-3.8-flash".into()), Some("high"))]), "{s:?}");
+        assert_eq!(r.lead.expect("총괄").model.as_deref(), Some("opus"));
+        assert!(!needs_team_reading(text, ALL, true), "AI에게 다시 읽히지 않는다");
+        for (t, n) in [("워커 1~3: Sonnet 5.5 high\n워커 4: Gemini 3.8 Flash", 4), ("Worker 1, 2: claude sonnet\nWorker 3-4 - gemini 3.8 flash", 4), ("워커 1: Sonnet 5.5\n워커 2: Gemini 3.8 Flash\n워커 1: Claude Haiku 5.5", 2), ("**워커 1/2/3**: Claude Sonnet 5.5 High (Gemini가 검토)", 3)] {
+            assert_eq!(requested_roster(t, ALL, true).unwrap().map(|r| r.teams.len()), Some(n), "{t}");
+        }
+        assert_eq!(requested_roster("워커 3개로 나눠서 해 줘", ALL, true), Ok(None), "번호가 아니라 수");
+    }
+
+    #[test]
     fn workers_listed_on_one_line_are_each_a_seat() {
         let text = "총괄은 Opus 5.5 high를 사용해 주고 그 및 워커들은 Sonnet 5.5 high * 3, Gemini 3.8 Flash high * 2 이렇게 구성해줘";
         let r = requested_roster(text, ALL, true).unwrap().expect("나열한 워커");
@@ -945,6 +1198,36 @@ mod tests {
         let repeated = "총괄은 Opus 5.5 high를 사용해 주고 그 및 워커들은 Sonnet 5.5 high,Sonnet 5.5 high,Sonnet 5.5 high, Gemini 3.8 Flash high,Gemini 3.8 Flash high,Gemini 3.8 Flash high 이렇게 구성해줘";
         assert_eq!(seats(&requested_roster(repeated, ALL, true).unwrap().expect("되풀이한 워커")).len(), 6);
         assert_eq!(requested_roster("워커는 Sonnet 5.5 high * 3", ALL, true), Ok(None), "모델이 하나면 requested_team이 읽는다");
+    }
+
+    #[test]
+    fn team_intent_is_read_and_signals_are_found() {
+        let plan = "다음 세션에서 작업을 완료할 수 있게 프롬프트를 만들어줘. 프롬프트는 Gemini 3.8 flash로 작성해줘
+총괄은 Opus 5.5 high로, 워커는 코딩용 Sonnet 5.5 high 3대, 문서작성용 Gemini 3.8 flash high 1대로 해줘";
+        assert!(team_signals(plan, ALL, true), "팀이 적혀 있으면 먼저 묻는다");
+        assert!(!team_signals("이 버그를 고쳐 줘", ALL, true));
+        let t = parse_team_intent("판단입니다
+```json
+{\"run_now\": false, \"roster\": \"\", \"why\": \"팀 구성은 만들 프롬프트의 내용\"}
+```").unwrap();
+        assert!(!t.run_now && t.roster.is_empty() && t.why.contains("프롬프트"));
+        let t = parse_team_intent("{\"run_now\": true, \"roster\": \"1팀 - Claude Sonnet 5.5 high\n2팀 - Claude Sonnet 5.5 high\"}").unwrap();
+        assert!(t.run_now);
+        assert_eq!(roster_from_answer(&t.roster, "요청", ALL, true).unwrap().unwrap().teams.len(), 2);
+        assert_eq!(parse_team_intent("모르겠습니다"), None);
+        assert_eq!(parse_team_intent("{\"roster\": \"\"}"), None, "run_now가 없으면 읽지 않는다");
+        let p = team_intent_prompt("요청 본문");
+        assert!(p.contains("요청 본문") && p.contains("run_now") && p.contains("roster"));
+    }
+
+    #[test]
+    fn counts_after_particles_and_in_parentheses() {
+        let r = roster_from_answer("1팀 - Claude Sonnet 5.5 high를 3대\n2팀 - Gemini 3.8 Flash high (1대)", "요청", ALL, true).unwrap().expect("구성표");
+        assert_eq!(r.teams.iter().map(Vec::len).collect::<Vec<_>>(), vec![3, 1]);
+        let r = roster_from_answer("1팀 - Claude Sonnet 5.5 high (x3)", "요청", ALL, true).unwrap().expect("괄호 안 곱하기");
+        assert_eq!(r.teams[0].len(), 3);
+        assert!(team_signals("소네트를 3대, 플래시를 1대로 작업 진행해", ALL, true), "약한 이름도 수가 붙으면 OpenCode에게 묻는다");
+        assert!(!team_signals("소네트 한 편 써 줘", ALL, true));
     }
 
     #[test]

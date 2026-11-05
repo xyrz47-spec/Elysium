@@ -33,13 +33,15 @@ pub struct Settings {
     pub agents_auto: bool,
     /// 입력하는 동안 JEV가 모드·스킬을 추천한다(보내기 전의 글이 TypeSafe로 전송됨). JEV가 켜져 있을 때만 돈다.
     pub jev_suggest: bool,
-    /// 게임 창을 띄우는 테스트를 동시에 몇 개까지 돌릴지(앱 전체, 1~8)
+    /// 창을 띄우는 실행(창 테스트)를 동시에 몇 개까지 돌릴지(앱 전체, 1~8)
     pub test_slots: u8,
+    /// 병렬 작업에서 워커가 끝낼 때마다 총괄이 변경을 검토·보정한 뒤 그 파일만 커밋한다(git 저장소일 때만).
+    pub lead_commit: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { workspace_dir: None, review: ReviewMode::Auto, jev_enabled: false, models: BTreeMap::new(), agents: 1, agents_auto: true, jev_suggest: true, test_slots: 1 }
+        Settings { workspace_dir: None, review: ReviewMode::Auto, jev_enabled: false, models: BTreeMap::new(), agents: 1, agents_auto: true, jev_suggest: true, test_slots: 1, lead_commit: true }
     }
 }
 
@@ -108,6 +110,7 @@ mod tests {
         assert_eq!(Settings { agents: 99, ..Default::default() }.sanitized().agents, 16);
         assert_eq!(Settings { agents: 0, ..Default::default() }.sanitized().agents, 1);
         assert_eq!(old.test_slots, 1, "예전 설정의 테스트 동시 실행은 1개");
+        assert!(old.lead_commit, "예전 설정도 총괄 커밋을 켠 채로 시작");
         assert_eq!(Settings { test_slots: 0, ..Default::default() }.sanitized().test_slots, 1);
         assert_eq!(Settings { test_slots: 99, ..Default::default() }.sanitized().test_slots, 8);
         let mut models = BTreeMap::new();

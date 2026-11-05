@@ -1,4 +1,4 @@
-//! 총괄과 워커를 잇는 실행 흐름: 요청 검토, 명령 실행, 게임 테스트 대기열, 사용자 질문, 워커 그룹.
+//! 총괄과 워커를 잇는 실행 흐름: 요청 검토, 명령 실행, 창 테스트 대기열, 사용자 질문, 워커 그룹.
 
 use crate::audit;
 use crate::db::new_id;
@@ -6,10 +6,12 @@ use crate::engines::{EngineId, Outcome, RunSpec};
 use crate::jev;
 use crate::lead::{self, Asked, Kind, Matched, Policy, Verdict, WorkerRequest};
 use crate::orchestrator::{self, add_opt, cut, emit, AppState};
+use crate::gitops;
 use crate::store;
+use crate::teamwork;
 use crate::testqueue::TestItem;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -22,7 +24,12 @@ use tokio_util::sync::CancellationToken;
 const MAX_TURNS: u32 = 40;
 /// 총괄 한 번을 기다리는 최대 시간
 const LEAD_TIMEOUT: Duration = Duration::from_secs(300);
-const FOLLOW_UP_MIN: Duration = Duration::from_secs(120);
+/// 총괄이 메인 폴더에서 직접 고치는 한 번(커밋 검토·직접 작업)을 기다리는 최대 시간
+const LEAD_WORK_TIMEOUT: Duration = Duration::from_secs(1200);
+/// 총괄 활동 기록을 몇 개까지 둘지
+const TIMELINE_KEEP: usize = 300;
+/// 창 테스트 로그를 화면에 보내는 간격
+const LOG_FLUSH: Duration = Duration::from_millis(250);
 const JEV_SAFE: f64 = 0.85;
 const JEV_SCOPE: f64 = 0.7;
 const JEV_WINDOW: f64 = 0.5;
@@ -36,6 +43,17 @@ pub struct WorkerInfo {
     pub title: String,
     pub group: Option<usize>,
 }
+
+/// 총괄이 지금 단계에 더하는 워커
+#[derive(Debug, Clone)]
+pub struct SpawnReq {
+    pub title: String,
+    pub task: String,
+    pub engine: Option<EngineId>,
+}
+
+/// 총괄이 지운 워커 표시(총괄에게 보이는 워커 목록)
+const REMOVED_MARK: &str = " (삭제됨)";
 
 /// 답을 기다리는 사용자 질문. PC와 휴대폰 중 먼저 온 답을 쓴다.
 #[derive(Default)]
@@ -142,6 +160,26 @@ pub struct TaskLead {
     calls: tokio::sync::Mutex<()>,
     /// 통합 단계에 들어가면 사용자 지시를 통합 중인 총괄에게 바로 보낸다.
     pub integrating: std::sync::atomic::AtomicBool,
+    /// 파일 작업 시스템 지시(총괄이 직접 고칠 때 쓴다)
+    pub work_system: Mutex<String>,
+    /// 커밋할 저장소. None이면 커밋하지 않는다(설정에서 껐거나 git 저장소가 아님).
+    pub repo: Mutex<Option<gitops::Repo>>,
+    /// 메인 폴더를 바꾸는 일(워커 반영·커밋 검토·직접 작업·통합)은 한 번에 하나씩 한다.
+    pub merge: tokio::sync::Mutex<()>,
+    /// 지금 단계의 워커 작업 공간
+    pub stage: Mutex<Option<Arc<StageGate>>>,
+    /// 총괄이 한 일(화면의 실시간 기록, 끝나면 대화 기록에 남긴다)
+    pub timeline: Mutex<Vec<Value>>,
+    /// 반영했지만 아직 커밋하지 못한 경로(저장소 최상위 기준). 다음 커밋에 함께 담는다.
+    pending: Mutex<BTreeSet<String>>,
+    /// 워커가 일하는 단계 동안만 있다: 총괄이 새 워커를 보내는 곳
+    pub spawner: Mutex<Option<tokio::sync::mpsc::UnboundedSender<SpawnReq>>>,
+    /// 총괄이 지운 워커 key. 결과를 합치지 않고 화면에서도 뺀다.
+    pub removed: Mutex<BTreeSet<String>>,
+    /// 조직으로 일하는 단계 동안만 있다: 팀장끼리 주고받는 보고판
+    pub org: Mutex<Option<Arc<OrgBoard>>>,
+    /// 팀장 보고 기록(끝나면 대화 기록에 남긴다)
+    pub org_log: Mutex<Vec<Value>>,
 }
 
 impl TaskLead {
@@ -166,6 +204,16 @@ impl TaskLead {
             review: tokio::sync::Mutex::new(()),
             calls: tokio::sync::Mutex::new(()),
             integrating: std::sync::atomic::AtomicBool::new(false),
+            work_system: Mutex::new(String::new()),
+            repo: Mutex::new(None),
+            merge: tokio::sync::Mutex::new(()),
+            stage: Mutex::new(None),
+            timeline: Mutex::new(vec![]),
+            pending: Mutex::new(BTreeSet::new()),
+            spawner: Mutex::new(None),
+            removed: Mutex::new(BTreeSet::new()),
+            org: Mutex::new(None),
+            org_log: Mutex::new(vec![]),
         }
     }
 
@@ -176,10 +224,11 @@ impl TaskLead {
     /// 세션을 이어 쓸 수 없는 AI도 판단할 수 있게 호출마다 맥락을 다시 만든다.
     fn context(&self) -> String {
         let request: String = self.request.chars().take(REQUEST_CHARS).collect();
-        let workers: String = self.workers.lock().unwrap_or_else(|p| p.into_inner()).iter().enumerate().map(|(i, w)| format!("{}. {}\n", i + 1, w.title)).collect();
+        let removed = self.removed.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let workers: String = self.workers.lock().unwrap_or_else(|p| p.into_inner()).iter().enumerate().map(|(i, w)| format!("{}. {}{}\n", i + 1, w.title, if removed.contains(&w.key) { REMOVED_MARK } else { "" })).collect();
         let decisions = self.decisions.lock().unwrap_or_else(|p| p.into_inner());
         let recent: String = decisions.iter().rev().take(20).rev().map(|d| format!("- {} → {}\n", d["command"].as_str().unwrap_or(""), d["verdict"].as_str().unwrap_or(""))).collect();
-        format!("당신은 이 작업의 총괄입니다. 워커들에게 일을 나눠 맡겼고, 지금은 파일을 고치지 않고 판단만 합니다.\n\n[사용자 요청]\n{request}\n\n[워커]\n{workers}\n[지금까지의 명령 판단]\n{recent}")
+        format!("당신은 이 작업의 총괄입니다. 워커들에게 일을 나눠 맡겼습니다. 평소에는 판단만 하지만 [커밋 검토]와 [직접 작업]에서는 메인 작업 폴더의 파일을 직접 고칩니다.\n\n[사용자 요청]\n{request}\n\n[워커]\n{workers}\n[지금까지의 명령 판단]\n{recent}")
     }
 }
 
@@ -211,17 +260,49 @@ impl CommandJudgment {
 }
 
 fn own_tools_note() -> &'static str {
-    "일반 명령은 당신의 명령 도구로 직접 실행하세요. 대기열 요청은 게임 창이 뜨는 테스트만 받습니다."
+    "일반 명령은 당신의 명령 도구로 직접 실행하세요. 대기열 요청은 창이 뜨는 실행(게임·앱·브라우저 등)만 받습니다."
 }
 
 fn results_prompt(results: &[String]) -> String {
     format!("[Elysium 결과]\n{}\n\n이 결과를 반영해 맡은 작업을 이어 가세요. 끝나면 바꾼 파일과 다른 AI가 알아야 할 것을 짧게 요약하세요.", results.join("\n\n"))
 }
 
-fn queued_note(command: &str, position: Option<usize>) -> String {
-    match position {
-        Some(n) => format!("[게임 테스트 대기] {command}\n대기열 {n}번째입니다. 남은 다른 작업이 있으면 그 일을 하고, 없으면 차례를 끝내세요. 결과는 나중에 전달합니다."),
-        None => format!("[게임 테스트 시작] {command}\n지금 실행을 시작했습니다. 남은 다른 작업이 있으면 그 일을 하고, 없으면 차례를 끝내세요. 결과는 나중에 전달합니다."),
+/// 요청을 받자마자 워커에게 돌려주는 말: 검토와 실행은 뒤에서 하고 워커는 기다리지 않는다.
+fn started_note(command: &str) -> String {
+    format!("[명령 접수] {command}\n검토를 거쳐 백그라운드에서 실행합니다. 결과를 기다리지 말고 남은 다른 작업을 계속하세요. 끝나면 결과를 다음 차례에 전달합니다. 결과가 꼭 있어야 하고 할 일이 없을 때만 차례를 끝내세요.")
+}
+
+/// 워커가 맡긴 백그라운드 명령 수. 바뀔 때마다 화면에 알린다(작업이 끊겨 버려져도 줄어든다).
+struct BgCount {
+    app: AppHandle,
+    task: String,
+    key: String,
+    n: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl BgCount {
+    fn publish(&self) {
+        emit(&self.app, "task:agent-bg", json!({ "taskId": self.task, "key": self.key, "count": self.n.load(std::sync::atomic::Ordering::Relaxed) }));
+    }
+    fn up(&self) -> BgSlot {
+        self.n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.publish();
+        BgSlot { app: self.app.clone(), task: self.task.clone(), key: self.key.clone(), n: self.n.clone() }
+    }
+}
+
+/// 백그라운드 명령 하나가 끝나면(또는 버려지면) 수를 줄인다.
+struct BgSlot {
+    app: AppHandle,
+    task: String,
+    key: String,
+    n: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for BgSlot {
+    fn drop(&mut self) {
+        let left = self.n.fetch_sub(1, std::sync::atomic::Ordering::Relaxed).saturating_sub(1);
+        emit(&self.app, "task:agent-bg", json!({ "taskId": self.task, "key": self.key, "count": left }));
     }
 }
 
@@ -318,6 +399,109 @@ async fn lead_call(ctx: &Ctx, prompt: String, stop: &CancellationToken) -> Optio
     o.ok.then_some(o.text)
 }
 
+/// 총괄이 한 일을 화면에 알린다. kind: review·consult·merge·conflict·commit·hold·work·test·warn·info
+pub fn note(ctx: &Ctx, kind: &str, text: impl Into<String>) {
+    let entry = json!({ "taskId": ctx.lead.task, "kind": kind, "text": text.into(), "at": crate::db::now() });
+    {
+        let mut t = ctx.lead.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        t.push(entry.clone());
+        let over = t.len().saturating_sub(TIMELINE_KEEP);
+        t.drain(..over);
+    }
+    emit(&ctx.app, "lead:activity", entry);
+}
+
+/// 총괄이 메인 폴더에서 파일을 고치는 한 번. 판단 호출과 따로 돌아 명령 검토를 막지 않는다(메인 폴더 잠금은 부르는 쪽이 잡는다).
+async fn lead_work_run(ctx: &Ctx, prompt: String, stop: &CancellationToken) -> Outcome {
+    let lead = &ctx.lead;
+    let commits = lead.repo.lock().unwrap_or_else(|p| p.into_inner()).is_some();
+    let system = format!("{}{}{}", lead.work_system.lock().unwrap_or_else(|p| p.into_inner()), lead::LEAD_WINDOW_SYSTEM, if commits { lead::COMMIT_SYSTEM } else { "" });
+    let spec = RunSpec { engine: lead.engine, prompt, system, cwd: lead.cwd.clone(), work: true, resume: None, plugin_dirs: vec![], model: lead.model.clone(), effort: Some("medium".into()), max_tokens: None, extra_dirs: vec![], steer: None, attachments: vec![] };
+    orchestrator::run_engine_as(&ctx.app, &ctx.st, &lead.conv, &lead.task, &lead.mid, "lead", spec, LEAD_WORK_TIMEOUT, stop, false, "lead-work").await
+}
+
+/// 메인 폴더의 지금 상태(커밋 전 파일과 해시)
+async fn dirty_now(repo: &gitops::Repo) -> BTreeMap<String, Option<[u8; 32]>> {
+    let r = repo.clone();
+    tokio::task::spawn_blocking(move || r.dirty()).await.unwrap_or_default()
+}
+
+/// before 이후 바뀐 파일과 앞서 커밋하지 못한 파일을 커밋 블록대로 커밋한다. 블록이 없으면 기본 메시지로 커밋한다.
+async fn commit_changes(ctx: &Ctx, repo: &gitops::Repo, before: &BTreeMap<String, Option<[u8; 32]>>, plan: Option<lead::CommitPlan>, fallback: &str) {
+    let lead = &ctx.lead;
+    let after = dirty_now(repo).await;
+    let mut paths: BTreeSet<String> = gitops::changed_between(before, &after).into_iter().collect();
+    paths.extend(lead.pending.lock().unwrap_or_else(|p| p.into_inner()).iter().cloned());
+    if paths.is_empty() {
+        return;
+    }
+    let plan = plan.unwrap_or(lead::CommitPlan { commit: true, message: String::new(), note: String::new() });
+    if !plan.commit {
+        lead.pending.lock().unwrap_or_else(|p| p.into_inner()).extend(paths);
+        note(ctx, "hold", if plan.note.trim().is_empty() { "커밋 보류".to_string() } else { format!("커밋 보류: {}", plan.note) });
+        return;
+    }
+    let message = if plan.message.is_empty() { fallback.to_string() } else { plan.message.clone() };
+    let (r, list, msg) = (repo.clone(), paths.iter().cloned().collect::<Vec<_>>(), message.clone());
+    match tokio::task::spawn_blocking(move || r.commit(&list, &msg)).await.unwrap_or_else(|e| Err(e.to_string())) {
+        Ok(Some(sha)) => {
+            lead.pending.lock().unwrap_or_else(|p| p.into_inner()).clear();
+            let files: Vec<String> = paths.into_iter().collect();
+            note(ctx, "commit", format!("{sha} {message}"));
+            audit::record(&ctx.st.db, "lead", "lead.commit", "ok", json!({ "task": lead.task, "sha": sha, "message": message, "files": files }));
+            emit(&ctx.app, "lead:commit", json!({ "taskId": lead.task, "sha": sha, "message": message, "files": files, "note": plan.note }));
+        }
+        Ok(None) => lead.pending.lock().unwrap_or_else(|p| p.into_inner()).clear(),
+        Err(e) => {
+            lead.pending.lock().unwrap_or_else(|p| p.into_inner()).extend(paths);
+            note(ctx, "warn", format!("커밋 실패: {}", cut(&e, 300)));
+        }
+    }
+}
+
+/// 총괄이 메인 폴더에서 직접 일한다(사용자 지시나 총괄 자신의 판단). 끝나면 바뀐 파일을 커밋한다.
+pub async fn lead_work(ctx: &Ctx, work: String, stop: &CancellationToken) {
+    let lead = &ctx.lead;
+    note(ctx, "work", format!("직접 작업: {}", cut(&work, 160)));
+    let Some(_main) = wait_or_stop(lead.merge.lock(), stop).await else { return };
+    let repo = lead.repo.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let before = match &repo {
+        Some(r) => Some(dirty_now(r).await),
+        None => None,
+    };
+    let o = lead_work_run(ctx, lead::direct_work_prompt(&lead.context(), &work), stop).await;
+    let (plan, clean) = lead::parse_commit(&o.text);
+    if !clean.trim().is_empty() {
+        emit(&ctx.app, "lead:said", json!({ "taskId": lead.task, "text": cut(clean.trim(), 1500) }));
+    }
+    if !o.ok {
+        note(ctx, "warn", format!("직접 작업 실패: {}", o.error.as_deref().unwrap_or("-")));
+    }
+    if let (Some(repo), Some(before)) = (repo, before) {
+        if !stop.is_cancelled() {
+            commit_changes(ctx, &repo, &before, plan, &format!("chore: {}", cut(&work, 60))).await;
+        }
+    }
+}
+
+/// 통합 단계의 커밋: 통합 전에 메인 폴더를 잠그고 상태를 잡아 둔다. 커밋하지 않으면 None.
+pub async fn integration_begin(ctx: &Ctx) -> Option<(tokio::sync::MutexGuard<'_, ()>, gitops::Repo, BTreeMap<String, Option<[u8; 32]>>)> {
+    let repo = ctx.lead.repo.lock().unwrap_or_else(|p| p.into_inner()).clone()?;
+    let guard = wait_or_stop(ctx.lead.merge.lock(), &ctx.lead.cancel).await?;
+    let before = dirty_now(&repo).await;
+    note(ctx, "info", "통합 시작");
+    Some((guard, repo, before))
+}
+
+/// 통합이 끝난 뒤 바뀐 파일을 커밋하고 답에서 커밋 블록을 뺀다.
+pub async fn integration_end(ctx: &Ctx, repo: &gitops::Repo, before: &BTreeMap<String, Option<[u8; 32]>>, text: &str, ok: bool) -> String {
+    let (plan, clean) = lead::parse_commit(text);
+    if ok && !ctx.lead.cancel.is_cancelled() {
+        commit_changes(ctx, repo, before, plan, "chore: 병렬 작업 통합").await;
+    }
+    clean
+}
+
 /// 사용자에게 묻고 답을 기다린다. 관련 워커는 다음 차례를 미룬다. 작업을 멈추면 None.
 pub async fn ask_user(ctx: &Ctx, asked: &Asked, requester: Option<&str>, stop: &CancellationToken) -> Option<String> {
     let lead = &ctx.lead;
@@ -347,6 +531,7 @@ pub fn answer_question(app: &AppHandle, st: &AppState, id: &str, text: String, a
 /// 총괄에게 일어난 일을 알리고 그 판단대로 움직인다. 사용자 질문이 나오면 답을 받아 한 번 더 판단한다.
 pub async fn consult_lead(ctx: &Ctx, mut event: String, requester: Option<&str>, stop: &CancellationToken) {
     let lead = &ctx.lead;
+    note(ctx, "consult", cut(&event, 200));
     for _ in 0..3 {
         let Some(text) = lead_call(ctx, lead::actions_prompt(&lead.context(), &event), stop).await else { return };
         let Ok(a) = lead::parse_actions(&text) else {
@@ -366,19 +551,75 @@ pub async fn consult_lead(ctx: &Ctx, mut event: String, requester: Option<&str>,
                 orchestrator::cancel_agent(&ctx.st, &lead.task, &k);
             }
         }
+        for n in &a.remove {
+            remove_worker(ctx, *n);
+        }
+        for s in &a.spawn {
+            spawn_worker(ctx, s);
+        }
+        for (n, m) in &a.messages {
+            note(ctx, "consult", format!("워커 {n}에게 지시: {}", cut(m, 140)));
+        }
+        if let Some(w) = a.work.clone() {
+            // 직접 작업은 오래 걸릴 수 있으니 따로 돌려 다른 판단을 막지 않는다.
+            let (c, s) = (ctx.clone(), stop.clone());
+            tauri::async_runtime::spawn(async move { lead_work(&c, w, &s).await });
+        }
         let Some(asked) = a.ask_user else { return };
         let Some(answer) = ask_user(ctx, &asked, requester, stop).await else { return };
         event = format!("사용자에게 \"{}\"라고 물었고 답은 \"{answer}\"입니다. 이에 맞춰 움직이세요.", asked.question);
     }
 }
 
+/// 총괄이 워커를 지운다: 강제로 끝내고, 결과를 합치지 않으며, 화면에서 뺀다.
+fn remove_worker(ctx: &Ctx, number: usize) {
+    let lead = &ctx.lead;
+    let Some(key) = lead.worker_key(number) else { return };
+    if !lead.removed.lock().unwrap_or_else(|p| p.into_inner()).insert(key.clone()) {
+        return;
+    }
+    let label = worker_label(lead, &key).unwrap_or_else(|| key.clone());
+    orchestrator::cancel_agent(&ctx.st, &lead.task, &key);
+    emit(&ctx.app, "task:agent-removed", json!({ "taskId": lead.task, "key": key }));
+    audit::record(&ctx.st.db, "lead", "lead.worker.removed", "ok", json!({ "task": lead.task, "key": key }));
+    note(ctx, "consult", format!("{w}을(를) 강제 종료하고 삭제했습니다.", w = label));
+}
+
+/// 총괄이 지금 단계에 워커를 더한다. 단계가 아니면(나누기 전·통합 중) 만들지 못한다고 남긴다.
+fn spawn_worker(ctx: &Ctx, s: &lead::Spawn) {
+    let lead = &ctx.lead;
+    let engine = s.engine.as_deref().and_then(|n| crate::engines::ALL.iter().copied().find(|e| e.as_str().eq_ignore_ascii_case(n.trim())));
+    let req = SpawnReq { title: cut(s.title.trim(), 60), task: s.task.trim().to_string(), engine };
+    let tx = lead.spawner.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    match tx {
+        Some(tx) if tx.send(req).is_ok() => {}
+        _ => spawn_refused(ctx, &s.title),
+    }
+}
+
+/// 새 워커를 만들지 못했다고 총괄 기록에 남긴다.
+pub fn spawn_refused(ctx: &Ctx, title: &str) {
+    note(ctx, "warn", format!("현재 워커가 실행 중이 아니므로 {t} 워커를 생성할 수 없습니다.", t = cut(title, 60)));
+}
+
 /// 사용자가 총괄에게 보낸 지시. 통합 중이면 통합하는 총괄에게 바로 전한다.
-pub fn user_message(ctx: Ctx, text: String, about: Option<String>) {
+pub fn user_message(ctx: Ctx, text: String, about: Option<String>, direct: bool) {
     let event = match about.as_deref().and_then(|k| worker_label(&ctx.lead, k)) {
         Some(w) => format!("사용자가 {w}의 문제를 알렸습니다: {text}"),
         None => format!("사용자의 전체 지시: {text}"),
     };
     emit(&ctx.app, "lead:user", json!({ "taskId": ctx.lead.task, "text": text, "about": about }));
+    if direct && !ctx.lead.integrating.load(std::sync::atomic::Ordering::Relaxed) {
+        let work = match about.as_deref().and_then(|k| worker_label(&ctx.lead, k)) {
+            Some(w) => format!("{w}와 관련된 사용자 지시: {text}"),
+            None => text,
+        };
+        tauri::async_runtime::spawn(async move {
+            let stop = ctx.lead.cancel.clone();
+            lead_work(&ctx, work, &stop).await
+        });
+        return;
+    }
     if ctx.lead.integrating.load(std::sync::atomic::Ordering::Relaxed) {
         orchestrator::message_task(&ctx.app, &ctx.st, &ctx.lead.task, &event);
         return;
@@ -427,7 +668,8 @@ fn record_ruling(ctx: &Ctx, key: &str, req: &WorkerRequest, r: &Ruling) {
 async fn decide(ctx: &Ctx, key: &str, req: &WorkerRequest, stop: &CancellationToken) -> Ruling {
     let lead = &ctx.lead;
     let judged = judge_command(ctx, req).await;
-    let mut window = req.kind == Kind::Window || judged.is_some_and(|j| j.opens_window());
+    // 규칙으로 분명한 창 띄우기는 JEV·총괄·자동 허용과 상관없이 언제나 창 테스트 대기열로 간다.
+    let mut window = req.kind == Kind::Window || lead::opens_window(&req.command) || judged.is_some_and(|j| j.opens_window());
     let manual = judged.is_some_and(|j| j.needs_person());
     let auto = |window: bool| {
         let m = lead.policy.lock().unwrap_or_else(|p| p.into_inner()).matches(&req.command);
@@ -453,8 +695,9 @@ async fn decide(ctx: &Ctx, key: &str, req: &WorkerRequest, stop: &CancellationTo
             return Ruling { run: true, window, by: "jev", verdict: Verdict::Once, pattern: None, reason: String::new() };
         }
     }
-    let opinion = judged.map(|j| format!("안전 {:.2}, 요청 범위 {:.2}, 게임 창 {:.2}, 사람이 닫아야 끝남 {:.2}", j.safe, j.in_scope, j.window, j.manual));
+    let opinion = judged.map(|j| format!("안전 {:.2}, 요청 범위 {:.2}, 창 열림 {:.2}, 사람이 닫아야 끝남 {:.2}", j.safe, j.in_scope, j.window, j.manual));
     let label = worker_label(lead, key).unwrap_or_else(|| key.to_string());
+    note(ctx, "review", format!("{label}의 명령 검토: {}", cut(&req.command, 160)));
     let mut extra = String::new();
     for _ in 0..2 {
         let prompt = format!("{}{extra}", lead::review_prompt(&lead.context(), &label, req, opinion.as_deref()));
@@ -495,14 +738,55 @@ async fn decide(ctx: &Ctx, key: &str, req: &WorkerRequest, stop: &CancellationTo
     deny("사용자 답을 받은 뒤에도 총괄이 결정하지 못해 거부했습니다".into(), window)
 }
 
-/// 요청이 command로 왔어도 게임 테스트로 판정되면 게임 테스트의 시간 제한을 쓴다.
+/// 요청이 command로 왔어도 창 테스트로 판정되면 창 테스트의 시간 제한을 쓴다.
 fn timeout_for(req: &WorkerRequest, window: bool) -> u64 {
     lead::clamp_timeout(if window { Kind::Window } else { req.kind }, req.timeout_sec)
 }
 
-async fn exec_command(cwd: &Path, req: &WorkerRequest, window: bool, stop: &CancellationToken) -> String {
-    let secs = timeout_for(req, window);
-    match wait_or_stop(crate::api_agent::powershell(cwd, &req.command, secs), stop).await {
+/// 워커 대신 뒤에서 돌리는 명령. 출력을 줄마다 모아 에이전트 탭에서 보고 멈출 수 있게 한다.
+async fn exec_bg(ctx: &Ctx, key: &str, cwd: &Path, req: &WorkerRequest, stop: &CancellationToken) -> String {
+    let own = stop.child_token();
+    let bg = &ctx.st.bg;
+    let id = bg.start_elysium(&ctx.app, &ctx.lead.task, key, &req.command, own.clone());
+    let run = crate::api_agent::powershell_live(cwd, &req.command, timeout_for(req, false), |line| bg.push_line(&id, line));
+    let (state, text) = match wait_or_stop(run, &own).await {
+        Some(Ok(body)) => ("ok", format!("[명령 성공] {}
+{body}", req.command)),
+        Some(Err(body)) => ("fail", format!("[명령 실패] {}
+{body}", req.command)),
+        None => ("stopped", format!("[명령 중지] {}
+실행 중에 중지되었습니다.", req.command)),
+    };
+    bg.finish(&ctx.app, &id, state);
+    text
+}
+
+/// 창 테스트를 실행하며 출력을 줄마다 보관하고 짧은 간격으로 화면에 보낸다.
+async fn exec_test_live(app: &AppHandle, queue: &crate::testqueue::TestQueue, id: u64, cwd: &Path, req: &WorkerRequest, stop: &CancellationToken) -> String {
+    let secs = timeout_for(req, true);
+    let fresh: Mutex<Vec<String>> = Mutex::new(vec![]);
+    let on_line = |line: &str| {
+        queue.push_log(id, line);
+        fresh.lock().unwrap_or_else(|p| p.into_inner()).push(line.to_string());
+    };
+    let flush = || {
+        let lines = std::mem::take(&mut *fresh.lock().unwrap_or_else(|p| p.into_inner()));
+        if !lines.is_empty() {
+            emit(app, "test:log", json!({ "id": id, "lines": lines }));
+        }
+    };
+    let run = crate::api_agent::powershell_live(cwd, &req.command, secs, on_line);
+    tokio::pin!(run);
+    let mut tick = tokio::time::interval(LOG_FLUSH);
+    let out = loop {
+        tokio::select! {
+            r = &mut run => break Some(r),
+            _ = stop.cancelled() => break None,
+            _ = tick.tick() => flush(),
+        }
+    };
+    flush();
+    match out {
         Some(Ok(body)) => format!("[명령 성공] {}\n{body}", req.command),
         Some(Err(body)) => format!("[명령 실패] {}\n{body}", req.command),
         None => format!("[명령 중지] {}\n실행 중에 중지되었습니다.", req.command),
@@ -513,24 +797,46 @@ struct PendingTest {
     handle: tokio::task::JoinHandle<String>,
 }
 
+/// 끝난 백그라운드 일의 결과를 꺼내고 나머지는 남긴다.
+async fn take_finished(pending: &mut Vec<PendingTest>) -> Vec<String> {
+    let mut out = vec![];
+    let mut left = vec![];
+    for p in pending.drain(..) {
+        if p.handle.is_finished() {
+            out.push(p.handle.await.unwrap_or_else(|e| format!("[명령 오류] {e}")));
+        } else {
+            left.push(p);
+        }
+    }
+    *pending = left;
+    out
+}
+
 /// 대기열에 넣고 자기 차례에 실행한다. 사용자가 이 테스트만 끄면 워커는 멈추지 않고 그 결과를 받는다.
 async fn spawn_window_test(ctx: &Ctx, key: &str, cwd: PathBuf, req: WorkerRequest, stop: &CancellationToken) -> (PendingTest, Option<usize>) {
     let q = ctx.st.tests.clone();
     let id = q.next_id();
-    let item = TestItem { id, task: ctx.lead.task.clone(), key: key.to_string(), command: req.command.clone() };
+    let item = TestItem { id, task: ctx.lead.task.clone(), key: key.to_string(), command: req.command.clone(), started_at: None };
     let own = stop.child_token();
     let parent = stop.clone();
     let queue = q.clone();
+    let app = ctx.app.clone();
+    note(ctx, "test", format!("창 테스트 등록: {}", cut(&req.command, 160)));
     let handle = tokio::spawn(async move {
         let stopped = |parent: &CancellationToken| if parent.is_cancelled() { "작업이 중지되었습니다" } else { "사용자가 이 테스트를 껐습니다" };
-        let Some(guard) = queue.acquire(item, &own).await else { return format!("[게임 테스트 취소] {}\n{}", req.command, stopped(&parent)) };
-        let result = exec_command(&cwd, &req, true, &own).await;
+        let record = item.clone();
+        let Some(guard) = queue.acquire(item, &own).await else {
+            let why = stopped(&parent);
+            queue.finish(&record, None, false, why);
+            return format!("[창 테스트 취소] {}\n{why}", req.command);
+        };
+        let started = queue.snapshot().running.iter().find(|i| i.id == id).and_then(|i| i.started_at);
+        let result = exec_test_live(&app, &queue, id, &cwd, &req, &own).await;
         drop(guard);
-        if own.is_cancelled() {
-            format!("[게임 테스트 취소] {}\n{}", req.command, stopped(&parent))
-        } else {
-            result
-        }
+        let (ok, text) = if own.is_cancelled() { (false, format!("[창 테스트 취소] {}\n{}", req.command, stopped(&parent))) } else { (result.starts_with("[명령 성공]"), result) };
+        let summary = text.lines().nth(1).unwrap_or("").to_string();
+        queue.finish(&record, started, ok, if summary.is_empty() { &text } else { &summary });
+        text
     });
     // 줄에 들어간 뒤의 순번을 알려 준다.
     for _ in 0..50 {
@@ -576,6 +882,10 @@ impl Crew {
     fn wake(&self) {
         self.busy.send_modify(|n| *n += 1);
     }
+    /// 단계 중에 워커가 새로 들어왔다.
+    pub fn join(&self) {
+        self.wake();
+    }
     async fn all_resting(&self) {
         let mut rx = self.busy.subscribe();
         let _ = rx.wait_for(|n| *n == 0).await;
@@ -614,6 +924,10 @@ pub async fn run_part_worker(ctx: &Ctx, spec: RunSpec, key: &str, title: &str, b
         let stop = ctx.st.agent_stops.lock().unwrap_or_else(|p| p.into_inner()).get(&slot).cloned().unwrap_or_else(|| lead.cancel.clone());
         let o = orchestrator::run_engine_as(&ctx.app, &ctx.st, &lead.conv, &lead.task, &lead.mid, "agent", spec, budget, &stop, false, key).await;
         if let Some(c) = crew {
+            if o.ok && !stop.is_cancelled() {
+                checkpoint(ctx, key, &o.text).await;
+                org_report_solo(ctx, key, &o.text);
+            }
             c.rest();
         }
         o
@@ -622,7 +936,16 @@ pub async fn run_part_worker(ctx: &Ctx, spec: RunSpec, key: &str, title: &str, b
 
 /// 그룹 라운드 상한
 const MAX_ROUNDS: u32 = 12;
-const GROUP_NOTE_CHARS: usize = 2500;
+/// 다른 그룹원에게 전하는 새 글 하나의 최대 글자 수
+const GROUP_NOTE_CHARS: usize = 1200;
+/// 세션을 이어 쓸 수 없는 그룹원에게 다시 주는, 이미 본 글 하나의 최대 글자 수
+const GROUP_OLD_CHARS: usize = 240;
+/// 그룹장이 나눈 역할 분담의 최대 글자 수
+const GROUP_PLAN_CHARS: usize = 2000;
+/// 팀장 보고 하나의 최대 글자 수
+const ORG_POST_CHARS: usize = 500;
+/// 한 번에 받는 팀장 보고 수(오래된 것은 버린다)
+const ORG_TAKE: usize = 6;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct MemberState {
@@ -647,6 +970,15 @@ fn next_round(members: &[MemberState], round: u32, cap: u32) -> RoundPlan {
     RoundPlan { run: if free.is_empty() { open } else { free }, finished: false }
 }
 
+/// 첫 라운드는 그룹장 혼자 역할을 나눈다(그룹원마다 역할만 제안하는 차례를 아낀다). 그룹장이 없으면 모두가 제안한다.
+fn first_round(members: &[MemberState], round: u32, cap: u32) -> RoundPlan {
+    if round == 0 && members.first().is_some_and(|m| m.alive) {
+        RoundPlan { run: vec![0], finished: false }
+    } else {
+        next_round(members, round, cap)
+    }
+}
+
 /// 그룹 블록이 없거나 읽을 수 없으면 다시 쓰게 하고, 두 번 연속이면 끝낸 것으로 본다. (글, 이번에 놓쳤는지)
 fn note_or_miss(note: Option<lead::GroupNote>, clean: String, misses: &mut u32) -> (lead::GroupNote, bool) {
     match note {
@@ -656,7 +988,8 @@ fn note_or_miss(note: Option<lead::GroupNote>, clean: String, misses: &mut u32) 
         }
         None => {
             *misses += 1;
-            (lead::GroupNote { say: clean, claim: vec![], done: *misses >= 2 }, true)
+            // 블록 없이 쓴 본문은 길 수 있으니 끝부분만 전한다.
+            (lead::GroupNote { say: solo_report(&clean), done: *misses >= 2, ..Default::default() }, true)
         }
     }
 }
@@ -686,10 +1019,14 @@ fn update_notices(notices: &mut [bool], ran: &[usize], clashes: &[(usize, usize)
     }
 }
 
+/// 다음 차례 앞에 붙이는 말. 새 글이 없으면 머리말 없이 이어 가라고만 한다.
 fn group_followup_with(others: &[(String, String)], held: bool, missed: bool) -> String {
-    let mut s = String::from("[다른 그룹원의 글]\n");
-    for (who, text) in others {
-        s.push_str(&format!("[{who}]\n{}\n\n", cut(text, GROUP_NOTE_CHARS)));
+    let mut s = String::new();
+    if !others.is_empty() {
+        s.push_str("[다른 그룹원의 글]\n");
+        for (who, text) in others {
+            s.push_str(&format!("[{who}]\n{}\n\n", cut(text, GROUP_NOTE_CHARS)));
+        }
     }
     if held {
         s.push_str("당신이 맡겠다고 한 파일을 다른 그룹원도 맡았습니다. 이번 차례에는 파일을 고치지 말고 누가 맡을지 정리하세요.\n");
@@ -703,34 +1040,119 @@ fn group_followup_with(others: &[(String, String)], held: bool, missed: bool) ->
     s
 }
 
-/// 워커 여럿이 한 하위 작업을 대화하며 함께 한다. 첫 라운드는 역할만 정하고, 끝나면 첫 번째 생존 그룹원이 결과를 정리한다.
+/// 그룹 기록 한 줄
+struct Said {
+    who: usize,
+    round: u32,
+    text: String,
+}
+
+fn said_label(names: &[String], s: &Said) -> String {
+    format!("{} · {}라운드", names[s.who], s.round + 1)
+}
+
+/// 세션을 이어 쓰는 그룹원에게: 아직 보지 못한 다른 그룹원의 글만(이미 본 글을 다시 보내지 않는다)
+fn unseen(log: &[Said], seen: usize, me: usize, names: &[String]) -> Vec<(String, String)> {
+    log[seen.min(log.len())..].iter().filter(|s| s.who != me && !s.text.trim().is_empty()).map(|s| (said_label(names, s), s.text.clone())).collect()
+}
+
+/// 세션을 이어 쓸 수 없는 그룹원에게: 지난 기록 전체(자기 글도, 앞 차례를 기억하지 못하므로)를 주되 이미 본 글은 짧게 줄인다.
+/// 그룹장이 나눈 역할 분담(첫 글)은 줄이지 않는다.
+fn recap(log: &[Said], seen: usize, names: &[String]) -> Vec<(String, String)> {
+    log.iter().enumerate().filter(|(_, s)| !s.text.trim().is_empty()).map(|(k, s)| (said_label(names, s), if k < seen && k > 0 { cut(&s.text, GROUP_OLD_CHARS) } else { s.text.clone() })).collect()
+}
+
+/// 그룹장이 첫 차례에 받는 말
+fn leader_plan_prompt(n: usize) -> String {
+    format!("당신은 그룹원 1이자 그룹장입니다. 이번 차례에는 파일을 고치지 말고, 그룹원 {n}명이 맡을 일과 파일을 겹치지 않게 나누세요. elysium-group 블록의 say에 '그룹원 1: …; 그룹원 2: …' 꼴로 짧게 쓰고, claim에는 당신이 맡을 파일만 쓰세요.")
+}
+
+/// 그룹원의 첫 차례: 그룹장이 나눈 역할이 있으면 그대로 시작하고, 없으면 역할을 제안한다.
+fn member_start_prompt(original: &str, name: &str, plan: Option<&str>) -> String {
+    match plan {
+        Some(p) => format!("{original}\n\n[그룹장의 역할 분담]\n{}\n\n당신은 {name}입니다. 분담대로 맡은 일을 하세요. 파일을 고치기 전에 claim에 적으세요.", cut(p, GROUP_PLAN_CHARS)),
+        None => format!("{original}\n\n당신은 {name}입니다. 이번 라운드는 파일을 고치지 말고 그룹에서 맡을 역할과 파일을 elysium-group 블록으로 제안하세요."),
+    }
+}
+
+/// 그룹장이 팀장 보고판에 올릴 글: 그룹장이 쓴 report, 없으면 이번 라운드 그룹원 글을 짧게 모은다.
+fn team_report(leader_report: &str, said: &[(String, String)]) -> String {
+    if !leader_report.trim().is_empty() {
+        return cut(leader_report.trim(), ORG_POST_CHARS);
+    }
+    let all = said.iter().filter(|(_, t)| !t.trim().is_empty()).map(|(who, t)| format!("{who}: {}", cut(t.trim(), 160))).collect::<Vec<_>>().join(" / ");
+    cut(&all, ORG_POST_CHARS)
+}
+
+/// 그룹이 끝난 뒤 통합 AI에게 넘길 요약: 그룹원마다 마지막 글과 맡은 파일(요약만 쓰게 하는 차례를 아낀다)
+fn group_digest(names: &[String], last: &[String], claims: &[BTreeSet<String>]) -> String {
+    names
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !last[*i].trim().is_empty())
+        .map(|(i, n)| {
+            let files = if claims[i].is_empty() { String::new() } else { format!(" (파일: {})", claims[i].iter().cloned().collect::<Vec<_>>().join(", ")) };
+            format!("- {n}{files}: {}", cut(last[i].trim(), 600))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 워커 여럿이 한 하위 작업을 대화하며 함께 한다. 첫 라운드는 그룹장이 역할을 나누고, 끝나면 그룹원의 마지막 글로 결과를 정리한다.
 pub async fn run_group(ctx: &Ctx, index: usize, title: &str, members: Vec<(String, RunSpec)>, budget: Duration) -> Outcome {
     let mut specs: Vec<RunSpec> = members.iter().map(|(_, s)| s.clone()).collect();
     let keys: Vec<String> = members.iter().map(|(k, _)| k.clone()).collect();
-    let names: Vec<String> = (0..keys.len()).map(|m| format!("그룹원 {}", m + 1)).collect();
-    let mut state = vec![MemberState { alive: true, done: false, held: false }; keys.len()];
+    let n = keys.len();
+    let names: Vec<String> = (0..n).map(|m| format!("그룹원 {}", m + 1)).collect();
+    let mut state = vec![MemberState { alive: true, done: false, held: false }; n];
     // 라운드 사이에도 멈추거나 메시지를 받도록 그룹이 끝날 때까지 등록해 둔다.
     let slots: Vec<String> = keys.iter().map(|k| orchestrator::agent_slot(&ctx.lead.task, k)).collect();
     let registered: Vec<(CancellationToken, bool)> = slots.iter().map(|s| register_line(&ctx.st.agent_stops, &ctx.st.agent_inboxes, s, &ctx.lead.cancel)).collect();
     let stops: Vec<CancellationToken> = registered.iter().map(|(t, _)| t.clone()).collect();
     let _lines: Vec<WorkerLine> = slots.iter().zip(&registered).map(|(slot, (_, owned))| WorkerLine { st: &ctx.st, slot: slot.clone(), owned: *owned }).collect();
-    let mut notices = vec![false; keys.len()];
-    let mut misses = vec![0u32; keys.len()];
-    let mut missed = vec![false; keys.len()];
+    let mut notices = vec![false; n];
+    let mut misses = vec![0u32; n];
+    let mut missed = vec![false; n];
     let mut merged = Outcome { ok: true, ..Default::default() };
     let originals: Vec<String> = specs.iter().map(|s| s.prompt.clone()).collect();
-    let mut log: Vec<(String, String)> = vec![];
+    let mut log: Vec<Said> = vec![];
+    // 그룹원마다 지금까지 받은 기록의 길이
+    let mut seen = vec![0usize; n];
+    let mut started = vec![false; n];
+    let mut last_say = vec![String::new(); n];
+    let mut claims: Vec<BTreeSet<String>> = vec![BTreeSet::new(); n];
+    let mut plan: Option<String> = None;
+    let board = org_board(ctx);
+    let part = board.as_ref().and_then(|b| b.part_of(&keys[0]));
     let mut round = 0;
-    for (i, s) in specs.iter_mut().enumerate() {
-        s.prompt = format!("{}\n\n당신은 {}입니다. 이번 라운드는 파일을 고치지 말고 그룹에서 맡을 역할과 파일을 elysium-group 블록으로 제안하세요.", originals[i], names[i]);
-    }
     loop {
         drop_stopped(&mut state, &stops);
-        let plan = next_round(&state, round, MAX_ROUNDS);
-        if plan.finished || ctx.lead.cancel.is_cancelled() {
+        let now = first_round(&state, round, MAX_ROUNDS);
+        if now.finished || ctx.lead.cancel.is_cancelled() {
             break;
         }
-        let runs = plan.run.iter().map(|&i| {
+        let leader = state.iter().position(|m| m.alive).unwrap_or(0);
+        for &i in &now.run {
+            specs[i].prompt = if round == 0 && now.run == [0] {
+                format!("{}\n\n{}", originals[0], leader_plan_prompt(n))
+            } else if !started[i] {
+                member_start_prompt(&originals[i], &names[i], plan.as_deref())
+            } else if specs[i].resume.is_some() {
+                group_followup_with(&unseen(&log, seen[i], i, &names), notices[i], missed[i])
+            } else {
+                format!("{}\n\n{}", originals[i], group_followup_with(&recap(&log, seen[i], &names), notices[i], missed[i]))
+            };
+            // 조직: 그룹장은 다른 팀장의 새 보고를 함께 받는다.
+            if let (true, Some(b), Some(p)) = (i == leader && started[i], &board, part) {
+                let posts = b.take(p);
+                if !posts.is_empty() {
+                    specs[i].prompt = format!("{}\n{}", board_prompt(&posts), specs[i].prompt);
+                }
+            }
+            started[i] = true;
+            seen[i] = log.len();
+        }
+        let runs = now.run.iter().map(|&i| {
             let (spec, key, title) = (specs[i].clone(), keys[i].clone(), title.to_string());
             async move { (i, run_part_worker(ctx, spec, &key, &title, budget, false, None).await) }
         });
@@ -746,30 +1168,36 @@ pub async fn run_group(ctx: &Ctx, index: usize, title: &str, members: Vec<(Strin
             let (note, miss) = note_or_miss(note, clean, &mut misses[i]);
             missed[i] = miss;
             state[i].done = note.done;
+            if round == 0 && i == 0 && o.ok && !miss && !note.say.trim().is_empty() {
+                plan = Some(note.say.clone());
+            }
+            if !note.say.trim().is_empty() {
+                last_say[i] = note.say.clone();
+            }
+            claims[i].extend(note.claim.iter().map(|c| c.trim().to_string()).filter(|c| !c.is_empty()));
             let entry = json!({ "taskId": ctx.lead.task, "group": index, "round": round, "key": keys[i], "who": names[i], "text": note.say, "claim": note.claim, "done": note.done });
             ctx.lead.group_log.lock().unwrap_or_else(|p| p.into_inner()).push(entry.clone());
             emit(&ctx.app, "group:say", entry);
-            log.push((format!("{} · {}라운드", names[i], round + 1), note.say.clone()));
+            log.push(Said { who: i, round, text: note.say.clone() });
             said.push((i, note));
+        }
+        // 조직: 그룹장이 이번 라운드에 일했으면 팀 상황을 다른 팀장에게 올린다.
+        if let (Some(b), Some(p), Some((_, ln))) = (&board, part, said.iter().find(|(i, _)| *i == leader)) {
+            let all: Vec<(String, String)> = said.iter().map(|(i, x)| (names[*i].clone(), x.say.clone())).collect();
+            org_post(ctx, b, p, &team_report(&ln.report, &all));
         }
         let notes: Vec<(usize, &lead::GroupNote)> = said.iter().map(|(i, n)| (*i, n)).collect();
         let held = lead::claim_overlaps(&notes);
-        update_notices(&mut notices, &plan.run, &lead::claim_clashes(&notes));
+        update_notices(&mut notices, &now.run, &lead::claim_clashes(&notes));
         for (i, m) in state.iter_mut().enumerate() {
             m.held = held.contains(&i);
         }
         let joined: String = said.iter().map(|(i, n)| format!("{}: {}\n", names[*i], cut(&n.say, GROUP_NOTE_CHARS))).collect();
-        if judge_blocked(ctx, "group", title, &joined).await.is_some_and(|p| p >= JEV_BLOCKED) {
+        // 그룹장 혼자 역할을 나눈 첫 라운드는 막힐 일이 없어 묻지 않는다.
+        if !(round == 0 && now.run == [0]) && judge_blocked(ctx, "group", title, &joined).await.is_some_and(|p| p >= JEV_BLOCKED) {
             consult_lead(ctx, format!("그룹 '{title}'이 막힌 것으로 보입니다. 최근 대화:\n{joined}"), None, &ctx.lead.cancel).await;
         }
         round += 1;
-        for (i, s) in specs.iter_mut().enumerate() {
-            let others: Vec<(String, String)> = log.iter().filter(|(who, _)| !who.starts_with(&names[i])).cloned().collect();
-            let recent = &others[others.len().saturating_sub(keys.len() * 2)..];
-            let body = group_followup_with(recent, notices[i], missed[i]);
-            // 세션을 이어 쓸 수 없으면 원래 요청과 전체 기록을 다시 준다.
-            s.prompt = if s.resume.is_some() { body } else { format!("{}\n\n{}", originals[i], group_followup_with(&others, notices[i], missed[i])) };
-        }
     }
     if ctx.lead.cancel.is_cancelled() {
         merged.ok = false;
@@ -782,11 +1210,118 @@ pub async fn run_group(ctx: &Ctx, index: usize, title: &str, members: Vec<(Strin
         merged.error = Some("그룹원이 모두 실패했습니다".to_string());
         return merged;
     };
+    // 그룹원이 남긴 마지막 글로 정리한다. 아무도 글을 남기지 않았을 때만 한 번 더 묻는다.
+    let digest = group_digest(&names, &last_say, &claims);
+    if !digest.is_empty() {
+        merged.text = digest;
+        return merged;
+    }
     let mut spec = specs[writer].clone();
     spec.prompt = "그룹 작업이 끝났습니다. 그룹 전체가 바꾼 파일과 다른 AI가 알아야 할 것을 짧게 요약하세요. 이번에는 elysium-group 블록을 쓰지 마세요.".to_string();
     let o = run_part_worker(ctx, spec, &keys[writer], title, budget, false, None).await;
     let (_, clean) = lead::parse_group(&o.text);
     merge_outcome(merged, &Outcome { text: clean, ..o })
+}
+
+/// 팀장 보고판: 같은 부서의 팀장끼리 짧은 보고를 주고받는다. 보고는 받는 쪽이 어차피 일하는 다음 차례 앞에 붙고,
+/// 보고 때문에 쉬는 워커를 깨우지 않는다(토큰을 아낀다).
+pub struct OrgBoard {
+    titles: Vec<String>,
+    peers: Vec<Vec<usize>>,
+    /// 팀장 실행 key → 하위 작업
+    leaders: HashMap<String, usize>,
+    posts: Mutex<Vec<(usize, String)>>,
+    /// 하위 작업마다 지금까지 받은 보고의 길이
+    seen: Mutex<Vec<usize>>,
+}
+
+impl OrgBoard {
+    pub fn new(titles: Vec<String>, peers: Vec<Vec<usize>>, leaders: HashMap<String, usize>) -> Self {
+        let n = titles.len();
+        OrgBoard { titles, peers, leaders, posts: Mutex::new(vec![]), seen: Mutex::new(vec![0; n]) }
+    }
+
+    /// 보고를 주고받는 팀장이면 그 하위 작업
+    pub fn part_of(&self, key: &str) -> Option<usize> {
+        self.leaders.get(key).copied().filter(|i| self.peers.get(*i).is_some_and(|p| !p.is_empty()))
+    }
+
+    /// 보고를 올린다. 바로 앞 보고와 같으면 올리지 않는다. 받는 하위 작업들을 돌려준다.
+    fn post(&self, from: usize, text: &str) -> Option<(Vec<usize>, String)> {
+        let text = cut(text.trim(), ORG_POST_CHARS);
+        let to = self.peers.get(from).filter(|p| !p.is_empty())?.clone();
+        if text.is_empty() {
+            return None;
+        }
+        let mut posts = self.posts.lock().unwrap_or_else(|p| p.into_inner());
+        if posts.iter().rev().find(|(f, _)| *f == from).is_some_and(|(_, t)| *t == text) {
+            return None;
+        }
+        posts.push((from, text.clone()));
+        Some((to, text))
+    }
+
+    /// to가 아직 받지 않은 다른 팀장의 보고(최근 몇 개). 받은 것으로 표시한다.
+    pub fn take(&self, to: usize) -> Vec<(String, String)> {
+        let Some(peers) = self.peers.get(to) else { return vec![] };
+        let posts = self.posts.lock().unwrap_or_else(|p| p.into_inner());
+        let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+        let from = seen[to].min(posts.len());
+        seen[to] = posts.len();
+        let fresh: Vec<(String, String)> = posts[from..].iter().filter(|(f, _)| peers.contains(f)).map(|(f, t)| (self.titles[*f].clone(), t.clone())).collect();
+        fresh[fresh.len().saturating_sub(ORG_TAKE)..].to_vec()
+    }
+}
+
+pub fn board_prompt(posts: &[(String, String)]) -> String {
+    let mut s = String::from("[다른 팀장의 보고] 필요한 것만 반영하세요. 답할 일이 있으면 다음 보고에 쓰세요.\n");
+    for (who, t) in posts {
+        s.push_str(&format!("- {who}: {t}\n"));
+    }
+    s
+}
+
+fn org_board(ctx: &Ctx) -> Option<Arc<OrgBoard>> {
+    ctx.lead.org.lock().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+/// 팀장 보고를 올리고 화면과 기록에 남긴다.
+fn org_post(ctx: &Ctx, board: &OrgBoard, from: usize, text: &str) {
+    if let Some((to, text)) = board.post(from, text) {
+        let entry = json!({ "taskId": ctx.lead.task, "from": from, "title": board.titles[from], "to": to, "text": text, "at": crate::db::now() });
+        ctx.lead.org_log.lock().unwrap_or_else(|p| p.into_inner()).push(entry.clone());
+        emit(&ctx.app, "org:post", entry);
+    }
+}
+
+/// 글의 끝부분(대개 요약). 줄 중간에서 자르지 않게 첫 줄바꿈 뒤부터 쓴다.
+fn solo_report(text: &str) -> String {
+    let t = text.trim();
+    let n = t.chars().count();
+    if n <= ORG_POST_CHARS {
+        return t.to_string();
+    }
+    let tail: String = t.chars().skip(n - ORG_POST_CHARS).collect();
+    match tail.find('\n') {
+        Some(i) if i < tail.len() / 2 => tail[i + 1..].to_string(),
+        _ => tail,
+    }
+}
+
+/// 혼자 일하는 팀장(key)이 쉬기 전에 다른 팀장에게 보고한다.
+fn org_report_solo(ctx: &Ctx, key: &str, text: &str) {
+    if let Some(b) = org_board(ctx) {
+        if let Some(p) = b.part_of(key) {
+            org_post(ctx, &b, p, &solo_report(text));
+        }
+    }
+}
+
+/// 팀장(key)이 다음 차례 앞에 받을 다른 팀장의 새 보고
+fn org_inbox(ctx: &Ctx, key: &str) -> Option<String> {
+    let b = org_board(ctx)?;
+    let posts = b.take(b.part_of(key)?);
+    (!posts.is_empty()).then(|| board_prompt(&posts))
 }
 
 pub struct WorkerOpts<'a> {
@@ -795,7 +1330,7 @@ pub struct WorkerOpts<'a> {
     pub role: &'static str,
     pub stream: bool,
     pub budget: Duration,
-    /// true면 명령 요청도 검토해 실행한다(명령이 막힌 워커). false면 게임 테스트 요청만 받는다.
+    /// true면 명령 요청도 검토해 실행한다(명령이 막힌 워커). false면 창 테스트 요청만 받는다.
     pub reviewed: bool,
     /// 차례가 끝날 때 JEV에게 막혔는지 묻는다. 그룹은 라운드마다 따로 묻는다.
     pub check_drift: bool,
@@ -822,7 +1357,7 @@ fn register_line(stops: &Mutex<HashMap<String, CancellationToken>>, inboxes: &Mu
     (t, true)
 }
 
-/// 워커가 끝나면 그 워커가 맡긴 게임 테스트도 끝내 대기열 자리를 돌려준다.
+/// 워커가 끝나면 그 워커가 맡긴 창 테스트도 끝내 대기열 자리를 돌려준다.
 struct TestScope {
     token: CancellationToken,
 }
@@ -856,9 +1391,9 @@ pub async fn run_worker(ctx: &Ctx, mut spec: RunSpec, opts: WorkerOpts<'_>) -> O
     let (stop, owned) = register_line(&st.agent_stops, &st.agent_inboxes, &slot, &lead.cancel);
     let _line = WorkerLine { st, slot: slot.clone(), owned };
     let tests = TestScope::new(&stop);
+    let bg = BgCount { app: ctx.app.clone(), task: lead.task.clone(), key: opts.key.to_string(), n: Arc::new(std::sync::atomic::AtomicUsize::new(0)) };
     let mut merged = Outcome::default();
     let mut pending: Vec<PendingTest> = vec![];
-    let mut used = Duration::ZERO;
     let mut resting = false;
     let wait_note = |note: &str| emit(&ctx.app, "task:agent-wait", json!({ "taskId": lead.task, "key": opts.key, "note": note }));
     for turn in 0..MAX_TURNS {
@@ -870,9 +1405,10 @@ pub async fn run_worker(ctx: &Ctx, mut spec: RunSpec, opts: WorkerOpts<'_>) -> O
         if !mail.is_empty() {
             spec.prompt = format!("[총괄·사용자가 보낸 메시지]\n{}\n\n{}", mail.join("\n"), spec.prompt);
         }
-        let left = opts.budget.saturating_sub(used).max(FOLLOW_UP_MIN);
-        let o = orchestrator::run_engine_as(&ctx.app, st, &lead.conv, &lead.task, &lead.mid, opts.role, spec.clone(), left, &stop, opts.stream, opts.key).await;
-        used += Duration::from_millis(o.latency_ms);
+        if let Some(board) = org_inbox(ctx, opts.key) {
+            spec.prompt = format!("{board}\n{}", spec.prompt);
+        }
+        let o = orchestrator::run_engine_as(&ctx.app, st, &lead.conv, &lead.task, &lead.mid, opts.role, spec.clone(), opts.budget, &stop, opts.stream, opts.key).await;
         let parsed = lead::parse_requests(&o.text);
         merged = merge_outcome(merged, &Outcome { text: parsed.clean.clone(), ..o.clone() });
         if stop.is_cancelled() || !o.ok {
@@ -890,42 +1426,42 @@ pub async fn run_worker(ctx: &Ctx, mut spec: RunSpec, opts: WorkerOpts<'_>) -> O
             results.push(format!("[요청 형식 오류] {e}. 형식을 고쳐 다시 쓰세요."));
         }
         for req in parsed.requests {
-            if !opts.reviewed && req.kind != Kind::Window {
+            if !opts.reviewed && req.kind != Kind::Window && !lead::opens_window(&req.command) {
                 results.push(format!("[요청 거부] {}\n{}", req.command, own_tools_note()));
                 continue;
             }
-            let ruling = if opts.reviewed { decide(ctx, opts.key, &req, &stop).await } else { Ruling { run: true, window: true, by: "self", verdict: Verdict::Once, pattern: None, reason: String::new() } };
-            record_ruling(ctx, opts.key, &req, &ruling);
-            if stop.is_cancelled() {
-                break;
-            }
-            if !ruling.run {
-                results.push(format!("[요청 거부] {}\n이유: {}", req.command, ruling.reason));
-            } else if ruling.window {
-                let (p, position) = spawn_window_test(ctx, opts.key, spec.cwd.clone(), req.clone(), &tests.token).await;
-                pending.push(p);
-                results.push(queued_note(&req.command, position));
-            } else {
-                wait_note("command");
-                results.push(exec_command(&spec.cwd, &req, false, &stop).await);
-            }
+            // 검토·실행은 뒤에서 한다: 워커는 바로 다음 일을 하고, 결과는 끝나는 대로 다음 차례에 받는다.
+            let (c, key, cwd, scope, stop2, reviewed, slot) = (ctx.clone(), opts.key.to_string(), spec.cwd.clone(), tests.token.clone(), stop.clone(), opts.reviewed, bg.up());
+            let command = req.command.clone();
+            let handle = tokio::spawn(async move {
+                let _slot = slot;
+                let ruling = if reviewed { decide(&c, &key, &req, &stop2).await } else { Ruling { run: true, window: true, by: "self", verdict: Verdict::Once, pattern: None, reason: String::new() } };
+                record_ruling(&c, &key, &req, &ruling);
+                if stop2.is_cancelled() {
+                    return format!("[명령 중지] {}\n작업이 중지되었습니다.", req.command);
+                }
+                if !ruling.run {
+                    format!("[요청 거부] {}\n이유: {}", req.command, ruling.reason)
+                } else if ruling.window {
+                    let (p, _) = spawn_window_test(&c, &key, cwd, req.clone(), &scope).await;
+                    p.handle.await.unwrap_or_else(|e| format!("[창 테스트 오류] {e}"))
+                } else {
+                    exec_bg(&c, &key, &cwd, &req, &scope).await
+                }
+            });
+            pending.push(PendingTest { handle });
+            results.push(started_note(&command));
         }
-        // 이미 끝난 테스트의 결과는 이번에 함께 전한다.
-        let mut unfinished = vec![];
-        for p in pending.drain(..) {
-            if p.handle.is_finished() {
-                results.push(p.handle.await.unwrap_or_else(|e| format!("[게임 테스트 오류] {e}")));
-            } else {
-                unfinished.push(p);
-            }
-        }
-        pending = unfinished;
-        // 할 일이 없어 차례를 끝낸 워커는 프로세스 없이 테스트 결과를 기다린다.
+        // 이미 끝난 명령·테스트의 결과는 이번에 함께 전한다.
+        results.extend(take_finished(&mut pending).await);
+        // 할 일이 없어 차례를 끝낸 워커만 기다린다. 다 기다리지 않고 하나라도 끝나면 그 결과로 바로 이어 간다.
         if results.is_empty() && !pending.is_empty() {
-            wait_note("test");
-            for p in pending.drain(..) {
-                results.push(p.handle.await.unwrap_or_else(|e| format!("[게임 테스트 오류] {e}")));
-            }
+            wait_note("command");
+            let handles: Vec<_> = pending.drain(..).map(|p| p.handle).collect();
+            let (first, _, rest) = futures_util::future::select_all(handles).await;
+            results.push(first.unwrap_or_else(|e| format!("[명령 오류] {e}")));
+            pending = rest.into_iter().map(|handle| PendingTest { handle }).collect();
+            results.extend(take_finished(&mut pending).await);
         }
         if stop.is_cancelled() {
             merged.ok = false;
@@ -941,6 +1477,10 @@ pub async fn run_worker(ctx: &Ctx, mut spec: RunSpec, opts: WorkerOpts<'_>) -> O
             let mut mail = has_mail(st, &slot);
             // 끝낸 뒤에 총괄·사용자가 보낸 지시도 받도록, 같은 단계의 다른 워커가 일하는 동안 기다린다.
             if let (false, Some(crew)) = (mail, opts.crew) {
+                // 쉬기 전에 지금까지 바꾼 파일을 메인 폴더에 반영하고 총괄이 검토해 커밋한다.
+                wait_note("commit");
+                checkpoint(ctx, opts.key, &parsed.clean).await;
+                org_report_solo(ctx, opts.key, &parsed.clean);
                 crew.rest();
                 resting = true;
                 wait_note("idle");
@@ -968,6 +1508,150 @@ pub async fn run_worker(ctx: &Ctx, mut spec: RunSpec, opts: WorkerOpts<'_>) -> O
     merged
 }
 
+/// 한 단계의 워커 작업 공간. 워커가 쉴 때마다 바꾼 파일을 메인 폴더에 반영한다.
+pub struct StageGate {
+    root: PathBuf,
+    scope: teamwork::Scope,
+    keys: Mutex<HashMap<String, usize>>,
+    units: Mutex<Vec<GateUnit>>,
+    /// 총괄이 풀지 못해 통합 AI에게 넘길 충돌
+    open: Mutex<Vec<Clash>>,
+}
+
+struct GateUnit {
+    title: String,
+    who: String,
+    dir: PathBuf,
+    /// 워커 작업 공간을 마지막으로 반영한 때의 상태(처음에는 단계의 기준)
+    last: Arc<teamwork::Snapshot>,
+    files: BTreeSet<String>,
+}
+
+/// 메인 폴더에 반영하지 못한 워커 판
+#[derive(Debug, Clone)]
+pub struct Clash {
+    pub path: String,
+    pub who: String,
+    pub copy: PathBuf,
+    pub deleted: bool,
+}
+
+/// 단계의 하위 작업 하나: (실행 key들, 이름, 맡은 AI, 작업 공간)
+pub type UnitSpec = (Vec<String>, String, String, PathBuf);
+
+impl StageGate {
+    pub fn new(root: PathBuf, base: Arc<teamwork::Snapshot>, units: Vec<UnitSpec>) -> Self {
+        let mut keys = HashMap::new();
+        let units = units
+            .into_iter()
+            .enumerate()
+            .map(|(i, (ks, title, who, dir))| {
+                for k in ks {
+                    keys.insert(k, i);
+                }
+                GateUnit { title, who, dir, last: base.clone(), files: BTreeSet::new() }
+            })
+            .collect();
+        StageGate { root, scope: base.scope, keys: Mutex::new(keys), units: Mutex::new(units), open: Mutex::new(vec![]) }
+    }
+
+    /// 단계 중에 늘린 워커의 작업 공간을 더한다. base는 그 공간을 만든 때의 메인 폴더 상태다.
+    pub fn add_unit(&self, key: &str, title: String, who: String, dir: PathBuf, base: Arc<teamwork::Snapshot>) {
+        let mut units = self.units.lock().unwrap_or_else(|p| p.into_inner());
+        units.push(GateUnit { title, who, dir, last: base, files: BTreeSet::new() });
+        self.keys.lock().unwrap_or_else(|p| p.into_inner()).insert(key.to_string(), units.len() - 1);
+    }
+
+    /// 이 key의 하위 작업에서 메인 폴더에 반영한 파일
+    pub fn files_of(&self, key: &str) -> Vec<String> {
+        let i = self.keys.lock().unwrap_or_else(|p| p.into_inner()).get(key).copied();
+        i.map(|i| self.files(i)).unwrap_or_default()
+    }
+
+    /// 이 하위 작업에서 메인 폴더에 반영한 파일
+    pub fn files(&self, i: usize) -> Vec<String> {
+        self.units.lock().unwrap_or_else(|p| p.into_inner()).get(i).map(|u| u.files.iter().cloned().collect()).unwrap_or_default()
+    }
+
+    /// 통합 AI에게 넘길 충돌(가져가면 비운다)
+    pub fn take_open(&self) -> Vec<Clash> {
+        std::mem::take(&mut *self.open.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+}
+
+/// 워커(또는 그룹)가 바꾼 파일을 메인 폴더에 반영하고, 저장소면 총괄이 검토·보정해 커밋한다.
+/// 메인 폴더 파일이 워커가 본 판과 다르면 덮지 않고 충돌로 넘긴다(총괄이 검토에서 합치거나 통합 AI가 합친다).
+pub async fn checkpoint(ctx: &Ctx, key: &str, summary: &str) {
+    let lead = &ctx.lead;
+    let Some(gate) = lead.stage.lock().unwrap_or_else(|p| p.into_inner()).clone() else { return };
+    let Some(i) = gate.keys.lock().unwrap_or_else(|p| p.into_inner()).get(key).copied() else { return };
+    let Some(_main) = wait_or_stop(lead.merge.lock(), &lead.cancel).await else { return };
+    let (dir, last, title, who) = {
+        let u = &gate.units.lock().unwrap_or_else(|p| p.into_inner())[i];
+        (u.dir.clone(), u.last.clone(), u.title.clone(), u.who.clone())
+    };
+    let (d, scope) = (dir.clone(), gate.scope);
+    let Ok(Ok(snap)) = tokio::task::spawn_blocking(move || teamwork::snapshot_like(&d, scope)).await else { return };
+    let changes = teamwork::diff(&last, &snap);
+    if changes.paths().is_empty() {
+        return;
+    }
+    let repo = lead.repo.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let before = match &repo {
+        Some(r) => Some(dirty_now(r).await),
+        None => None,
+    };
+    let (root, d, l, c) = (gate.root.clone(), dir.clone(), last.clone(), changes.clone());
+    let applied = tokio::task::spawn_blocking(move || teamwork::apply_checked(&root, &d, &l, &c)).await.unwrap_or_default();
+    {
+        let mut units = gate.units.lock().unwrap_or_else(|p| p.into_inner());
+        units[i].last = Arc::new(snap);
+        units[i].files.extend(applied.written.iter().cloned());
+    }
+    if !applied.written.is_empty() {
+        note(ctx, "merge", format!("'{title}' 변경 {}개를 메인 폴더에 반영", applied.written.len()));
+    }
+    for e in applied.errors.iter().take(3) {
+        note(ctx, "warn", e.clone());
+    }
+    let clashes: Vec<Clash> = applied.clashes.iter().map(|(path, deleted)| Clash { path: path.clone(), who: format!("{title} · {who}"), copy: dir.clone(), deleted: *deleted }).collect();
+    if !clashes.is_empty() {
+        note(ctx, "conflict", format!("'{title}' 충돌 {}개: {}", clashes.len(), clashes.iter().map(|c| c.path.as_str()).take(5).collect::<Vec<_>>().join(", ")));
+    }
+    let (Some(repo), Some(before)) = (repo, before) else {
+        gate.open.lock().unwrap_or_else(|p| p.into_inner()).extend(clashes);
+        return;
+    };
+    let (r, b) = (repo.clone(), before.clone());
+    let (changed, diff, log) = tokio::task::spawn_blocking(move || {
+        let changed = gitops::changed_between(&b, &r.dirty());
+        let diff = r.diff(&changed);
+        (changed, diff, r.recent_log(5))
+    })
+    .await
+    .unwrap_or_default();
+    if changed.is_empty() && clashes.is_empty() {
+        return;
+    }
+    note(ctx, "review", format!("'{title}' 변경을 메인에 넣어도 되는지 검토"));
+    let conflicts: Vec<(String, String)> = clashes.iter().map(|c| (c.path.clone(), if c.deleted { "(워커가 지움)".to_string() } else { teamwork::version_path(&c.copy, &c.path) })).collect();
+    let prompt = lead::commit_review_prompt(&lead.context(), &title, &cut(summary, 3000), &changed, &diff, &conflicts, &log);
+    let o = lead_work_run(ctx, prompt, &lead.cancel).await;
+    let (plan, clean) = lead::parse_commit(&o.text);
+    if !o.ok || lead.cancel.is_cancelled() {
+        note(ctx, "warn", format!("'{title}' 검토를 끝내지 못했습니다. 변경은 메인 폴더에 남겨 통합에서 다시 봅니다."));
+        lead.pending.lock().unwrap_or_else(|p| p.into_inner()).extend(changed);
+        gate.open.lock().unwrap_or_else(|p| p.into_inner()).extend(clashes);
+        return;
+    }
+    if let Some(p) = plan.as_ref().filter(|p| !p.note.trim().is_empty()) {
+        note(ctx, "info", format!("검토 메모: {}", cut(&p.note, 200)));
+    } else if !clean.trim().is_empty() {
+        note(ctx, "info", format!("검토 메모: {}", cut(clean.trim(), 200)));
+    }
+    commit_changes(ctx, &repo, &before, plan, &format!("chore: {title}")).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -980,10 +1664,25 @@ mod tests {
     }
 
     #[test]
-    fn queued_result_tells_worker_to_continue_or_end_turn() {
-        let n = queued_note("x", Some(2));
-        assert!(n.contains("2번째") && n.contains("다른 작업") && n.contains("차례를 끝내"), "{n}");
-        assert!(queued_note("x", None).contains("시작"));
+    fn started_note_tells_worker_not_to_wait() {
+        let n = started_note("./gradlew build");
+        assert!(n.contains("./gradlew build") && n.contains("백그라운드") && n.contains("기다리지 말고"), "{n}");
+    }
+
+    #[tokio::test]
+    async fn finished_jobs_are_taken_and_running_ones_stay() {
+        let done = tokio::spawn(async { "A".to_string() });
+        let slow = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            "B".to_string()
+        });
+        while !done.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let mut pending = vec![PendingTest { handle: done }, PendingTest { handle: slow }];
+        assert_eq!(take_finished(&mut pending).await, vec!["A"]);
+        assert_eq!(pending.len(), 1);
+        pending[0].handle.abort();
     }
 
     #[test]
@@ -1068,10 +1767,67 @@ mod tests {
         assert_eq!(n.say, "그냥 쓴 글");
         let (n, missed) = note_or_miss(None, String::new(), &mut misses);
         assert!(missed && n.done, "두 번 연속이면 끝낸 것으로 본다");
-        let ok = lead::GroupNote { say: "s".into(), claim: vec![], done: false };
+        let ok = lead::GroupNote { say: "s".into(), ..Default::default() };
         let (n, missed) = note_or_miss(Some(ok), String::new(), &mut misses);
         assert!(!missed && !n.done);
         assert_eq!(misses, 0, "제대로 쓰면 다시 센다");
+    }
+
+    #[test]
+    fn leader_plans_alone_in_the_first_round() {
+        let all = [m(true, false, false), m(true, false, false), m(true, false, false)];
+        assert_eq!(first_round(&all, 0, 12).run, vec![0], "첫 라운드는 그룹장만");
+        assert_eq!(first_round(&all, 1, 12).run, vec![0, 1, 2]);
+        let no_leader = [m(false, false, false), m(true, false, false)];
+        assert_eq!(first_round(&no_leader, 0, 12).run, vec![1], "그룹장이 없으면 남은 그룹원이 제안한다");
+        assert!(member_start_prompt("일", "그룹원 2", Some("그룹원 2: b.rs")).contains("b.rs"));
+        assert!(member_start_prompt("일", "그룹원 2", None).contains("제안"));
+    }
+
+    #[test]
+    fn members_get_only_what_they_have_not_seen() {
+        let names: Vec<String> = (1..=3).map(|i| format!("그룹원 {i}")).collect();
+        let log = vec![Said { who: 0, round: 0, text: "분담".into() }, Said { who: 1, round: 1, text: "a 끝".into() }, Said { who: 2, round: 1, text: String::new() }, Said { who: 0, round: 1, text: "b 시작".into() }];
+        assert_eq!(unseen(&log, 1, 1, &names).iter().map(|x| x.1.as_str()).collect::<Vec<_>>(), vec!["b 시작"], "자기 글·빈 글·이미 본 글은 뺀다");
+        let plan = Said { who: 0, round: 0, text: "분".repeat(GROUP_OLD_CHARS + 100) };
+        let long = Said { who: 1, round: 1, text: "가".repeat(GROUP_OLD_CHARS + 100) };
+        let r = recap(&[plan, long, Said { who: 0, round: 2, text: "새 글".into() }], 2, &names);
+        assert_eq!(r[0].1.chars().count(), GROUP_OLD_CHARS + 100, "역할 분담은 줄이지 않는다");
+        assert_eq!(r[1].1.chars().count(), GROUP_OLD_CHARS, "이미 본 글은 줄인다(자기 글도 준다)");
+        assert_eq!(r[2].1, "새 글");
+        assert_eq!(group_followup_with(&[], false, false), "이어서 맡은 일을 하세요.\n끝에 elysium-group 블록을 쓰세요.", "새 글이 없으면 머리말도 없다");
+    }
+
+    #[test]
+    fn group_ends_with_a_digest_instead_of_another_turn() {
+        let names: Vec<String> = vec!["그룹원 1".into(), "그룹원 2".into()];
+        let claims = vec![BTreeSet::from(["a.rs".to_string()]), BTreeSet::new()];
+        let d = group_digest(&names, &["a 완료".into(), String::new()], &claims);
+        assert_eq!(d, "- 그룹원 1 (파일: a.rs): a 완료");
+        assert!(group_digest(&names, &[String::new(), String::new()], &claims).is_empty());
+    }
+
+    #[test]
+    fn org_board_delivers_each_report_once_to_peers_only() {
+        let leaders = HashMap::from([("agent:0".to_string(), 0), ("agent:1".to_string(), 1), ("agent:2".to_string(), 2)]);
+        let b = OrgBoard::new(vec!["화면".into(), "서버".into(), "문서".into()], vec![vec![1], vec![0], vec![]], leaders);
+        assert_eq!(b.part_of("agent:2"), None, "받을 팀이 없으면 보고하지 않는다");
+        assert!(b.post(0, "화면 API 정함").is_some());
+        assert!(b.post(0, "화면 API 정함").is_none(), "같은 말은 다시 올리지 않는다");
+        assert_eq!(b.take(1), vec![("화면".to_string(), "화면 API 정함".to_string())]);
+        assert!(b.take(1).is_empty(), "한 번 받은 보고는 다시 주지 않는다");
+        assert!(b.take(0).is_empty(), "자기 보고는 받지 않는다");
+        assert!(board_prompt(&[("화면".into(), "x".into())]).contains("- 화면: x"));
+        assert_eq!(team_report("", &[("그룹원 1".into(), "a".into()), ("그룹원 2".into(), String::new())]), "그룹원 1: a");
+        assert_eq!(team_report("요약", &[]), "요약");
+    }
+
+    #[test]
+    fn solo_report_keeps_the_end_of_long_text() {
+        let text = format!("{}\n요약: 끝", "가".repeat(ORG_POST_CHARS * 2));
+        let r = solo_report(&text);
+        assert!(r.ends_with("요약: 끝") && r.chars().count() <= ORG_POST_CHARS);
+        assert_eq!(solo_report(" 짧음 "), "짧음");
     }
 
     #[test]
@@ -1132,7 +1888,7 @@ mod tests {
     fn window_ruling_gets_the_window_timeout() {
         let req = WorkerRequest { command: "x".into(), why: String::new(), kind: Kind::Command, timeout_sec: None };
         assert_eq!(timeout_for(&req, false), 600);
-        assert_eq!(timeout_for(&req, true), 1800, "총괄이 게임 테스트로 본 명령");
+        assert_eq!(timeout_for(&req, true), 1800, "총괄이 창 테스트로 본 명령");
     }
 
     #[test]
@@ -1196,7 +1952,7 @@ mod tests {
         assert!(ok.clearly_safe() && !ok.opens_window() && !ok.needs_person());
         assert!(!CommandJudgment { safe: 0.8, ..ok }.clearly_safe());
         assert!(!CommandJudgment { in_scope: 0.6, ..ok }.clearly_safe());
-        assert!(!CommandJudgment { window: 0.6, ..ok }.clearly_safe(), "게임 창은 총괄이 본다");
+        assert!(!CommandJudgment { window: 0.6, ..ok }.clearly_safe(), "창이 뜨면 총괄이 본다");
         assert!(CommandJudgment { window: 0.5, ..ok }.opens_window());
         assert!(CommandJudgment { manual: 0.6, ..ok }.needs_person());
     }

@@ -13,6 +13,13 @@ function when(iso: string | null): string {
   return `${new Date(iso).toLocaleDateString("ko-KR", { month: "short", day: "numeric" })} 접속`;
 }
 
+/** 다른 네트워크 연결 상태 표시 */
+const RELAY_TAG: Record<"starting" | "online" | "error", string> = {
+  starting: "외부 연결 준비 중",
+  online: "외부 연결 가능",
+  error: "외부 연결 불가 (로컬 가능)",
+};
+
 /** 설정 → 폰 연결: 원격 제어 켜기, 페어링 QR, 연결된 기기. */
 export default function RemoteSection() {
   const { toast } = useApp();
@@ -29,6 +36,13 @@ export default function RemoteSection() {
       api.remotePairCancel().catch(() => {});
     };
   }, [load]);
+
+  // 외부 연결을 준비하는 동안은 상태를 다시 읽는다.
+  useEffect(() => {
+    if (st?.relay !== "starting") return;
+    const t = setTimeout(load, 2500);
+    return () => clearTimeout(t);
+  }, [st, load]);
 
   // 폰이 페어링을 마치면 QR을 닫고 목록을 새로 읽는다.
   useTauriEvent("remote:changed", () => {
@@ -52,10 +66,10 @@ export default function RemoteSection() {
   if (!st) return null;
   const on = st.config.enabled;
 
-  async function configure(enabled: boolean, allowApprove: boolean) {
+  async function configure(enabled: boolean, allowApprove: boolean, relay?: boolean) {
     setBusy(true);
     try {
-      setSt(await api.remoteConfigure(enabled, allowApprove));
+      setSt(await api.remoteConfigure(enabled, allowApprove, relay));
       if (!enabled) setPair(null);
     } catch (e) {
       toast(errorText(e), "error");
@@ -93,6 +107,13 @@ export default function RemoteSection() {
             </span>
             <input type="checkbox" className="switch" role="switch" checked={st.config.allowApprove} disabled={busy} onChange={(e) => configure(true, e.target.checked)} />
           </label>
+          <label className="toggle-row">
+            <span>
+              {"외부 네트워크 연결 허용"}
+              <small>{"포트 포워딩 없이 작동하며, 직접 연결이 어려울 때는 암호화된 데이터만 전달하는 공용 릴레이를 통해 연결됩니다. 기존과 동일한 인증서 및 기기 토큰 검증이 적용되어 안전합니다."}</small>
+            </span>
+            <input type="checkbox" className="switch" role="switch" checked={st.config.relay} disabled={busy} onChange={(e) => configure(true, st.config.allowApprove, e.target.checked)} />
+          </label>
 
           <div className="remote-addr">
             {st.running ? (
@@ -104,11 +125,14 @@ export default function RemoteSection() {
             ) : (
               <span className="tag warn">서버가 꺼져 있습니다</span>
             )}
+            {st.running && st.relay && <span className={`tag ${st.relay === "online" ? "ok" : st.relay === "error" ? "warn" : ""}`}>{RELAY_TAG[st.relay]}</span>}
           </div>
           <p className="help">
-            {tailscale
-              ? "밖에서는 Tailscale 주소로 연결합니다(폰에도 Tailscale을 켜 두세요)."
-              : "밖에서 쓰려면 PC와 폰에 Tailscale을 설치해 같은 계정으로 로그인하거나, 공유기에서 이 포트를 포트 포워딩하세요."}{" "}
+            {st.relay === "online"
+              ? "페어링된 휴대전화는 동일한 Wi-Fi는 물론 외부에서도 자동으로 연결됩니다. 이전에 등록한 기기는 재페어링 없이 동일한 Wi-Fi에 한 번만 연결하면 새 경로를 자동으로 인식합니다."
+              : tailscale
+                ? "밖에서는 Tailscale 주소로 연결합니다(폰에도 Tailscale을 켜 두세요)."
+                : "포트 포워딩 없이 외부에서도 휴대전화를 연결하려면 위의 '외부 네트워크 연결 허용'을 켜세요."}{" "}
             처음 켤 때 Windows 방화벽이 묻으면 개인 네트워크를 허용하세요.
           </p>
 

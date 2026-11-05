@@ -214,6 +214,70 @@ pub(crate) async fn powershell(root: &Path, command: &str, secs: u64) -> Result<
     }
 }
 
+/// 출력을 줄마다 on_line으로 흘려 보내며 실행한다(게임 테스트 로그). 결과는 powershell과 같은 형식이다.
+pub(crate) async fn powershell_live(root: &Path, command: &str, secs: u64, on_line: impl Fn(&str) + Send + Sync) -> Result<String, String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let script = format!("$ProgressPreference='SilentlyContinue'; [Console]::OutputEncoding=[System.Text.Encoding]::UTF8; {command}");
+    let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let enc = base64(&utf16);
+    let mut c = crate::engines::command(Path::new("powershell.exe"));
+    c.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", enc.as_str()])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = c.spawn().map_err(|e| format!("PowerShell을 실행할 수 없습니다: {e}"))?;
+    let mut guard = TreeGuard(child.id());
+    let (out, err) = (child.stdout.take(), child.stderr.take());
+    // 결과로 돌려줄 글은 끝부분만 둔다(로그가 수 MB가 될 수 있다).
+    let text = std::sync::Mutex::new(String::new());
+    let keep = |line: &str| {
+        on_line(line);
+        let mut t = text.lock().unwrap_or_else(|p| p.into_inner());
+        t.push_str(line);
+        t.push('\n');
+        if t.len() > MAX_OUT * 8 {
+            let cut = t.len() - MAX_OUT * 4;
+            let at = (cut..t.len()).find(|i| t.is_char_boundary(*i)).unwrap_or(t.len());
+            t.drain(..at);
+        }
+    };
+    async fn pump<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>, f: &(dyn Fn(&str) + Sync)) {
+        let Some(pipe) = pipe else { return };
+        let mut r = BufReader::new(pipe);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match r.read_until(b'\n', &mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => f(String::from_utf8_lossy(&buf).trim_end()),
+            }
+        }
+    }
+    let run = async {
+        tokio::join!(pump(out, &keep), pump(err, &keep));
+        child.wait().await
+    };
+    let waited = tokio::time::timeout(Duration::from_secs(secs), run).await;
+    if matches!(waited, Ok(Ok(_))) {
+        guard.0 = None;
+    }
+    let body = text.into_inner().unwrap_or_else(|p| p.into_inner());
+    match waited {
+        Ok(Ok(status)) => {
+            let code = status.code().unwrap_or(-1);
+            let body = format!("종료 코드 {code}\n{}", clip(body.trim()));
+            if status.success() {
+                Ok(body)
+            } else {
+                Err(body)
+            }
+        }
+        Ok(Err(e)) => Err(format!("PowerShell 실행 실패: {e}")),
+        Err(_) => Err(format!("{secs}초 안에 끝나지 않아 멈췄습니다\n{}", clip(body.trim()))),
+    }
+}
+
 /// 도구 하나를 실행한다. Err면 모델에게 오류로 돌려준다.
 async fn exec(sb: &mut Sandbox, name: &str, input: &Value) -> Result<String, String> {
     match name {
@@ -478,6 +542,7 @@ pub async fn run(http: &reqwest::Client, spec: &RunSpec, a: &Api, key: &str, mod
                 (text, calls)
             }
         };
+        on_event(&Event::Usage { input: usage.input + usage.cache_read + usage.cache_write, output: usage.output });
         if calls.is_empty() {
             // 답을 마치는 순간 온 메시지가 있으면 받아서 한 차례 더 이어간다.
             let extra = take_steer(spec);

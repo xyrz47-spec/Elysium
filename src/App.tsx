@@ -13,6 +13,7 @@ import Composer from "./components/Composer";
 import SettingsDialog from "./components/SettingsDialog";
 import SkillsDialog from "./components/SkillsDialog";
 import { FolderIcon } from "./components/Icons";
+import SleepScreen from "./components/SleepScreen";
 import { GlassDefs, useGlassLight, useLiquidRefraction } from "./lib/glass";
 
 /** 세션 머리: 제목과 이 세션의 작업 폴더(눌러서 바꾸기) */
@@ -180,6 +181,7 @@ export default function App() {
       {dialog === "skills" && <SkillsDialog />}
       {dialog === "usage" && <UsageDialog />}
       <ConfirmDialog />
+      <SleepScreen />
       <div className="toasts" role="status">
         {toasts.map((t) => (
           <div key={t.id} className={`toast ${t.kind}`}>

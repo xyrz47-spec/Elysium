@@ -4,6 +4,56 @@ import { API_SECRET, api, errorText, type ApiId, type AppInfo, type EngineInfo, 
 import { useApp } from "../store";
 import { CloseIcon, FolderIcon, RefreshIcon } from "./Icons";
 import Segmented from "./Segmented";
+import { loadAutoSleep, loadMonitorOff, saveAutoSleep, saveMonitorOff, setSleep } from "../lib/sleep";
+
+const SLEEP = {
+  title: "취침 모드",
+  help: "화면을 꺼 전력을 절약하며 AI 작업은 최고 속도로 중단 없이 계속 실행됩니다. 마우스를 클릭하거나 아무 키나 누르면 언제든 원래 화면으로 돌아옵니다.",
+  auto: "자동 취침 전환",
+  off: "끔",
+  minutes: "{n}분",
+  monitor: "취침 시 모니터 끄기",
+  now: "지금 시작",
+};
+const AUTO_CHOICES = [0, 10, 30, 60];
+
+/** 취침 모드: 지금 켜기, 자동 전환, 모니터 끄기 */
+function SleepSettings() {
+  const [auto, setAuto] = useState(loadAutoSleep);
+  const [monitor, setMonitor] = useState(loadMonitorOff);
+  return (
+    <>
+      <div className="sleep-row">
+        <span>{SLEEP.auto}</span>
+        <Segmented
+          label={SLEEP.auto}
+          value={String(auto)}
+          options={AUTO_CHOICES.map((m) => ({ value: String(m), label: m ? SLEEP.minutes.replace("{n}", String(m)) : SLEEP.off }))}
+          onChange={(v) => {
+            setAuto(Number(v));
+            saveAutoSleep(Number(v));
+          }}
+        />
+      </div>
+      <label className="sleep-row check">
+        <input
+          type="checkbox"
+          checked={monitor}
+          onChange={(e) => {
+            setMonitor(e.target.checked);
+            saveMonitorOff(e.target.checked);
+          }}
+        />
+        <span>{SLEEP.monitor}</span>
+        <div className="spacer" />
+        <button className="btn sm" onClick={() => setSleep(true)}>
+          {SLEEP.now}
+        </button>
+      </label>
+      <p className="help">{SLEEP.help}</p>
+    </>
+  );
+}
 import RemoteSection from "./RemoteSection";
 import { A as AGENT_TEXT, agentChoice } from "./Tools";
 
@@ -338,9 +388,20 @@ export default function SettingsDialog({ focusKeys = false }: { focusKeys?: bool
           <p className="help">{REVIEW.find((r) => r.id === settings.review)?.help}</p>
         </Section>
 
+        <Section title={SLEEP.title} i={4}>
+          <SleepSettings />
+        </Section>
+
         <Section title={LT.queue} i={4}>
           <SlotsPicker />
           <p className="help">{LT.slotsHelp}</p>
+          <label className="toggle-row">
+            <span>
+              {"작업 결과 검토 및 선별 커밋"}
+              <small>{"Git 저장소에서만 동작하며, 워커는 프로젝트의 .elysium/worktrees 폴더에서 작업합니다. 워커가 작업을 마칠 때마다 총괄 AI가 변경 사항을 검토·보완한 뒤, 다른 미커밋 변경 사항은 그대로 두고 해당 파일만 안전하게 커밋합니다."}</small>
+            </span>
+            <input type="checkbox" className="switch" role="switch" checked={settings.leadCommit ?? true} onChange={(e) => saveSettings({ ...settings, leadCommit: e.target.checked })} />
+          </label>
         </Section>
 
         <Section title={AGENT_TEXT.preset} i={4}>

@@ -15,12 +15,12 @@ interface Look {
   glitch: number;
 }
 
-// 회백색(.86,.88,.9) 구에 청록(.47,.72,.70)을 살짝 섞는다.
+// 로고의 별(위: 별빛 흰 민트)과 오로라(아래: 청록). 처리 중에는 오로라가 민트로 밝아지고, 허락 대기는 금빛.
 const LOOK: Record<OrbMode, Look> = {
   off: { a: [0.6, 0.62, 0.66], b: [0.4, 0.42, 0.46], energy: 0.03, spin: 0.05, swirl: 0, spread: 0, glitch: 0 },
-  idle: { a: [0.88, 0.9, 0.92], b: [0.47, 0.72, 0.7], energy: 0.07, spin: 0.16, swirl: 0, spread: 0, glitch: 0 },
-  thinking: { a: [0.88, 0.9, 0.92], b: [0.47, 0.72, 0.7], energy: 0.12, spin: 0.9, swirl: 1.0, spread: 0.04, glitch: 0 },
-  approval: { a: [0.88, 0.7, 0.42], b: [0.6, 0.62, 0.66], energy: 0.1, spin: 0.2, swirl: 0, spread: 0, glitch: 0 },
+  idle: { a: [0.9, 0.98, 0.96], b: [0.47, 0.8, 0.72], energy: 0.07, spin: 0.16, swirl: 0, spread: 0, glitch: 0 },
+  thinking: { a: [0.9, 1.0, 0.98], b: [0.62, 0.92, 0.85], energy: 0.12, spin: 0.9, swirl: 1.0, spread: 0.04, glitch: 0 },
+  approval: { a: [0.91, 0.79, 0.55], b: [0.47, 0.8, 0.72], energy: 0.1, spin: 0.2, swirl: 0, spread: 0, glitch: 0 },
   error: { a: [0.91, 0.47, 0.44], b: [0.4, 0.42, 0.46], energy: 0.08, spin: 0.08, swirl: 0, spread: 0.05, glitch: 1 },
 };
 
@@ -125,7 +125,13 @@ function compile(gl: WebGL2RenderingContext, type: number, src: string) {
   return s;
 }
 
-function buildGeometry() {
+/** 입자 수. lite(폰)는 GPU가 약하고 화면이 작아 적게 그린다. */
+function counts(lite: boolean) {
+  return lite ? { SPHERE: 2200, HALO: 800, FIELD: 1000, MOTES: 36 } : { SPHERE, HALO, FIELD, MOTES };
+}
+
+function buildGeometry(lite: boolean) {
+  const { SPHERE, HALO, FIELD, MOTES } = counts(lite);
   const n = SPHERE + HALO + FIELD + MOTES;
   const pos = new Float32Array(n * 3);
   const seed = new Float32Array(n);
@@ -164,18 +170,18 @@ function buildGeometry() {
 
 /** 구가 자리 잡을 곳: 첫 화면의 큰 자리(data-orb-anchor)가 먼저, 대화 중에는 머리의 작은 상태 구 자리(data-orb-anchor="mini").
  *  둘 다 없으면 본문 가운데에 크고 옅게. */
-function target(dpr: number) {
+function target(dpr: number, ox = 0, oy = 0) {
   const anchor =
     document.querySelector<HTMLElement>('[data-orb-anchor]:not([data-orb-anchor="mini"])') ?? document.querySelector<HTMLElement>('[data-orb-anchor="mini"]');
   if (anchor) {
     const r = anchor.getBoundingClientRect();
     // 작은 상태 구는 입자가 겹쳐 하얗게 뭉치지 않도록 옅게
-    if (r.width > 0) return { x: (r.left + r.width / 2) * dpr, y: (r.top + r.height / 2) * dpr, radius: (r.width / 2) * dpr, dim: r.width < 80 ? 0.42 : 1 };
+    if (r.width > 0) return { x: (r.left - ox + r.width / 2) * dpr, y: (r.top - oy + r.height / 2) * dpr, radius: (r.width / 2) * dpr, dim: r.width < 80 ? 0.42 : 1 };
   }
   const main = document.querySelector<HTMLElement>(".main")?.getBoundingClientRect();
   const w = main?.width ?? innerWidth;
   const h = main?.height ?? innerHeight;
-  return { x: ((main?.left ?? 0) + w / 2) * dpr, y: ((main?.top ?? 0) + h * 0.46) * dpr, radius: Math.min(w, h) * 0.34 * dpr, dim: 0.22 };
+  return { x: ((main?.left ?? 0) - ox + w / 2) * dpr, y: ((main?.top ?? 0) - oy + h * 0.46) * dpr, radius: Math.min(w, h) * 0.34 * dpr, dim: 0.22 };
 }
 
 /**
@@ -183,7 +189,7 @@ function target(dpr: number) {
  * 대화를 열면 본문 뒤로 미끄러지듯 커지며 옅어진다. 구 둘레 먼지와 성운이 창 끝까지 이어진다.
  * WebGL2를 쓸 수 없으면 아무것도 그리지 않는다(바탕색과 CSS 빛만 남는다).
  */
-export default function ParticleOrb({ mode }: { mode: OrbMode }) {
+export default function ParticleOrb({ mode, lite = false }: { mode: OrbMode; lite?: boolean }) {
   const ref = useRef<HTMLCanvasElement>(null);
   const glowRef = useRef<HTMLDivElement>(null);
   const modeRef = useRef(mode);
@@ -205,7 +211,9 @@ export default function ParticleOrb({ mode }: { mode: OrbMode }) {
       return;
     }
     gl.useProgram(prog);
-    const geo = buildGeometry();
+    const geo = buildGeometry(lite);
+    // 폰은 화면 배율이 3배까지 올라가 픽셀 수가 9배가 된다. 입자 배경은 1.25배면 충분하다.
+    const maxDpr = lite ? 1.25 : 2;
     const vao = gl.createVertexArray();
     gl.bindVertexArray(vao);
     const attr = (name: string, data: Float32Array, size: number) => {
@@ -229,7 +237,7 @@ export default function ParticleOrb({ mode }: { mode: OrbMode }) {
 
     let dpr = 1;
     const fit = () => {
-      dpr = Math.min(window.devicePixelRatio || 1, 2);
+      dpr = Math.min(window.devicePixelRatio || 1, maxDpr);
       canvas.width = Math.round(canvas.clientWidth * dpr);
       canvas.height = Math.round(canvas.clientHeight * dpr);
       gl.viewport(0, 0, canvas.width, canvas.height);
@@ -259,7 +267,9 @@ export default function ParticleOrb({ mode }: { mode: OrbMode }) {
       raf = requestAnimationFrame(draw);
       // 고주사율 화면에서도 60fps, 대화 화면(구가 옅을 때)에서는 30fps면 충분하다. 뒤가 덜 바뀌면 유리 판의 backdrop-filter도 덜 다시 계산된다.
       // 작은 상태 구(대화 중)나 옅은 구는 30fps면 충분하다.
-      const budget = (at.dim < 0.5 || at.radius / dpr < 40) && modeRef.current !== "thinking" ? 1000 / 30 : 1000 / 60;
+      const calm = (at.dim < 0.5 || at.radius / dpr < 40) && modeRef.current !== "thinking";
+      // 폰: 처리 중 30fps, 그 밖에는 20fps(배터리·발열)
+      const budget = lite ? (calm ? 1000 / 20 : 1000 / 30) : calm ? 1000 / 30 : 1000 / 60;
       acc += now - tick;
       tick = now;
       if (acc < budget - 1) return;
@@ -283,7 +293,14 @@ export default function ParticleOrb({ mode }: { mode: OrbMode }) {
 
       // 첫 화면 ↔ 대화 화면 사이를 미끄러지듯 옮겨 간다.
       // 위치는 여섯 프레임에 한 번만 잰다(매 프레임 강제 레이아웃 방지). 사이는 보간이 메운다.
-      if (frame++ % 6 === 0) to = target(dpr);
+      if (frame++ % 6 === 0) {
+        // 캔버스가 지금 보이는 크기·배율과 어긋났으면 다시 맞춘다. 폰 앱은 뜨는 도중에 화면 크기·배율이 바뀌는데
+        // 크기 감시(ResizeObserver)가 배율만 바뀐 경우를 놓치면 구체가 왼쪽 위로 작게 밀려 그려진다.
+        const box = canvas.getBoundingClientRect();
+        const want = Math.min(window.devicePixelRatio || 1, maxDpr);
+        if (box.width > 0 && (want !== dpr || Math.abs(Math.round(box.width * want) - canvas.width) > 1 || Math.abs(Math.round(box.height * want) - canvas.height) > 1)) fit();
+        to = target(dpr, box.left, box.top);
+      }
       at.x = ease(at.x, to.x, 0.07);
       at.y = ease(at.y, to.y, 0.07);
       at.radius = ease(at.radius, to.radius, 0.07);
@@ -335,19 +352,23 @@ export default function ParticleOrb({ mode }: { mode: OrbMode }) {
     const onVis = () => {
       cancelAnimationFrame(raf);
       raf = 0;
-      if (!document.hidden) {
+      if (!document.hidden && !document.documentElement.hasAttribute("data-sleep")) {
         last = tick = performance.now();
         acc = 0;
         raf = requestAnimationFrame(draw);
       }
     };
     document.addEventListener("visibilitychange", onVis);
+    window.addEventListener("elysium:sleep", onVis);
     return () => {
       cancelAnimationFrame(raf);
       document.removeEventListener("visibilitychange", onVis);
+      window.removeEventListener("elysium:sleep", onVis);
       // 개발 모드(StrictMode)는 같은 캔버스로 다시 마운트하므로 컨텍스트를 버리지 않는다.
       ro.disconnect();
     };
+    // lite는 처음 한 번 정해지고 바뀌지 않는다.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (

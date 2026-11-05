@@ -1273,3 +1273,150 @@ body { background-image: var(--vignette), var(--horizon), var(--sky); background
   .worker-side { overflow: visible; }
   .worker-live { min-height: 240px; }
 }
+
+/* 실시간 토큰 사용량 칩 */
+.token-meter { display: inline-flex; align-items: center; gap: 7px; justify-self: start; width: fit-content; padding: 3px 10px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--line); color: var(--muted); font-family: var(--mono); font-size: 11px; font-variant-numeric: tabular-nums; animation: fade 0.3s var(--ease) both; }
+.token-meter b { font-family: var(--font); font-weight: 700; color: var(--dim); font-size: 11px; }
+.token-meter .token-cost { color: var(--accent-ink); font-weight: 700; }
+.token-meter > i { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: ring 1.2s ease-out infinite; }
+.token-meter.live { border-color: rgba(var(--accent-rgb), 0.3); }
+.token-meter.compact { gap: 5px; padding: 0 7px; font-size: 10.5px; }
+.card > .token-meter { margin: 2px 0 0; }
+
+
+/* ── 워커 창: 본체와 같은 리퀴드 글라스 ─────────────────────────── */
+.worker-inner { border-color: transparent; background: var(--glass-sheen), var(--glass-2, var(--rail)); -webkit-backdrop-filter: var(--glass-blur); backdrop-filter: var(--glass-blur); box-shadow: var(--glass-inner), var(--lg-pop-drop, var(--shadow-lg)); border-radius: 26px; gap: 14px; padding: 18px; }
+.worker-inner::before, .worker-card::before { content: ""; position: absolute; inset: -1px; border-radius: inherit; padding: 1px; pointer-events: none; background: var(--glass-rim); -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite: xor; mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0); }
+/* 일하는 동안 가장자리를 따라 옅은 빛이 천천히 돈다(본체의 진행 카드와 같다) */
+.worker-inner.run { border-color: transparent; box-shadow: var(--glass-inner), var(--lg-pop-drop, var(--shadow-lg)); }
+.worker-inner.run::before { background: conic-gradient(from var(--angle), rgba(var(--accent-rgb), 0.75), rgba(var(--accent-rgb), 0.08) 25%, rgba(var(--accent-rgb), 0.08) 75%, rgba(var(--accent-rgb), 0.75)); animation: border-run 4s linear infinite; }
+.worker-card { position: relative; border-color: transparent; background: var(--glass-sheen), var(--glass-ctl, var(--surface)); box-shadow: var(--glass-inner); border-radius: 20px; padding: 14px; }
+
+/* 머리: 상태 고리 + 엔진 줄 + 이름 */
+.worker-head { gap: 12px; border-bottom: 0; padding-bottom: 0; }
+.worker-status { flex: none; position: relative; width: 38px; height: 38px; border-radius: 50%; display: grid; place-items: center; background: radial-gradient(circle, rgba(var(--accent-rgb), 0.18), rgba(var(--accent-rgb), 0) 70%); }
+.worker-status::after { content: ""; position: absolute; inset: 3px; border-radius: 50%; border: 1.5px solid rgba(var(--accent-rgb), 0.35); }
+.worker-status i { width: 12px; height: 12px; border-radius: 50%; background: var(--off); }
+.worker-status.run i { background: var(--accent); box-shadow: 0 0 14px rgba(var(--accent-rgb), 0.8); }
+.worker-status.run::after { border-color: transparent; border-top-color: var(--accent); border-right-color: rgba(var(--accent-rgb), 0.4); animation: spin 1.4s linear infinite; }
+.worker-status.run.waiting::after { animation-duration: 3.2s; border-top-color: var(--accent-2); }
+.worker-status.ok i { background: var(--hl); }
+.worker-status.fail i { background: var(--err); }
+.worker-status.fail::after { border-color: rgba(var(--err-rgb), 0.4); }
+.worker-name { display: grid; min-width: 0; }
+.worker-kicker { font-family: var(--mono); font-size: 11px; letter-spacing: 0.02em; color: var(--accent-ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.worker-title h1 { font-size: 19px; }
+.worker-pill { flex: none; padding: 4px 11px; border-radius: 999px; font-size: 12px; font-weight: 700; color: var(--muted); background: var(--lg-ctl, var(--surface-2)); box-shadow: var(--lg-ctl-edge, none); }
+.worker-pill.run { color: var(--accent-ink); background: rgba(var(--accent-rgb), 0.16); }
+.worker-pill.ok { color: var(--accent-ink); }
+.worker-pill.fail { color: var(--err); background: rgba(var(--err-rgb), 0.1); }
+
+/* 숫자 타일 */
+.worker-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(92px, 1fr)); gap: 8px; }
+.worker-stat { position: relative; display: grid; gap: 2px; padding: 9px 12px; border-radius: 14px; background: var(--lg-ctl, var(--surface-2)); box-shadow: var(--lg-ctl-edge, none); animation: pop 0.35s var(--spring) both; }
+.worker-stat span { font-size: 11px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.worker-stat b { font-family: var(--mono); font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--ink); }
+.worker-stat b .worker-clock { padding: 0; border: 0; background: none; font-size: 16px; color: var(--ink); }
+.worker-stat.accent b { color: var(--accent-ink); }
+
+/* 실시간 출력: 터미널 창 */
+.worker-term { padding: 0; overflow: hidden; gap: 0; }
+.worker-term-head { display: flex; align-items: center; gap: 9px; padding: 9px 14px; border-bottom: 1px solid var(--line); background: rgba(var(--shade-rgb), 0.12); }
+.worker-term-head b { font-size: 12px; color: var(--muted); }
+.worker-term-dots { display: inline-flex; gap: 5px; }
+.worker-term-dots i { width: 9px; height: 9px; border-radius: 50%; background: var(--line-2); }
+.worker-term-dots i:first-child { background: rgba(var(--err-rgb), 0.55); }
+.worker-term-dots i:nth-child(2) { background: rgba(224, 178, 108, 0.55); }
+.worker-term-dots i:last-child { background: rgba(var(--hl-rgb), 0.6); }
+.worker-live-tag { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 700; color: var(--accent-ink); }
+.worker-live-tag i { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: ring 1.2s ease-out infinite; }
+.worker-term .worker-live { padding: 0; }
+.worker-term .worker-out { border-radius: 0 0 20px 20px; border: 0; padding: 14px 16px; }
+.worker-term .worker-empty { padding: 30px 0; }
+.worker-term .worker-jump { right: 14px; bottom: 14px; }
+
+/* 보내기 캡슐: 본체 입력창처럼 */
+.worker-compose { border-color: transparent; background: var(--glass-sheen), var(--lg-ctl, var(--surface)); box-shadow: var(--glass-inner), var(--lg-drop, var(--shadow)); border-radius: 20px; padding: 6px 6px 6px 8px; }
+.worker-compose:focus-within { border-color: transparent; box-shadow: var(--glass-inner), 0 0 0 3px rgba(var(--accent-rgb), 0.18), var(--lg-drop, var(--shadow)); }
+.worker-timeline li.latest .tag.tool { box-shadow: 0 0 0 1px rgba(var(--accent-rgb), 0.35); }
+
+
+/* 토큰 칩은 카드 안쪽 여백에 맞춘다 */
+.card > .token-meter { margin: 10px 22px 0; }
+/* 워커 창: 창이 낮아도 칸이 줄어들어 내용이 서로 겹치지 않는다. 넘치면 그 열이 스크롤된다. */
+.worker-head, .worker-foot { flex: none; }
+.worker-body { flex: 1 1 auto; min-height: 0; }
+.worker-main { overflow-y: auto; scrollbar-width: thin; }
+.worker-main > .worker-card, .worker-side > .worker-card { flex: none; }
+.worker-main > .worker-card.grow { flex: 1 0 auto; min-height: 280px; }
+@media (max-width: 760px) { .worker-main { overflow: visible; } }
+
+
+/* ── 토큰 단가표 & 계산기 ─────────────────────────────── */
+.pricing-view { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.pricing-top-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.price-list { display: grid; gap: 6px; max-height: 360px; overflow-y: auto; padding: 2px 4px 2px 0; scrollbar-width: thin; }
+.price-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 4px 12px; width: 100%; padding: 10px 14px; border-radius: 14px; border: 1px solid var(--line); background: var(--lg-ctl, var(--surface-2)); box-shadow: var(--lg-ctl-edge, none); color: var(--ink); text-align: left; cursor: pointer; transition: background 0.2s, border-color 0.2s, transform 0.2s var(--spring); }
+.price-row:hover { border-color: rgba(var(--accent-rgb), 0.35); transform: translateY(-1px); }
+.price-row.selected { border-color: rgba(var(--accent-rgb), 0.6); background: rgba(var(--accent-rgb), 0.1); }
+.price-id { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.price-id b { flex: none; font-size: 13px; }
+.price-id .model-code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.price-chips { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.price-chip { display: inline-flex; flex-direction: column; align-items: flex-end; min-width: 74px; padding: 3px 9px; border-radius: 9px; background: var(--surface); border: 1px solid var(--line); font-family: var(--mono); font-size: 12.5px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.price-chip small { font-family: var(--font); font-size: 10px; font-weight: 600; color: var(--dim); }
+.price-chip.dim { color: var(--muted); font-weight: 500; }
+.price-chip.free { flex-direction: row; color: var(--hl); }
+.price-row .price-desc { grid-column: 1 / -1; color: var(--dim); font-size: 11.5px; line-height: 1.4; }
+
+.pricing-calc-box { padding: 18px; border-radius: 20px; background: var(--glass-sheen, none), var(--lg-ctl, var(--surface-2)); border: 1px solid var(--line); box-shadow: var(--glass-inner, none); gap: 16px; }
+.calc-layout { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(220px, 1fr); gap: 16px; align-items: stretch; }
+.calc-inputs { display: grid; gap: 12px; min-width: 0; }
+.calc-field label { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.calc-amount { display: grid; gap: 6px; }
+.calc-select, .calc-input { width: 100%; min-width: 0; height: 40px; border-radius: 12px; background: var(--surface); }
+.calc-presets { display: flex; gap: 6px; }
+.calc-presets button { flex: 1; height: 28px; border-radius: 9px; border: 1px solid var(--line); background: var(--surface); color: var(--muted); font-family: var(--mono); font-size: 11.5px; transition: background 0.2s, color 0.2s; }
+.calc-presets button:hover { color: var(--ink); border-color: rgba(var(--accent-rgb), 0.35); }
+.calc-presets button.on { color: var(--accent-ink); background: rgba(var(--accent-rgb), 0.14); border-color: transparent; }
+.calc-result { display: flex; flex-direction: column; justify-content: center; gap: 4px; padding: 18px; border-radius: 18px; text-align: left; border: 1px solid rgba(var(--accent-rgb), 0.3); background: radial-gradient(120% 90% at 0% 0%, rgba(var(--accent-rgb), 0.16), transparent 60%), var(--surface); }
+.calc-res-usd { font-size: 30px; line-height: 1.1; }
+.calc-res-breakdown { justify-content: flex-start; gap: 10px; font-size: 11.5px; }
+.pricing-guide-cards { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+.guide-card { background: var(--surface); border-radius: 14px; }
+@media (max-width: 800px) {
+  .calc-layout { grid-template-columns: minmax(0, 1fr); }
+  .price-row { grid-template-columns: minmax(0, 1fr); }
+  .price-chips { justify-content: flex-start; }
+}
+
+
+/* 사용량 창 안의 계산기 상자: 창의 section 공통 여백(15px 0)이 안쪽 여백을 지우지 않게 */
+.modal .pricing-calc-box { padding: 18px; border-bottom: 1px solid var(--line); overflow: visible; }
+.modal .price-list { padding-right: 6px; }
+
+/* 워커 창: 오른쪽 열 폭을 고정해 활동 글이 바뀔 때 상자가 좌우로 흔들리지 않게, 스크롤바 자리도 미리 잡는다 */
+.worker-body { grid-template-columns: minmax(0, 1fr) 280px; }
+.worker-main, .worker-side, .worker-timeline, .worker-out { scrollbar-gutter: stable; }
+.worker-stats { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+@media (max-width: 760px) { .worker-body { grid-template-columns: minmax(0, 1fr); } .worker-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+
+/* 보내기 하나: 보내기 + ▾(회의·만들기) */
+.send-group { display: inline-flex; align-items: center; gap: 2px; }
+.send-group .send { border-top-right-radius: 6px; border-bottom-right-radius: 6px; }
+.send-more { display: grid; place-items: center; width: 26px; height: var(--ctl, 32px); border: 0; border-radius: 6px 12px 12px 6px; background: var(--lg-ctl, var(--surface-2)); box-shadow: var(--lg-ctl-edge, none); color: var(--muted); transition: background 0.2s, color 0.2s; }
+.send-more:hover { color: var(--ink); background: var(--lg-ctl-hi, var(--surface)); }
+.send-menu { left: auto; right: 0; width: 320px; transform-origin: bottom right; }
+.send-menu b { display: inline-flex; align-items: center; gap: 6px; }
+
+/* 취침 모드: 앱은 그리지 않고 검은 화면만 남긴다 */
+:root[data-sleep] .app > :not(.sleep-screen) { visibility: hidden; }
+:root[data-sleep] *, :root[data-sleep] *::before, :root[data-sleep] *::after { animation-play-state: paused !important; transition: none !important; }
+.sleep-screen { position: fixed; inset: 0; z-index: 9999; display: grid; place-content: center; justify-items: center; gap: 10px; background: #000; color: #8a8f98; cursor: pointer; user-select: none; }
+.sleep-clock { font-family: var(--display); font-size: 64px; font-weight: 600; letter-spacing: 0.06em; color: #5f656e; font-variant-numeric: tabular-nums; }
+.sleep-title { font-size: 15px; font-weight: 700; color: #6f8f8c; }
+.sleep-status { font-size: 13px; }
+.sleep-wake { margin-top: 18px; font-size: 12px; color: #4a4f57; }
+.sleep-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.sleep-row > span { font-size: 13px; color: var(--muted); }
+.sleep-row.check { cursor: pointer; }

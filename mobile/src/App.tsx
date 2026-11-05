@@ -1,5 +1,5 @@
 import { QuestionCard, type LeadQuestion } from "./Question";
-import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
+import { memo, useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { listen } from "@tauri-apps/api/event";
 import ParticleOrb, { type OrbMode } from "../../src/components/ParticleOrb";
 import Segmented from "../../src/components/Segmented";
@@ -8,15 +8,90 @@ import Markdown from "./Markdown";
 import ConfirmDialog from "../../src/components/ConfirmDialog";
 import { ask } from "../../src/lib/confirm";
 import { deviceName, errorText, remote, type Approval, type Attachment, type Connection, type Conversation, type EngineInfo, type Message, type PcInfo } from "./remote";
+import { AgentRow, AgentSheet, SideSheet, T, TokenChip, agentTitle, type AgentState, type SideTurn, type TaskAgents, ProgressBox } from "./Live";
+import { liveTurn, sumUsage, turnEvent } from "../../src/lib/usage";
 
-interface Live {
-  taskId: string;
+const ASK = {
+  you: "요청",
+  more: "더보기",
+  less: "접기",
+};
+
+interface Live extends TaskAgents {
   conversationId: string;
   work: boolean;
   phase: string | null;
   label: string | null;
   text: string;
   activity: string | null;
+  /** 총괄이 지운 워커 key(늦게 온 이벤트로 다시 생기지 않게) */
+  gone: Record<string, true>;
+}
+
+/** 에이전트 글은 끝부분만 둔다(폰 메모리) */
+const STREAM_KEEP = 20000;
+/** 실시간 이벤트를 모아 화면에 반영하는 간격(ms). 글자 조각마다 다시 그리면 폰이 버벅이고 뜨거워진다. */
+const LIVE_FLUSH_MS = 220;
+/** PC와 에이전트 상태를 맞추는 간격(ms) */
+const SYNC_MS = 6000;
+
+type LiveMap = Record<string, Live>;
+type LiveFn = (m: LiveMap) => LiveMap;
+
+/** 실시간 이벤트를 모았다가 한 번에 반영한다. 글자 조각은 실행마다 이어 붙여 한 번만 자른다. 순서는 그대로 지킨다. */
+function useLiveQueue(setLive: (f: LiveFn) => void) {
+  const q = useRef<{ fns: LiveFn[]; streams: Record<string, Record<string, string>>; text: Record<string, string>; timer: number | null }>({ fns: [], streams: {}, text: {}, timer: null });
+  const seal = () => {
+    const { streams, text } = q.current;
+    if (!Object.keys(streams).length && !Object.keys(text).length) return;
+    q.current.streams = {};
+    q.current.text = {};
+    q.current.fns.push((m) => {
+      const out = { ...m };
+      for (const [id, keys] of Object.entries(streams)) {
+        const l = out[id];
+        if (!l) continue;
+        const next = { ...l.streams };
+        for (const [k, d] of Object.entries(keys)) next[k] = ((next[k] ?? "") + d).slice(-STREAM_KEEP);
+        out[id] = { ...l, streams: next };
+      }
+      for (const [id, d] of Object.entries(text)) if (out[id]) out[id] = { ...out[id], text: out[id].text + d };
+      return out;
+    });
+  };
+  const flush = () => {
+    const c = q.current;
+    if (c.timer != null) window.clearTimeout(c.timer);
+    c.timer = null;
+    seal();
+    const fns = c.fns;
+    c.fns = [];
+    if (fns.length) setLive((m) => fns.reduce((acc, f) => f(acc), m));
+  };
+  const later = () => {
+    if (q.current.timer == null) q.current.timer = window.setTimeout(flush, LIVE_FLUSH_MS);
+  };
+  return {
+    push(f: LiveFn) {
+      seal();
+      q.current.fns.push(f);
+      later();
+    },
+    delta(taskId: string, key: string, d: string) {
+      const keys = (q.current.streams[taskId] ??= {});
+      keys[key] = (keys[key] ?? "") + d;
+      later();
+    },
+    text(taskId: string, d: string) {
+      q.current.text[taskId] = (q.current.text[taskId] ?? "") + d;
+      later();
+    },
+    flush,
+  };
+}
+
+function blankLive(taskId: string, conversationId: string, work: boolean): Live {
+  return { taskId, conversationId, work, phase: null, label: null, text: "", activity: null, lead: false, agents: {}, parts: {}, usage: {}, streams: {}, timeline: [], commits: 0, gone: {} };
 }
 
 type Toast = { id: number; text: string; kind: "info" | "error" };
@@ -150,16 +225,32 @@ function Files({ items, toast }: { items?: Attachment[]; toast: (t: string, k?: 
   );
 }
 
-function Exchange({ ask, answer, toast }: { ask: Message; answer?: Message; toast: (t: string, k?: Toast["kind"]) => void }) {
+/** 보낸 요청: 길면 몇 줄만 보이고 눌러서 펼친다. 진행 중이면 바로 아래 진행 카드와 이어 붙는다. */
+function Ask({ m, toast }: { m: Message; toast: (t: string, k?: Toast["kind"]) => void }) {
+  const [open, setOpen] = useState(false);
+  const long = m.content.length > 160 || m.content.split("\n").length > 4;
+  return (
+    <div className={`ex-ask ${long && !open ? "clamped" : ""}`}>
+      <span className="ex-ask-label">{ASK.you}</span>
+      <div className="ex-ask-text">{m.content}</div>
+      <Files items={m.data?.attachments} toast={toast} />
+      {long && (
+        <button className="ex-ask-more" onClick={() => setOpen((o) => !o)} aria-expanded={open}>
+          {open ? ASK.less : ASK.more}
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** 지난 대화 한 쌍. 실시간 글이 바뀌어도 다시 그리지 않는다(마크다운을 다시 읽지 않게). */
+const Exchange = memo(function Exchange({ ask, answer, toast, live = false }: { ask: Message; answer?: Message; toast: (t: string, k?: Toast["kind"]) => void; live?: boolean }) {
   const d = answer?.data;
   return (
-    <article className="ex">
-      <div className="ex-ask">
-        {ask.content}
-        <Files items={ask.data?.attachments} toast={toast} />
-      </div>
+    <article className={`ex ${live ? "asking" : ""}`}>
+      <Ask m={ask} toast={toast} />
       {answer && (
-        <div className="ex-answer">
+        <div className={`ex-answer ${answer.content.startsWith("⚠") ? "failed" : ""}`}>
           <Markdown text={answer.content} />
           <Files items={d?.attachments} toast={toast} />
           {(d?.draftedBy || d?.reviewedBy) && (
@@ -172,7 +263,7 @@ function Exchange({ ask, answer, toast }: { ask: Message; answer?: Message; toas
       )}
     </article>
   );
-}
+});
 
 function pair(messages: Message[]): { ask: Message; answer?: Message }[] {
   const out: { ask: Message; answer?: Message }[] = [];
@@ -188,14 +279,21 @@ export default function App() {
   const [conn, setConn] = useState<Connection | null | undefined>(undefined);
   const [info, setInfo] = useState<PcInfo | null>(null);
   const [online, setOnline] = useState(false);
+  /** 다른 네트워크에서 터널로 붙었는지 */
+  const [viaRelay, setViaRelay] = useState(false);
   const [engines, setEngines] = useState<EngineInfo[]>([]);
   const [convs, setConvs] = useState<Conversation[]>([]);
   const [cid, setCid] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [live, setLive] = useState<Record<string, Live>>({});
+  const liveQ = useLiveQueue(setLive);
+  const liveQRef = useRef(liveQ);
+  liveQRef.current = liveQ;
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [questions, setQuestions] = useState<LeadQuestion[]>([]);
   const [drawer, setDrawer] = useState(false);
+  const [sheet, setSheet] = useState<null | "agents" | "side">(null);
+  const [side, setSide] = useState<SideTurn[]>([]);
   const [text, setText] = useState("");
   const [engine, setEngine] = useState("auto");
   const [work, setWork] = useState(false);
@@ -206,9 +304,36 @@ export default function App() {
   const cidRef = useRef(cid);
   cidRef.current = cid;
   const scroller = useRef<HTMLDivElement>(null);
+  const stick = useRef(true);
 
   useEffect(() => {
     remote.connection().then(setConn).catch(() => setConn(null));
+  }, []);
+
+  // PC가 따라가는 작업·에이전트 상태로 맞춘다. 에이전트 상태와 토큰은 PC 값을 믿는다(폰은 출력 끝부분이 없을 때만 채운다).
+  const syncAgents = useCallback(() => {
+    remote
+      .agents()
+      .then((list) =>
+        setLive((m) => {
+          const out = { ...m };
+          for (const t of list) {
+            const l = out[t.taskId] ?? blankLive(t.taskId, t.conversationId, t.work);
+            const agents = { ...l.agents };
+            const usage = { ...l.usage };
+            const streams = { ...l.streams };
+            for (const a of Object.values(t.agents)) {
+              agents[a.key] = { key: a.key, engine: a.engine as AgentState["engine"], label: a.label, role: a.role, state: a.state, wait: a.wait, last: a.last, stopped: a.stopped, tools: Math.max(a.tools ?? 0, l.agents[a.key]?.tools ?? 0), bg: a.bg ?? 0 };
+              usage[a.key] = { done: a.done, cur: a.cur };
+              if (!streams[a.key] && a.tail) streams[a.key] = a.tail;
+            }
+            const timeline = (t.timeline ?? []).length >= l.timeline.length ? (t.timeline ?? []) : l.timeline;
+            out[t.taskId] = { ...l, conversationId: l.conversationId || t.conversationId, lead: l.lead || t.lead, parts: { ...t.parts, ...l.parts }, agents, usage, streams, timeline, commits: Math.max(l.commits, t.commits ?? 0) };
+          }
+          return out;
+        }),
+      )
+      .catch(() => {});
   }, []);
 
   const refreshAll = useCallback(async () => {
@@ -220,39 +345,122 @@ export default function App() {
       setConvs(c);
       setApprovals(a);
       setOnline(true);
-      if (cidRef.current) setMessages(await remote.messages(cidRef.current));
+      const want = cidRef.current;
+      if (want) {
+        const m = await remote.messages(want);
+        if (cidRef.current === want) setMessages(m);
+      }
+      syncAgents();
     } catch (e) {
       setOnline(false);
       toast(errorText(e), "error");
     }
-  }, [toast]);
+  }, [toast, syncAgents]);
 
-  const loadMessages = useCallback((id: string | null) => {
-    if (!id) return setMessages([]);
-    remote.messages(id).then(setMessages).catch((e) => toast(errorText(e), "error"));
-  }, [toast]);
+  // 늦게 온 다른 세션의 답이 지금 화면을 덮지 않게 한다.
+  const loadMessages = useCallback(
+    (id: string | null) => {
+      if (!id) return setMessages([]);
+      return remote
+        .messages(id)
+        .then((m) => {
+          if (cidRef.current === id) setMessages(m);
+        })
+        .catch((e) => toast(errorText(e), "error"));
+    },
+    [toast],
+  );
 
   // 연결되면 목록을 읽고 PC 이벤트를 받기 시작한다.
   useEffect(() => {
     if (!conn) return;
     refreshAll();
     remote.eventsStart().catch(() => {});
+    // 폰이 잠들었다 깨면 끊긴 연결을 기다리지 않고 바로 다시 붙고 목록을 새로 읽는다.
+    const onVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      remote.reconnect().catch(() => {});
+      refreshAll();
+    };
+    document.addEventListener("visibilitychange", onVisible);
     const offs = [
-      listen<{ connected: boolean }>("remote:status", (e) => {
+      listen<{ connected: boolean; host?: string }>("remote:status", (e) => {
         setOnline(e.payload.connected);
+        if (e.payload.connected) setViaRelay(e.payload.host === "relay");
         if (e.payload.connected) refreshAll();
       }),
       listen<{ event: string; payload: any }>("remote:event", ({ payload: { event, payload: p } }) => {
-        const patch = (f: (l: Live) => Live) => setLive((m) => (m[p.taskId] ? { ...m, [p.taskId]: f(m[p.taskId]) } : m));
+        const lq = liveQRef.current;
+        const patch = (f: (l: Live) => Live) => lq.push((m) => (m[p.taskId] ? { ...m, [p.taskId]: f(m[p.taskId]) } : m));
+        // 폰이 늦게 붙었으면 에이전트 이벤트로 작업을 만든다.
+        const upsert = (f: (l: Live) => Live) => lq.push((m) => ({ ...m, [p.taskId]: f(m[p.taskId] ?? blankLive(p.taskId, p.conversationId ?? "", true)) }));
+        const agent = (l: Live, key: string, f: (a: AgentState) => AgentState) => (l.agents[key] ? { ...l, agents: { ...l.agents, [key]: f(l.agents[key]) } } : l);
+        const sidePatch = (f: (t: SideTurn) => SideTurn) => setSide((x) => x.map((t) => (t.id === p.sideId ? f(t) : t)));
         switch (event) {
           case "task:started":
-            setLive((m) => ({ ...m, [p.taskId]: m[p.taskId] ?? { taskId: p.taskId, conversationId: p.conversationId, work: p.work, phase: null, label: null, text: "", activity: null } }));
+            lq.push((m) => ({ ...m, [p.taskId]: { ...(m[p.taskId] ?? blankLive(p.taskId, p.conversationId, p.work)), conversationId: p.conversationId, work: p.work } }));
+            break;
+          case "task:agent":
+            upsert((l) => {
+              if (l.gone[p.key]) return l;
+              const prev = l.agents[p.key];
+              const a: AgentState = { key: p.key, engine: p.engine, label: p.label, role: p.role, state: p.state, wait: null, last: p.state === "run" ? (prev?.last ?? null) : null, stopped: !!p.stopped, tools: prev?.tools ?? 0, bg: prev?.bg ?? 0 };
+              return { ...l, conversationId: l.conversationId || p.conversationId, agents: { ...l.agents, [p.key]: a }, usage: { ...l.usage, [p.key]: turnEvent(l.usage[p.key], p) } };
+            });
+            break;
+          case "task:agent-activity":
+            patch((l) => agent(l, p.key, (a) => ({ ...a, last: p.text, tools: (a.tools ?? 0) + 1 })));
+            break;
+          case "task:agent-wait":
+            patch((l) => agent(l, p.key, (a) => ({ ...a, state: "run", wait: p.note })));
+            break;
+          case "task:agent-usage":
+            patch((l) => ({ ...l, usage: { ...l.usage, [p.key]: liveTurn(l.usage[p.key], p) } }));
+            break;
+          case "task:agent-delta":
+            lq.delta(p.taskId, p.key, p.delta);
+            break;
+          case "task:parts":
+            upsert((l) => ({ ...l, parts: { ...l.parts, ...Object.fromEntries(p.parts.map((x: { key: string; title: string }) => [x.key, x.title])) } }));
+            break;
+          case "task:part-added":
+            upsert((l) => ({ ...l, parts: { ...l.parts, [p.key]: p.title } }));
+            break;
+          case "task:agent-removed":
+            patch((l) => {
+              const drop = <T,>(r: Record<string, T>) => Object.fromEntries(Object.entries(r).filter(([k]) => k !== p.key));
+              return { ...l, agents: drop(l.agents), parts: drop(l.parts), streams: drop(l.streams), usage: drop(l.usage), gone: { ...l.gone, [p.key]: true } };
+            });
+            break;
+          case "lead:started":
+            upsert((l) => ({ ...l, lead: true }));
+            break;
+          case "task:agent-bg":
+            patch((l) => agent(l, p.key, (a) => ({ ...a, bg: p.count })));
+            break;
+          case "lead:activity":
+            upsert((l) => ({ ...l, timeline: [...l.timeline, { kind: p.kind, text: p.text, at: p.at }].slice(-40) }));
+            break;
+          case "lead:commit":
+            upsert((l) => ({ ...l, commits: l.commits + 1 }));
+            break;
+          case "side:started":
+            sidePatch((t) => ({ ...t, text: "", activity: null }));
+            break;
+          case "side:activity":
+            sidePatch((t) => ({ ...t, activity: p.text }));
+            break;
+          case "side:delta":
+            sidePatch((t) => ({ ...t, text: t.text + p.delta }));
+            break;
+          case "side:done":
+            sidePatch((t) => ({ ...t, state: p.ok ? "ok" : "fail", text: p.text || t.text || p.error || "", activity: null }));
             break;
           case "task:phase":
             patch((l) => ({ ...l, phase: p.phase, label: p.label, text: "" }));
             break;
           case "task:delta":
-            patch((l) => ({ ...l, text: l.text + p.delta }));
+            lq.text(p.taskId, p.delta);
             break;
           case "task:activity":
             patch((l) => ({ ...l, activity: p.text }));
@@ -272,10 +480,30 @@ export default function App() {
           case "message:created":
             if (p.conversationId === cidRef.current) loadMessages(p.conversationId);
             break;
-          case "task:done":
-            setLive(({ [p.taskId]: _, ...rest }) => rest);
+          case "task:done": {
+            // 저장된 답을 받은 뒤에 진행 카드를 지워 카드가 잠깐 사라졌다 다시 생기지 않게 한다. 모아 둔 이벤트를 먼저 반영한다.
+            lq.flush();
+            const drop = () => setLive(({ [p.taskId]: _, ...rest }) => rest);
             remote.conversations().then(setConvs).catch(() => {});
-            if (p.conversationId === cidRef.current) loadMessages(p.conversationId);
+            if (p.conversationId === cidRef.current) Promise.resolve(loadMessages(p.conversationId)).finally(drop);
+            else drop();
+            break;
+          }
+          case "conversation:deleted":
+            lq.flush();
+            setConvs((x) => x.filter((c) => c.id !== p.conversationId));
+            setLive((m) => Object.fromEntries(Object.entries(m).filter(([, l]) => l.conversationId !== p.conversationId)));
+            if (cidRef.current === p.conversationId) {
+              setCid(null);
+              setMessages([]);
+            }
+            break;
+          case "data:cleared":
+            lq.flush();
+            setCid(null);
+            setMessages([]);
+            setLive({});
+            refreshAll();
             break;
           case "engines:changed":
             remote.engines().then((e) => setEngines(e.filter((x) => x.installed))).catch(() => {});
@@ -286,28 +514,55 @@ export default function App() {
         }
       }),
     ];
-    return () => offs.forEach((o) => o.then((f) => f()));
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      offs.forEach((o) => o.then((f) => f()));
+    };
   }, [conn, refreshAll, loadMessages]);
 
-  useEffect(() => loadMessages(cid), [cid, loadMessages]);
+  const hasLive = Object.keys(live).length > 0;
+  useEffect(() => {
+    if (!hasLive || !online) return;
+    // 화면이 꺼져 있으면 묻지 않는다(깨어나면 바로 새로 읽는다).
+    const t = window.setInterval(() => document.visibilityState === "visible" && syncAgents(), SYNC_MS);
+    return () => window.clearInterval(t);
+  }, [hasLive, online, syncAgents]);
+
+  useEffect(() => {
+    // 세션을 바꾸면 이전 대화를 바로 지우고 맨 아래부터 본다.
+    setMessages([]);
+    stick.current = true;
+    loadMessages(cid);
+  }, [cid, loadMessages]);
 
   const mine = Object.values(live).filter((l) => l.conversationId === cid);
+  const pairs = pair(messages);
   const pending = approvals.filter((a) => a.conversationId === cid);
+  // 맨 아래에 있을 때만 새 글을 따라간다. 위로 올려 읽는 중이면 그대로 둔다.
   useEffect(() => {
-    scroller.current?.scrollTo({ top: scroller.current.scrollHeight, behavior: "smooth" });
+    const el = scroller.current;
+    if (el && stick.current) el.scrollTop = el.scrollHeight;
   }, [messages.length, mine.map((l) => l.text.length).join(), pending.length]);
 
   if (conn === undefined) return <div className="boot" />;
   if (!conn)
     return (
       <>
-        <ParticleOrb mode="idle" />
+        <ParticleOrb mode="idle" lite />
         <Pair onPaired={(c) => setConn(c)} toast={toast} />
         <Toasts toasts={toasts} />
       </>
     );
 
   const current = convs.find((c) => c.id === cid);
+  const tasks = Object.values(live).filter((l) => Object.keys(l.agents).length > 0);
+  const runningAgents = tasks.reduce((n, l) => n + Object.values(l.agents).filter((a) => a.state === "run").length, 0);
+  const askSide = (q: string) => {
+    const id = crypto.randomUUID();
+    const before = side.filter((t) => t.state !== "fail").map((t) => ({ role: t.role, text: t.text }));
+    setSide((x) => [...x, { id: `${id}:q`, role: "user", text: q }, { id, role: "assistant", text: "", state: "run", activity: null }]);
+    remote.side(id, cid, q, before).catch((e) => setSide((x) => x.map((t) => (t.id === id ? { ...t, state: "fail", text: errorText(e) } : t))));
+  };
   const orb: OrbMode = !online ? "off" : approvals.length ? "approval" : Object.keys(live).length ? "thinking" : "idle";
 
   async function upload(list: FileList | null) {
@@ -338,7 +593,8 @@ export default function App() {
       const r = await remote.send(cid, t, engine, work, files.map((f) => f.id));
       setText("");
       setFiles([]);
-      setLive((m) => ({ ...m, [r.taskId]: m[r.taskId] ?? { taskId: r.taskId, conversationId: r.conversationId, work, phase: null, label: null, text: "", activity: null } }));
+      stick.current = true;
+      setLive((m) => ({ ...m, [r.taskId]: m[r.taskId] ?? blankLive(r.taskId, r.conversationId, work) }));
       if (r.conversationId !== cid) setCid(r.conversationId);
       else loadMessages(cid);
       remote.conversations().then(setConvs).catch(() => {});
@@ -351,7 +607,7 @@ export default function App() {
 
   return (
     <div className="shell">
-      <ParticleOrb mode={orb} />
+      <ParticleOrb mode={orb} lite />
       <header className="top">
         <button className="icon-btn" aria-label="세션 목록" onClick={() => setDrawer(true)}>
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden>
@@ -361,17 +617,33 @@ export default function App() {
         <div className="top-title">
           <b>{current?.title ?? "새 세션"}</b>
           <span className={`pc ${online ? "on" : ""}`}>
-            <i /> {info?.pcName ?? conn.pcName} {online ? "연결됨" : "다시 연결하는 중"}
+            <i /> {info?.pcName ?? conn.pcName} {online ? (viaRelay ? "연결됨 (원격)" : "연결됨") : "다시 연결하는 중"}
           </span>
         </div>
-        <button className="icon-btn" aria-label="새 세션" onClick={() => setCid(null)}>
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden>
-            <path d="M12 5v14M5 12h14" />
+        <button className="icon-btn" aria-label={T.side} onClick={() => setSheet("side")} disabled={!online}>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+            <path d="M5 18.5V6.5A2.5 2.5 0 0 1 7.5 4h9A2.5 2.5 0 0 1 19 6.5v6a2.5 2.5 0 0 1-2.5 2.5H9z" />
+            <path d="M9 9.5h6M9 12h3.5" />
           </svg>
+        </button>
+        <button className={`icon-btn ${runningAgents ? "busy" : ""}`} aria-label={T.agents} onClick={() => setSheet("agents")}>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+            <circle cx="8" cy="9" r="3" />
+            <circle cx="16.5" cy="10" r="2.5" />
+            <path d="M3 19c.6-2.8 2.6-4.5 5-4.5s4.4 1.7 5 4.5M13.5 18.5c.5-2 1.6-3.2 3-3.2s2.5 1.2 3 3.2" />
+          </svg>
+          {runningAgents > 0 && <span className="badge">{runningAgents}</span>}
         </button>
       </header>
 
-      <main className="main" ref={scroller}>
+      <main
+        className="main"
+        ref={scroller}
+        onScroll={() => {
+          const el = scroller.current;
+          if (el) stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+        }}
+      >
         {!cid && messages.length === 0 && mine.length === 0 && (
           <div className="hello">
             <div className="hello-orb" data-orb-anchor aria-hidden />
@@ -379,15 +651,24 @@ export default function App() {
             <p>여기서 보낸 질문은 PC에서 실행되고, PC 화면에도 같이 보입니다.</p>
           </div>
         )}
-        {pair(messages).map((x) => (
-          <Exchange key={x.ask.id} ask={x.ask} answer={x.answer} toast={toast} />
+        {pairs.map((x, i) => (
+          <Exchange key={x.ask.id} ask={x.ask} answer={x.answer} toast={toast} live={i === pairs.length - 1 && !x.answer && mine.length > 0} />
         ))}
-        {mine.map((l) => (
-          <article key={l.taskId} className="ex live">
+        {mine.map((l, i) => (
+          <article key={l.taskId} className={`ex live ${i === 0 && pairs.length > 0 && !pairs[pairs.length - 1].answer ? "joined" : ""}`}>
             <div className="ex-answer">
               <div className="live-head">
-                <i className="spark" /> {l.label ? `${l.label} ${l.phase === "review" ? "검토 중" : l.phase === "judge" ? "토론을 판정하는 중" : "쓰는 중"}` : (l.activity ?? "JEV가 판단하는 중")}
+                <i className="spark" /> {l.label ? `${l.label} ${l.phase === "review" ? "검토 중" : l.phase === "judge" ? "토론을 판정하는 중" : "쓰는 중"}` : Object.keys(l.agents).length > 0 ? T.teamWorking.replace("{n}", String(Object.values(l.agents).filter((a) => a.state === "run").length)) : (l.activity ?? T.preparing)}
               </div>
+              <TokenChip t={sumUsage(l.usage)} live />
+              {Object.keys(l.agents).length > 1 && <ProgressBox t={l} />}
+              {Object.keys(l.agents).length > 0 && (
+                <div className="live-agents">
+                  {Object.values(l.agents).map((a) => (
+                    <AgentRow key={a.key} a={a} title={agentTitle(a, l.parts)} usage={l.usage[a.key]} onOpen={() => setSheet("agents")} />
+                  ))}
+                </div>
+              )}
               {l.text ? <Markdown text={stripFileMarkers(l.text)} /> : <div className="live-act">{l.activity ?? "준비 중"}</div>}
               <button className="stop" onClick={() => remote.cancel(l.taskId).catch((e) => toast(errorText(e), "error"))}>
                 중지
@@ -524,6 +805,8 @@ export default function App() {
           이 폰에서 연결 지우기
         </button>
       </aside>
+      <AgentSheet open={sheet === "agents"} onClose={() => setSheet(null)} tasks={tasks} toast={toast} />
+      <SideSheet open={sheet === "side"} onClose={() => setSheet(null)} thread={side} onAsk={askSide} onStop={(id) => remote.cancel(id).catch((e) => toast(errorText(e), "error"))} />
       <Toasts toasts={toasts} />
       <ConfirmDialog />
     </div>

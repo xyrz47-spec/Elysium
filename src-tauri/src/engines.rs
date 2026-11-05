@@ -329,7 +329,45 @@ pub enum Event {
     /// 도구 사용 등 진행 상황(사람이 읽는 짧은 설명)
     Activity(String),
     Session(String),
+    /// 이번 실행에서 지금까지 쓴 토큰(실행 중에 늘어난다. 최종 값은 Done이 정한다)
+    Usage { input: u64, output: u64 },
+    /// 뒤에서 돌리는 셸 명령(Claude Code의 run_in_background)
+    Bg(Bg),
     Done(Finish),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Bg {
+    /// id: Claude가 준 작업 번호, path: 출력이 쌓이는 파일
+    Started { id: String, command: String, path: PathBuf },
+    /// status: completed · failed · killed · stopped
+    Ended { id: String, status: String },
+}
+
+/// 백그라운드 셸 도구의 결과에서 (작업 번호, 출력 파일)을 읽는다.
+/// 예: "Command running in background with ID: b1x. Output is being written to: C:\...	asks1x.output. You will be notified ..."
+fn bg_started(text: &str) -> Option<(String, PathBuf)> {
+    let id = text.split_once("background with ID:")?.1.trim_start();
+    let id: String = id.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect();
+    let rest = text.split_once("written to:")?.1.trim_start();
+    let end = rest.find(".output")? + ".output".len();
+    (!id.is_empty()).then(|| (id, PathBuf::from(&rest[..end])))
+}
+
+/// 작업 알림(<task-id>…</task-id> … <status>…</status>)에서 끝난 작업을 읽는다.
+fn bg_ended(line: &str) -> Vec<Bg> {
+    let mut out = vec![];
+    let mut rest = line;
+    while let Some((_, after)) = rest.split_once("<task-id>") {
+        let Some((id, tail)) = after.split_once("</task-id>") else { break };
+        let near: String = tail.chars().take(400).collect();
+        let status = near.split_once("<status>").and_then(|(_, s)| s.split_once("</status>")).map(|(s, _)| s.trim().to_string());
+        if let Some(status) = status.filter(|s| !s.is_empty() && s != "running") {
+            out.push(Bg::Ended { id: id.trim().to_string(), status });
+        }
+        rest = tail;
+    }
+    out
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -356,6 +394,51 @@ pub struct Outcome {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub latency_ms: u64,
+    /// 출력 없이 너무 오래 멈춰 있어 중지했다(일하던 중에 시간이 다 된 것이 아니다).
+    #[serde(skip)]
+    pub stalled: bool,
+}
+
+/// 작업 실행은 출력이 이만큼 없어야 멈춘 것으로 본다. 도구 한 번의 한도(긴 빌드·테스트 10분)보다 넉넉하다.
+pub const WORK_IDLE: Duration = Duration::from_secs(1200);
+/// 출력이 계속 나와도 실행 한 번은 이 시간을 넘기지 않는다(끝없는 반복을 막는 안전장치).
+pub const RUN_CAP: Duration = Duration::from_secs(6 * 3600);
+
+/// 이 실행의 무응답 한도. 일하는 실행은 긴 명령을 기다릴 수 있게 WORK_IDLE보다 짧게 두지 않는다.
+pub(crate) fn idle_limit(spec: &RunSpec, idle: Duration) -> Duration {
+    if spec.work { idle.max(WORK_IDLE) } else { idle }
+}
+
+/// 출력 없이 멈춰 중지했을 때의 오류
+pub(crate) fn stalled_error(idle: Duration) -> String {
+    format!("{m}분 동안 활동이 없어 실행을 중지했습니다", m = idle.as_secs().div_ceil(60))
+}
+
+/// 안전 한도에 닿아 중지했을 때의 오류
+pub(crate) fn capped_error() -> String {
+    format!("단일 실행 제한 시간인 {h}시간을 초과하여 실행을 중지했습니다", h = RUN_CAP.as_secs() / 3600)
+}
+
+/// 마지막으로 출력이 온 때. 무응답 한도를 잴 때 쓴다.
+pub(crate) struct Pulse(std::sync::Mutex<Instant>);
+
+impl Pulse {
+    pub fn new() -> Self {
+        Pulse(std::sync::Mutex::new(Instant::now()))
+    }
+    pub fn beat(&self) {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
+    }
+    /// 출력 없이 `idle`이 지나면 끝난다.
+    pub async fn stalled(&self, idle: Duration) {
+        loop {
+            let quiet = self.0.lock().unwrap_or_else(|p| p.into_inner()).elapsed();
+            if quiet >= idle {
+                return;
+            }
+            tokio::time::sleep(idle - quiet).await;
+        }
+    }
 }
 
 const CHAT_TOOLS: &str = "Read,Grep,Glob,WebFetch,WebSearch";
@@ -368,8 +451,8 @@ fn claude_settings(home: &str) -> String {
     serde_json::json!({ "claudeMdExcludes": [format!("{home}/.claude/CLAUDE.md"), format!("{home}/.claude/rules/**")] }).to_string()
 }
 
-/// 대기열을 쓰는 Claude가 직접 띄우지 못하게 막는 게임 창 작업. 패턴이라 모든 경우를 막지는 못한다.
-const WINDOW_BLOCK: &str = "PowerShell(*runClient*),PowerShell(*frameBenchmark*),PowerShell(*clientWorldReloadTest*),PowerShell(*launcherProfileTest*),PowerShell(*gradlew*Client),PowerShell(*gradlew*Client *)";
+/// 대기열을 쓰는 Claude가 직접 띄우지 못하게 막는 창 띄우기 작업. 패턴이라 모든 경우를 막지는 못한다.
+const WINDOW_BLOCK: &str = "PowerShell(*runClient*),PowerShell(*runGame*),PowerShell(*frameBenchmark*),PowerShell(*clientWorldReloadTest*),PowerShell(*launcherProfileTest*),PowerShell(*gradlew*Client),PowerShell(*gradlew*Client *),PowerShell(*Start-Process*),PowerShell(start *),PowerShell(saps *),PowerShell(*Invoke-Item*),PowerShell(ii *),PowerShell(*explorer.exe*),PowerShell(*msedge*),PowerShell(*chrome.exe*),PowerShell(*firefox*),PowerShell(*electron*),PowerShell(*tauri dev*),PowerShell(*npm run tauri*),PowerShell(* --open*)";
 
 /// CLI 인자. 요청 본문은 들어가지 않는다(표준 입력으로 보냄).
 pub fn args(spec: &RunSpec) -> Vec<String> {
@@ -394,7 +477,8 @@ pub fn args(spec: &RunSpec) -> Vec<String> {
                 a.push(s("--settings"));
                 a.push(claude_settings(&home));
             }
-            if spec.work && spec.system.contains(crate::lead::QUEUE_SYSTEM) {
+            // 창 테스트 대기열을 쓰는 실행(워커·통합)과 총괄의 직접 작업은 창을 직접 띄우지 못한다.
+            if spec.work && (spec.system.contains(crate::lead::QUEUE_SYSTEM) || spec.system.contains(crate::lead::LEAD_WINDOW_SYSTEM)) {
                 a.push(s("--disallowedTools"));
                 a.push(s(WINDOW_BLOCK));
             }
@@ -531,13 +615,22 @@ fn tool_activity(name: &str, input: &Value) -> String {
 /// Claude Code `--output-format stream-json` 해석기(2026-10-17 실제 출력으로 확인).
 #[derive(Default)]
 pub struct ClaudeParser {
+    /// 백그라운드로 시작한 셸 도구(도구 호출 id → 명령)
+    bg_tools: std::collections::HashMap<String, String>,
     has_text: bool,
+    /// 사용량을 이미 더한 메시지
+    counted: std::collections::HashSet<String>,
+    input: u64,
+    output: u64,
 }
 
 impl ClaudeParser {
     pub fn feed(&mut self, line: &str) -> Vec<Event> {
         let Ok(v) = serde_json::from_str::<Value>(line) else { return vec![] };
         let mut out = vec![];
+        if line.contains("<task-id>") {
+            out.extend(bg_ended(line).into_iter().map(Event::Bg));
+        }
         // 하위 에이전트의 출력은 본문에 섞지 않는다.
         let top = v.get("parent_tool_use_id").is_none_or(Value::is_null);
         match v["type"].as_str() {
@@ -560,9 +653,37 @@ impl ClaudeParser {
                 }
             }
             Some("assistant") => {
+                let m = &v["message"];
+                if let Some(id) = m["id"].as_str().filter(|_| top && m["usage"].is_object()) {
+                    if self.counted.insert(id.to_string()) {
+                        let u = &m["usage"];
+                        self.input += ["input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"].iter().filter_map(|k| u[*k].as_u64()).sum::<u64>();
+                        self.output += u["output_tokens"].as_u64().unwrap_or(0);
+                        out.push(Event::Usage { input: self.input, output: self.output });
+                    }
+                }
                 for c in v["message"]["content"].as_array().into_iter().flatten() {
                     if c["type"] == "tool_use" {
                         out.push(Event::Activity(tool_activity(c["name"].as_str().unwrap_or("도구"), &c["input"])));
+                        if c["input"]["run_in_background"].as_bool() == Some(true) {
+                            if let (Some(id), Some(cmd)) = (c["id"].as_str(), c["input"]["command"].as_str()) {
+                                self.bg_tools.insert(id.to_string(), cmd.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            Some("user") => {
+                for c in v["message"]["content"].as_array().into_iter().flatten().filter(|c| c["type"] == "tool_result") {
+                    let Some(command) = c["tool_use_id"].as_str().and_then(|id| self.bg_tools.remove(id)) else { continue };
+                    let text = match &c["content"] {
+                        Value::String(s) => s.clone(),
+                        Value::Array(a) => a.iter().filter_map(|x| x["text"].as_str()).collect::<Vec<_>>().join("
+"),
+                        _ => String::new(),
+                    };
+                    if let Some((id, path)) = bg_started(&text) {
+                        out.push(Event::Bg(Bg::Started { id, command, path }));
                     }
                 }
             }
@@ -617,6 +738,7 @@ impl GenericParser {
             "turn.completed" => {
                 self.usage.input_tokens = v["usage"]["input_tokens"].as_u64();
                 self.usage.output_tokens = v["usage"]["output_tokens"].as_u64();
+                out.push(Event::Usage { input: self.usage.input_tokens.unwrap_or(0), output: self.usage.output_tokens.unwrap_or(0) });
             }
             "turn.failed" | "error" => {
                 let msg = v["error"]["message"].as_str().or(v["message"].as_str()).unwrap_or("CLI 오류").to_string();
@@ -672,6 +794,8 @@ impl GenericParser {
 pub struct AgyParser {
     /// 마지막으로 글을 낸 단계 번호(단계가 바뀌면 빈 줄로 나눈다)
     text_step: Option<u64>,
+    /// 끝난 단계마다의 사용량(같은 단계가 여러 번 오면 마지막 값)
+    steps: std::collections::BTreeMap<u64, (u64, u64)>,
 }
 
 impl AgyParser {
@@ -686,6 +810,14 @@ impl AgyParser {
             }
             Some("step_update") => {
                 let s = &v["step_update"];
+                if let (Some(i), true) = (s["step_index"].as_u64(), s["usage"].is_object()) {
+                    let u = &s["usage"];
+                    let now = (u["input_tokens"].as_u64().unwrap_or(0), u["output_tokens"].as_u64().unwrap_or(0));
+                    if self.steps.insert(i, now) != Some(now) {
+                        let (input, output) = self.steps.values().fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+                        out.push(Event::Usage { input, output });
+                    }
+                }
                 match s["step_type"].as_str() {
                     Some("agent_response") => {
                         if let Some(t) = s["text_delta"].as_str().filter(|t| !t.is_empty()) {
@@ -764,6 +896,7 @@ impl OpenCodeParser {
                 self.usage.output_tokens = Some(self.usage.output_tokens.unwrap_or(0) + t["output"].as_u64().unwrap_or(0));
                 self.charged += part["cost"].as_f64().unwrap_or(0.0);
                 self.finished = true;
+                out.push(Event::Usage { input: self.usage.input_tokens.unwrap_or(0), output: self.usage.output_tokens.unwrap_or(0) });
             }
             Some("error") => {
                 let e = &v["error"];
@@ -804,6 +937,7 @@ impl Parser {
 }
 
 /// 엔진을 실행하고 끝날 때까지 이벤트를 넘긴다. 취소하면 프로세스·요청을 끝낸다.
+/// timeout은 무응답 한도다: 출력이 계속 나오는 동안은 기다리고, 출력 없이 이만큼 지나면 멈춘 것으로 보고 끝낸다.
 pub async fn run(http: &reqwest::Client, spec: &RunSpec, timeout: Duration, cancel: &CancellationToken, mut on_event: impl FnMut(&Event)) -> Outcome {
     if spec.engine.is_api() {
         // 파일을 읽을 도구가 없는 대화 모드도 답할 수 있게 글 파일은 본문에 넣는다.
@@ -872,13 +1006,16 @@ pub async fn run(http: &reqwest::Client, spec: &RunSpec, timeout: Duration, canc
         _ => Parser::Generic(GenericParser::default()),
     };
     let mut finish: Option<Finish> = None;
-    let deadline = tokio::time::sleep(timeout);
-    tokio::pin!(deadline);
+    let idle = idle_limit(spec, timeout);
+    let cap = tokio::time::sleep(RUN_CAP);
+    tokio::pin!(cap);
     let mut stopped: Option<String> = None;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => { stopped = Some("사용자가 중지했습니다".into()); break; }
-            _ = &mut deadline => { stopped = Some(format!("{}초 안에 끝나지 않아 중지했습니다", timeout.as_secs())); break; }
+            _ = &mut cap => { stopped = Some(capped_error()); break; }
+            // 줄이 올 때마다 새로 잰다: 일하는 동안은 끝내지 않는다.
+            _ = tokio::time::sleep(idle) => { stopped = Some(stalled_error(idle)); out.stalled = true; break; }
             line = lines.next_line() => match line {
                 Ok(Some(l)) => {
                     for ev in parser.feed(&l) {
@@ -886,6 +1023,7 @@ pub async fn run(http: &reqwest::Client, spec: &RunSpec, timeout: Duration, canc
                             Event::Text(t) => out.text.push_str(t),
                             Event::Activity(a) => out.activities.push(a.clone()),
                             Event::Session(s) => out.session_id = Some(s.clone()),
+                            Event::Usage { .. } | Event::Bg(_) => {}
                             Event::Done(f) => finish = Some(f.clone()),
                         }
                         on_event(&ev);
@@ -960,6 +1098,93 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn pulse_waits_while_output_keeps_coming() {
+        let p = Pulse::new();
+        let idle = Duration::from_millis(150);
+        let started = Instant::now();
+        let feed = async {
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                p.beat();
+            }
+        };
+        let ((), ()) = tokio::join!(feed, async {
+            p.stalled(idle).await;
+        });
+        // 60ms마다 소식이 오는 동안(300ms)은 끝나지 않고, 마지막 소식 뒤 150ms가 지나서야 끝난다.
+        assert!(started.elapsed() >= Duration::from_millis(440), "{:?}", started.elapsed());
+    }
+
+    /// 가짜 엔진(PATH 앞의 codex.cmd)으로 실제 실행 경로를 확인한다. PATH를 바꾸므로 따로 돌린다:
+    /// cargo test --lib idle_stop_follows_output -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn idle_stop_follows_output() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("codex.cmd"), "@echo off
+if \"%FAKE_MODE%\"==\"busy\" (for /L %%i in (1,1,5) do (echo {} & ping -n 2 127.0.0.1 >nul)) else (echo {} & ping -n 11 127.0.0.1 >nul)
+").unwrap();
+        let path = format!("{};{}", dir.path().display(), std::env::var("PATH").unwrap_or_default());
+        std::env::set_var("PATH", path);
+        let http = reqwest::Client::new();
+        let s = RunSpec { resume: None, plugin_dirs: vec![], extra_dirs: vec![], cwd: dir.path().to_path_buf(), ..spec(EngineId::Codex, false) };
+        let idle = Duration::from_secs(3);
+        // 1초마다 출력이 나오면 한도(3초)를 넘겨 5초 넘게 돌아도 끝까지 둔다.
+        std::env::set_var("FAKE_MODE", "busy");
+        let t = Instant::now();
+        let o = run(&http, &s, idle, &CancellationToken::new(), |_| {}).await;
+        assert!(!o.stalled && t.elapsed() > Duration::from_secs(4), "{:?} {:?}", o.error, t.elapsed());
+        // 출력이 멈추면 한도가 지나 끝낸다.
+        std::env::set_var("FAKE_MODE", "quiet");
+        let t = Instant::now();
+        let o = run(&http, &s, idle, &CancellationToken::new(), |_| {}).await;
+        assert!(o.stalled && t.elapsed() < Duration::from_secs(8), "{:?} {:?}", o.error, t.elapsed());
+        assert_eq!(o.error.as_deref(), Some(stalled_error(idle).as_str()));
+    }
+
+    /// 실제 Claude Code로 백그라운드 셸을 돌려 본다(로그인 필요, 비용 조금): cargo test --lib live_claude_background -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn live_claude_background_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = RunSpec { prompt: "Use the PowerShell tool with run_in_background set to true to run exactly: Start-Sleep -Seconds 4; Write-Output bg-done-42 . Then wait until it finishes, read its output, and reply with the output only.".into(), system: String::new(), cwd: dir.path().to_path_buf(), resume: None, plugin_dirs: vec![], extra_dirs: vec![], model: Some("haiku".into()), ..spec(EngineId::Claude, true) };
+        let mut bg = vec![];
+        let o = run(&reqwest::Client::new(), &s, Duration::from_secs(240), &CancellationToken::new(), |e| {
+            if let Event::Bg(b) = e {
+                println!("{b:?}");
+                bg.push(b.clone());
+            }
+        })
+        .await;
+        println!("ok={} text={:?} err={:?}", o.ok, o.text, o.error);
+        let Some(Bg::Started { path, .. }) = bg.first() else { panic!("백그라운드 셸을 못 봤다") };
+        assert!(crate::bgjobs::tests_allowed(path), "{path:?}");
+        println!("output file: {:?}", std::fs::read_to_string(path));
+    }
+
+    #[test]
+    fn claude_background_shells_are_reported_with_their_output_file() {
+        let mut p = ClaudeParser::default();
+        let call = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"toolu_1","name":"PowerShell","input":{"command":"./gradlew build","run_in_background":true}},{"type":"tool_use","id":"toolu_2","name":"PowerShell","input":{"command":"ls"}}]}}"#;
+        assert!(!p.feed(call).iter().any(|e| matches!(e, Event::Bg(_))));
+        let done = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_2","content":"a.txt"},{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"Command running in background with ID: b3xk9. Output is being written to: C:\\Temp\\claude\\h\\sid\\tasks\\b3xk9.output. You will be notified when it completes."}]}]}}"#;
+        let evs = p.feed(done);
+        assert_eq!(evs, vec![Event::Bg(Bg::Started { id: "b3xk9".into(), command: "./gradlew build".into(), path: PathBuf::from(r"C:\Temp\claude\h\sid\tasks\b3xk9.output") })]);
+        let note = r#"{"type":"user","message":{"content":"<task-notification>\n<task-id>b3xk9</task-id>\n<tool-use-id>toolu_1</tool-use-id>\n<status>completed</status>\n<summary>done</summary></task-notification>"}}"#;
+        assert_eq!(p.feed(note), vec![Event::Bg(Bg::Ended { id: "b3xk9".into(), status: "completed".into() })]);
+        assert!(bg_ended("<task-id>x</task-id> no status here").is_empty());
+    }
+
+    #[test]
+    fn work_runs_get_a_long_idle_limit() {
+        assert_eq!(idle_limit(&spec(EngineId::Claude, true), Duration::from_secs(90)), WORK_IDLE);
+        assert_eq!(idle_limit(&spec(EngineId::Claude, true), Duration::from_secs(1800)), Duration::from_secs(1800));
+        assert_eq!(idle_limit(&spec(EngineId::Claude, false), Duration::from_secs(90)), Duration::from_secs(90));
+        assert!(stalled_error(Duration::from_secs(1200)).contains("20"));
+        assert!(capped_error().contains("6"));
+    }
+
     /// 실제 무료 모델로 끝까지 돌려 본다(네트워크 필요): cargo test --lib live_opencode -- --ignored --nocapture
     #[tokio::test]
     #[ignore]
@@ -1022,7 +1247,7 @@ mod tests {
     #[test]
     fn parses_opencode_stream() {
         let mut p = OpenCodeParser::default();
-        let evs: Vec<Event> = OPENCODE_SAMPLE.iter().flat_map(|l| p.feed(l)).collect();
+        let evs: Vec<Event> = OPENCODE_SAMPLE.iter().flat_map(|l| p.feed(l)).filter(|e| !matches!(e, Event::Usage { .. })).collect();
         assert_eq!(evs[0], Event::Session("ses_1".into()));
         assert_eq!(evs.iter().filter(|e| matches!(e, Event::Session(_))).count(), 1);
         assert_eq!(evs[1], Event::Activity("read · C:\\w\\note.txt".into()));
@@ -1039,6 +1264,21 @@ mod tests {
         let mut paid = OpenCodeParser::default();
         paid.feed(r#"{"type":"step_finish","part":{"cost":0.01,"tokens":{}}}"#);
         assert!(paid.charged > 0.0);
+    }
+
+    #[test]
+    fn live_usage_is_reported_while_running() {
+        let mut c = ClaudeParser::default();
+        let a = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"x"}],"usage":{"input_tokens":5,"cache_read_input_tokens":100,"output_tokens":7}}}"#;
+        assert_eq!(c.feed(a)[0], Event::Usage { input: 105, output: 7 });
+        assert!(c.feed(a).is_empty(), "같은 메시지의 다른 블록은 다시 더하지 않는다");
+        let b = r#"{"type":"assistant","message":{"id":"m2","content":[],"usage":{"input_tokens":10,"output_tokens":3}}}"#;
+        assert_eq!(c.feed(b)[0], Event::Usage { input: 115, output: 10 });
+        let mut g = AgyParser::default();
+        let step = |i: u64, o: u64| format!(r#"{{"event":"step_update","step_update":{{"step_index":{i},"state":"DONE","step_type":"agent_response","usage":{{"input_tokens":100,"output_tokens":{o}}}}}}}"#);
+        assert_eq!(g.feed(&step(1, 5))[0], Event::Usage { input: 100, output: 5 });
+        assert!(g.feed(&step(1, 5)).is_empty(), "바뀌지 않으면 알리지 않는다");
+        assert_eq!(g.feed(&step(2, 8))[0], Event::Usage { input: 200, output: 13 });
     }
 
     #[test]
@@ -1207,6 +1447,7 @@ mod tests {
         ]
         .iter()
         .flat_map(|l| p.feed(l))
+        .filter(|e| !matches!(e, Event::Usage { .. }))
         .collect();
         assert_eq!(evs[0], Event::Session("t-9".into()));
         assert_eq!(evs[1], Event::Activity("명령 · ls".into()));
@@ -1259,7 +1500,7 @@ mod tests {
     #[test]
     fn parses_antigravity_stream_and_keeps_chat_read_only() {
         let mut p = AgyParser::default();
-        let evs: Vec<Event> = AGY_SAMPLE.iter().flat_map(|l| p.feed(l)).collect();
+        let evs: Vec<Event> = AGY_SAMPLE.iter().flat_map(|l| p.feed(l)).filter(|e| !matches!(e, Event::Usage { .. })).collect();
         assert_eq!(evs[0], Event::Session("c-1".into()));
         assert_eq!(evs[1], Event::Activity("read_file · C:/w/note.txt".into()), "도구는 시작할 때 한 번");
         let text: String = evs.iter().filter_map(|e| if let Event::Text(t) = e { Some(t.as_str()) } else { None }).collect();

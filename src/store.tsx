@@ -1,11 +1,22 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { api, errorText, type GroupInfo, type GroupNote, type LeadDecision, type LeadPolicy, type LeadQuestion, type QueueView, type Approval, type Conversation, type EngineChoice, type EngineId, type EngineInfo, type Budget, type CouncilPlan, type DebatePlan, type Judgment, type Message, type Settings, type SkillRef, type SkillsView, type TeamPlan } from "./lib/api";
+import { api, errorText, type BgJob, type GroupInfo, type GroupNote, type OrgPost, type OrgUnit, type LeadCommit, type LeadNote, type LeadDecision, type LeadPolicy, type LeadQuestion, type QueueView, type Approval, type Conversation, type EngineChoice, type EngineId, type EngineInfo, type Budget, type CouncilPlan, type DebatePlan, type Judgment, type Message, type Settings, type SkillRef, type SkillsView, type TeamPlan } from "./lib/api";
 import { useTauriEvent } from "./lib/events";
 import { emit } from "@tauri-apps/api/event";
-import { ACTIVITY_KEEP, STREAM_KEEP } from "./lib/panel";
+import { ACTIVITY_KEEP, STREAM_KEEP, hideBlocks } from "./lib/panel";
+import { liveTurn, turnEvent, type RunUsage } from "./lib/usage";
+import { isSleeping } from "./lib/sleep";
+
+/** 총괄 활동 기록을 화면에 몇 개까지 둘지 */
+const TIMELINE_KEEP = 300;
+/** 팀장 보고를 몇 개까지 둘지 */
+const ORG_LOG_KEEP = 400;
+/** 창 테스트 로그를 화면에 몇 줄까지 둘지(백엔드 보관량과 같다) */
+const TEST_LOG_KEEP = 4000;
 
 /** 글자 조각을 화면에 반영하는 간격(ms) */
 const DELTA_FLUSH_MS = 50;
+/** 취침 중에는 화면이 꺼져 있으니 드물게 반영한다 */
+const SLEEP_FLUSH_MS = 2000;
 
 export interface Toast {
   id: number;
@@ -33,6 +44,8 @@ export interface AgentRun {
   sent: string[];
   /** 차례 사이에 무엇을 기다리는지(review·question·test·command) */
   wait?: string | null;
+  /** 백그라운드에서 도는 명령 수 */
+  bg?: number;
 }
 
 /** 곁질문 한 차례. 앱 메모리에만 두고 대화 기록에 남기지 않는다. */
@@ -64,6 +77,14 @@ export interface LeadState {
   questions: LeadQuestion[];
   groups: GroupInfo[];
   groupLog: GroupNote[];
+  /** 조직으로 일할 때 팀과 부서(없으면 비어 있다) */
+  org: OrgUnit[];
+  /** 팀장끼리 주고받은 보고 */
+  orgLog: OrgPost[];
+  /** 총괄이 지금까지 한 일(실시간) */
+  timeline: LeadNote[];
+  /** 총괄이 만든 커밋 */
+  commits: LeadCommit[];
 }
 
 /** 진행 중인 요청 하나(스트리밍 중인 답) */
@@ -97,6 +118,12 @@ export interface Live {
   agents: Record<string, AgentRun>;
   /** 병렬 작업일 때 실행 key → 하위 작업 */
   parts: Record<string, PartInfo>;
+  /** 총괄이 지운 워커 key. 늦게 온 이벤트로 다시 생기지 않게 한다. */
+  gone: Record<string, true>;
+  /** 에이전트가 뒤에서 돌리는 명령(id → 상태) */
+  bg: Record<string, BgJob>;
+  /** 실행 key → 토큰 사용량(실행 중에도 늘어난다) */
+  usage: Record<string, RunUsage>;
   startedAt: number;
   label: string | null;
   text: string;
@@ -107,8 +134,12 @@ export interface Live {
 export type Dialog = null | "settings" | "keys" | "skills" | "usage";
 
 interface AppCtx {
-  /** 게임 테스트 대기열(앱 전체) */
+  /** 창 테스트 대기열(앱 전체) */
   queue: QueueView;
+  /** 창 테스트 id → 로그 줄(실행 중이거나 최근에 끝난 테스트) */
+  testLogs: Record<number, string[]>;
+  /** 늦게 연 로그 창이 지금까지의 로그를 받아 온다 */
+  loadTestLog: (id: number) => void;
   engines: EngineInfo[];
   setEngines: (e: EngineInfo[]) => void;
   /** 새 세션을 시작할 때 쓸 폴더(없으면 기본 작업 폴더) */
@@ -173,8 +204,11 @@ const blank = (taskId: string, conversationId: string, work: boolean): Live => (
   team: null,
   council: null,
   streams: {},
+  usage: {},
   agents: {},
   parts: {},
+  gone: {},
+  bg: {},
   startedAt: Date.now(),
   effort: null,
   model: null,
@@ -185,18 +219,73 @@ const blank = (taskId: string, conversationId: string, work: boolean): Live => (
   activities: [],
 });
 
-/** 곁질문 AI에게 줄 지금 진행 상황(화면에는 보이지 않는다) */
-function progressOf(l: Live): string {
-  const lines = [`경과 ${Math.round((Date.now() - l.startedAt) / 1000)}초 · ${l.work ? "파일 작업" : "대화"}`];
-  if (l.reasons.length) lines.push(`계획: ${l.reasons.join(" / ")}`);
-  for (const a of Object.values(l.agents)) {
-    const last = a.activities[a.activities.length - 1];
-    lines.push(`- ${l.parts[a.key]?.title ?? a.label}(${a.role}): ${a.state === "run" ? "실행 중" : a.state === "ok" ? "완료" : "중단"}${last ? ` · 최근 활동: ${last}` : ""}`);
-    const text = l.streams[a.key];
-    if (text) lines.push(`  쓴 글 끝부분: ${text.slice(-400)}`);
+/** 곁질문에 보내는 진행 상황의 전체 길이(백엔드 SIDE_PROGRESS_CHARS와 맞춘다) */
+const PROGRESS_CHARS = 15000;
+const WAIT_NOTE: Record<string, string> = { review: "명령 검토 대기", question: "사용자 답 대기", test: "창 테스트 결과 대기", command: "할 일을 끝내고 백그라운드 명령 결과 대기", idle: "할 일을 끝내고 메시지 대기", commit: "변경 반영·커밋 검토 중" };
+
+function secs(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  return s >= 60 ? `${Math.floor(s / 60)}분 ${s % 60}초` : `${s}초`;
+}
+
+/** 곁질문 AI에게 줄 지금 진행 상황(화면에는 보이지 않는다). 개요를 먼저 쓰고, 워커마다 짧게, 출력 끝부분은 남은 길이에 맞춘다. */
+function progressOf(l: Live, queue: QueueView): string {
+  const now = Date.now();
+  const all = Object.values(l.agents).sort((a, b) => a.startedAt - b.startedAt);
+  const workers = all.filter((a) => a.key.startsWith("agent:"));
+  const others = all.filter((a) => !a.key.startsWith("agent:") && !a.key.startsWith("lead"));
+  const count = (xs: AgentRun[], f: (a: AgentRun) => boolean) => xs.filter(f).length;
+  const lines = [`[개요] 경과 ${secs(now - l.startedAt)} · ${l.work ? "파일 작업" : "대화"}${l.lead ? " · 병렬 작업(총괄 있음)" : ""}`];
+  if (workers.length) {
+    lines.push(`워커 ${workers.length}명: 완료 ${count(workers, (a) => a.state === "ok")} · 실패/중지 ${count(workers, (a) => a.state === "fail")} · 작업 중 ${count(workers, (a) => a.state === "run" && !a.wait)} · 대기 ${count(workers, (a) => a.state === "run" && !!a.wait)}`);
   }
-  if (l.text) lines.push(`지금 쓰는 답의 끝부분:\n${l.text.slice(-1200)}`);
-  return lines.join("\n");
+  if (l.reasons.length) lines.push(`계획: ${l.reasons.join(" / ")}`);
+  if (l.lead) {
+    const lead = l.lead;
+    const busy = ["lead", "lead-work"].map((k) => l.agents[k]).filter((a) => a?.state === "run");
+    lines.push(`총괄(${lead.label}): ${busy.length ? busy.map((a) => (a.key === "lead-work" ? "메인 폴더에서 직접 작업 중" : "판단 중")).join(", ") : "대기"} · 커밋 ${lead.commits.length}개 · 명령 판단 ${lead.decisions.length}건 · 열린 질문 ${lead.questions.length}개`);
+    for (const q of lead.questions) lines.push(`  사용자에게 묻는 중: ${q.question}`);
+  }
+  const tests = [...queue.running.map((t) => ({ t, s: "실행 중" })), ...queue.waiting.map((t, i) => ({ t, s: `대기 ${i + 1}번` }))].filter((x) => x.t.task === l.taskId);
+  if (tests.length) lines.push(`창 테스트: ${tests.map((x) => `${x.s} ${x.t.command}`).join(" / ")}`);
+  const row = (a: AgentRun) => {
+    const part = l.parts[a.key];
+    const state = a.state === "run" ? (a.wait ? WAIT_NOTE[a.wait] ?? a.wait : "작업 중") : a.state === "ok" ? "완료" : a.stopped ? "중지" : "실패";
+    const took = a.state === "run" ? now - a.startedAt : a.ms ?? 0;
+    const u = l.usage[a.key];
+    const tok = u ? u.done.output + u.cur.output : 0;
+    const recent = a.activities.slice(-3).join(" → ");
+    return [
+      `- ${part?.title ?? a.label} [${a.label}${a.model ? ` · ${a.model}` : ""}] ${state}${a.bg ? ` · 백그라운드 명령 ${a.bg}개 실행 중` : ""} · ${secs(took)} · 도구 ${a.activities.length}회${tok ? ` · 출력 토큰 ${tok}` : ""}`,
+      part?.files.length ? `  맡은 파일: ${part.files.slice(0, 6).join(", ")}${part.files.length > 6 ? " …" : ""}` : "",
+      recent ? `  최근 활동: ${recent}` : "",
+      a.error && a.state === "fail" ? `  오류: ${a.error}` : "",
+    ].filter(Boolean);
+  };
+  if (workers.length) lines.push("", "[워커별]");
+  for (const a of workers) lines.push(...row(a));
+  if (others.length) lines.push("", "[그 밖의 실행]");
+  for (const a of others) lines.push(...row(a));
+  if (l.lead?.timeline.length) {
+    lines.push("", "[총괄 최근 활동]");
+    for (const n of l.lead.timeline.slice(-10)) lines.push(`- ${n.kind}: ${n.text}`);
+  }
+  if (l.lead?.commits.length) {
+    lines.push("", "[커밋]");
+    for (const c of l.lead.commits.slice(-8)) lines.push(`- ${c.sha} ${c.message} (${c.files.length}개 파일)`);
+  }
+  // 출력 끝부분은 개요 뒤에 남은 길이를 실행 중인 것부터 나눠 쓴다.
+  const head = lines.join("\n");
+  const tails = [...all.filter((a) => a.state === "run"), ...all.filter((a) => a.state !== "run")].filter((a) => l.streams[a.key]?.trim());
+  const room = PROGRESS_CHARS - head.length - (l.text ? 1300 : 0) - 200;
+  const each = tails.length ? Math.max(0, Math.min(900, Math.floor(room / tails.length) - 40)) : 0;
+  const out = [head];
+  if (each >= 120) {
+    out.push("", "[실행별 출력 끝부분]");
+    for (const a of tails) out.push(`- ${l.parts[a.key]?.title ?? a.label}: …${hideBlocks(l.streams[a.key]).slice(-each).replace(/\s+/g, " ")}`);
+  }
+  if (l.text) out.push("", `[지금 쓰는 답의 끝부분]\n${l.text.slice(-1200)}`);
+  return out.join("\n");
 }
 
 export function AppProvider({ children }: { children: ReactNode }) {
@@ -206,7 +295,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [live, setLive] = useState<Record<string, Live>>({});
-  const [queue, setQueue] = useState<QueueView>({ capacity: 1, running: [], waiting: [] });
+  const [queue, setQueue] = useState<QueueView>({ capacity: 1, running: [], waiting: [], recent: [] });
+  const [testLogs, setTestLogs] = useState<Record<number, string[]>>({});
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [skills, setSkills] = useState<SkillsView | null>(null);
   const [dialog, setDialog] = useState<Dialog>(null);
@@ -294,7 +384,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     });
   }, []);
   const queueDeltas = () => {
-    if (pending.current.timer == null) pending.current.timer = window.setTimeout(flushDeltas, DELTA_FLUSH_MS);
+    if (pending.current.timer == null) pending.current.timer = window.setTimeout(flushDeltas, isSleeping() ? SLEEP_FLUSH_MS : DELTA_FLUSH_MS);
   };
   useEffect(
     () => () => {
@@ -309,18 +399,20 @@ export function AppProvider({ children }: { children: ReactNode }) {
       [p.taskId]: { ...(m[p.taskId] ?? blank(p.taskId, p.conversationId, p.work)), messageId: p.messageId, primary: p.primary, reviewer: p.reviewer, work: p.work, skill: p.skill, reasons: p.reasons, jev: p.jev, budget: p.budget, debate: p.debate ?? null, team: p.team ?? null, council: p.council ?? null, model: p.model ?? null },
     })),
   );
-  useTauriEvent<{ taskId: string; conversationId: string; key: string; engine: EngineId; label: string; role: string; state: AgentRun["state"]; model?: string | null; effort?: string | null; ms?: number; error?: string | null; chars?: number; stopped?: boolean }>("task:agent", (p) =>
+  useTauriEvent<{ taskId: string; conversationId: string; key: string; engine: EngineId; label: string; role: string; state: AgentRun["state"]; model?: string | null; effort?: string | null; ms?: number; error?: string | null; chars?: number; stopped?: boolean; inputTokens?: number | null; outputTokens?: number | null; costUsd?: number | null }>("task:agent", (p) =>
     setLive((m) => {
       const l = m[p.taskId] ?? blank(p.taskId, p.conversationId, false);
+      if (l.gone[p.key]) return m;
       const prev = l.agents[p.key];
       const run: AgentRun =
         p.state === "run"
           ? // 같은 워커의 다음 차례는 앞선 기록을 이어 간다.
-            { key: p.key, engine: p.engine, label: p.label, role: p.role, model: p.model ?? null, effort: p.effort ?? null, state: "run", startedAt: prev?.startedAt ?? Date.now(), ms: null, error: null, chars: null, activities: prev?.activities ?? [], stopped: false, sent: prev?.sent ?? [], wait: null }
+            { key: p.key, engine: p.engine, label: p.label, role: p.role, model: p.model ?? null, effort: p.effort ?? null, state: "run", startedAt: prev?.startedAt ?? Date.now(), ms: null, error: null, chars: null, activities: prev?.activities ?? [], stopped: false, sent: prev?.sent ?? [], wait: null, bg: prev?.bg ?? 0 }
           : { ...(prev ?? { key: p.key, engine: p.engine, label: p.label, role: p.role, model: null, effort: null, startedAt: Date.now(), activities: [], sent: [] }), state: p.state, ms: p.ms ?? null, error: p.error ?? null, chars: p.chars ?? null, stopped: !!p.stopped, wait: null };
-      return { ...m, [p.taskId]: { ...l, agents: { ...l.agents, [p.key]: run } } };
+      return { ...m, [p.taskId]: { ...l, agents: { ...l.agents, [p.key]: run }, usage: { ...l.usage, [p.key]: turnEvent(l.usage[p.key], p) } } };
     }),
   );
+  useTauriEvent<{ taskId: string; key: string; input: number; output: number; costUsd: number | null }>("task:agent-usage", (p) => patch(p.taskId, (l) => ({ ...l, usage: { ...l.usage, [p.key]: liveTurn(l.usage[p.key], p) } })));
   useTauriEvent<{ taskId: string; key: string; text: string }>("task:agent-activity", (p) =>
     patch(p.taskId, (l) => {
       const a = l.agents[p.key];
@@ -333,10 +425,17 @@ export function AppProvider({ children }: { children: ReactNode }) {
       return a ? { ...l, agents: { ...l.agents, [p.key]: { ...a, state: "run", wait: p.note } } } : l;
     }),
   );
+  useTauriEvent<BgJob>("task:bg-job", (j) => patch(j.taskId, (l) => ({ ...l, bg: { ...l.bg, [j.id]: j } })));
+  useTauriEvent<{ taskId: string; key: string; count: number }>("task:agent-bg", (p) =>
+    patch(p.taskId, (l) => {
+      const a = l.agents[p.key];
+      return a ? { ...l, agents: { ...l.agents, [p.key]: { ...a, bg: p.count } } } : l;
+    }),
+  );
   useTauriEvent<{ taskId: string; conversationId: string; engine: EngineId; label: string; model: string | null }>("lead:started", (p) =>
     setLive((m) => {
       const l = m[p.taskId] ?? blank(p.taskId, p.conversationId, true);
-      return { ...m, [p.taskId]: { ...l, lead: { engine: p.engine, label: p.label, model: p.model, said: [], policy: { allowAll: false, rules: [] }, decisions: [], questions: [], groups: [], groupLog: [] } } };
+      return { ...m, [p.taskId]: { ...l, lead: { engine: p.engine, label: p.label, model: p.model, said: [], policy: { allowAll: false, rules: [] }, decisions: [], questions: [], groups: [], groupLog: [], org: [], orgLog: [], timeline: [], commits: [] } } };
     }),
   );
   const patchLead = (taskId: string, fn: (d: LeadState) => LeadState) => patch(taskId, (l) => (l.lead ? { ...l, lead: fn(l.lead) } : l));
@@ -350,7 +449,23 @@ export function AppProvider({ children }: { children: ReactNode }) {
   );
   useTauriEvent<{ taskId: string; groups: GroupInfo[] }>("task:groups", (p) => patchLead(p.taskId, (d) => ({ ...d, groups: p.groups })));
   useTauriEvent<GroupNote>("group:say", (p) => patchLead(p.taskId, (d) => ({ ...d, groupLog: [...d.groupLog, p] })));
-  useTauriEvent<QueueView>("queue:changed", setQueue);
+  useTauriEvent<{ taskId: string; units: OrgUnit[] }>("task:org", (p) => patchLead(p.taskId, (d) => ({ ...d, org: p.units })));
+  useTauriEvent<OrgPost>("org:post", (p) => patchLead(p.taskId, (d) => ({ ...d, orgLog: [...d.orgLog, p].slice(-ORG_LOG_KEEP) })));
+  useTauriEvent<{ taskId: string } & LeadNote>("lead:activity", (p) => patchLead(p.taskId, (d) => ({ ...d, timeline: [...d.timeline, p].slice(-TIMELINE_KEEP) })));
+  useTauriEvent<LeadCommit>("lead:commit", (p) => patchLead(p.taskId, (d) => ({ ...d, commits: [...d.commits, p] })));
+  useTauriEvent<QueueView>("queue:changed", (v) => {
+    setQueue(v);
+    // 대기열에서 사라진 테스트의 로그는 버린다.
+    const keep = new Set([...v.running, ...v.waiting, ...v.recent].map((t) => t.id));
+    setTestLogs((m) => (Object.keys(m).some((id) => !keep.has(Number(id))) ? Object.fromEntries(Object.entries(m).filter(([id]) => keep.has(Number(id)))) : m));
+  });
+  useTauriEvent<{ id: number; lines: string[] }>("test:log", (p) => setTestLogs((m) => ({ ...m, [p.id]: [...(m[p.id] ?? []), ...p.lines].slice(-TEST_LOG_KEEP) })));
+  const loadTestLog = useCallback((id: number) => {
+    api
+      .testLog(id)
+      .then((lines) => setTestLogs((m) => ({ ...m, [id]: lines.length >= (m[id]?.length ?? 0) ? lines : m[id] })))
+      .catch(() => {});
+  }, []);
   useEffect(() => {
     api.queueGet().then(setQueue).catch(() => {});
   }, []);
@@ -361,7 +476,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
     const l = liveRef.current[p.task];
     const pick = <T,>(from: Record<string, T> | undefined) => Object.fromEntries(p.keys.filter((k) => from?.[k] !== undefined).map((k) => [k, from![k]]));
     const groupIndex = l?.lead?.groups.find((g) => g.keys.some((k) => p.keys.includes(k)))?.index;
-    emit("worker-window:snapshot", { label: p.label, runs: pick(l?.agents), streams: pick(l?.streams), parts: pick(l?.parts), decisions: l?.lead?.decisions.filter((d) => p.keys.includes(d.key)) ?? [], groupLog: l?.lead?.groupLog.filter((g) => g.group === groupIndex) ?? [] });
+    const unit = l?.lead?.org.find((u) => u.keys.some((k) => p.keys.includes(k))) ?? null;
+    const orgLog = unit ? (l?.lead?.orgLog ?? []).filter((x) => x.from === unit.index || x.to.includes(unit.index)) : [];
+    emit("worker-window:snapshot", { label: p.label, runs: pick(l?.agents), streams: pick(l?.streams), parts: pick(l?.parts), usage: pick(l?.usage), decisions: l?.lead?.decisions.filter((d) => p.keys.includes(d.key)) ?? [], groupLog: l?.lead?.groupLog.filter((g) => g.group === groupIndex) ?? [], unit, orgLog });
   });
   useTauriEvent<{ taskId: string; key: string; text: string }>("task:agent-message", (p) =>
     patch(p.taskId, (l) => {
@@ -378,7 +495,23 @@ export function AppProvider({ children }: { children: ReactNode }) {
   useTauriEvent<{ taskId: string; conversationId: string; parts: ({ key: string } & PartInfo)[] }>("task:parts", (p) =>
     setLive((m) => {
       const l = m[p.taskId] ?? blank(p.taskId, p.conversationId, true);
-      return { ...m, [p.taskId]: { ...l, parts: Object.fromEntries(p.parts.map((x) => [x.key, { title: x.title, files: x.files }])) } };
+      // 총괄이 단계 중에 더한 워커는 다음 단계 목록에 없으니 덮지 않고 합친다.
+      return { ...m, [p.taskId]: { ...l, parts: { ...l.parts, ...Object.fromEntries(p.parts.map((x) => [x.key, { title: x.title, files: x.files }])) } } };
+    }),
+  );
+  // 총괄이 단계 중에 워커를 새로 만들었다.
+  useTauriEvent<{ taskId: string; conversationId: string; key: string; title: string; files: string[] }>("task:part-added", (p) =>
+    setLive((m) => {
+      const l = m[p.taskId] ?? blank(p.taskId, p.conversationId, true);
+      return { ...m, [p.taskId]: { ...l, parts: { ...l.parts, [p.key]: { title: p.title, files: p.files } } } };
+    }),
+  );
+  // 총괄이 워커를 지웠다: 카드·글·사용량을 바로 뺀다.
+  useTauriEvent<{ taskId: string; key: string }>("task:agent-removed", (p) =>
+    patch(p.taskId, (l) => {
+      const drop = <T,>(r: Record<string, T>) => Object.fromEntries(Object.entries(r).filter(([k]) => k !== p.key));
+      const lead = l.lead && { ...l.lead, groups: l.lead.groups.map((g) => ({ ...g, keys: g.keys.filter((k) => k !== p.key) })).filter((g) => g.keys.length > 0) };
+      return { ...l, lead, agents: drop(l.agents), parts: drop(l.parts), streams: drop(l.streams), usage: drop(l.usage), gone: { ...l.gone, [p.key]: true } };
     }),
   );
   // 병렬 작업을 나눌 수 없어 한 AI로 돌아갈 때
@@ -494,7 +627,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     async (question: string) => {
       const id = crypto.randomUUID();
       const running = Object.values(live).filter((l) => l.conversationId === conversationId);
-      const progress = running.length ? running.map(progressOf).join("\n\n") : null;
+      const progress = running.length ? running.map((l) => progressOf(l, queue)).join("\n\n") : null;
       const thread = side.filter((t) => t.text.trim() && t.state !== "fail").map((t) => ({ role: t.role, text: t.text }));
       setSideThreads((m) => ({ ...m, [sideKey]: [...(m[sideKey] ?? []), { id: `${id}:q`, role: "user", text: question }, { id, role: "assistant", text: "", state: "run" }] }));
       try {
@@ -503,7 +636,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         patchSide(id, (t) => ({ ...t, state: "fail", error: errorText(e) }));
       }
     },
-    [conversationId, live, newFolder, patchSide, side, sideKey],
+    [conversationId, live, newFolder, patchSide, side, sideKey, queue],
   );
   const stopSide = useCallback(() => {
     for (const t of side) if (t.state === "run") api.taskCancel(t.id).catch(() => {});
@@ -552,6 +685,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const value = useMemo<AppCtx>(
     () => ({
       queue,
+      testLogs,
+      loadTestLog,
       engines,
       setEngines,
       newFolder,
@@ -584,7 +719,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       toasts,
       toast,
     }),
-    [queue, engines, newFolder, chooseFolder, resetFolder, refreshEngines, settings, saveSettings, conversations, conversationId, deleteConversation, messages, live, approvals, decide, send, cancel, cancelAgent, cancelAll, side, askSide, stopSide, clearSide, skills, refreshSkills, dialog, toasts, toast],
+    [queue, testLogs, loadTestLog, engines, newFolder, chooseFolder, resetFolder, refreshEngines, settings, saveSettings, conversations, conversationId, deleteConversation, messages, live, approvals, decide, send, cancel, cancelAgent, cancelAll, side, askSide, stopSide, clearSide, skills, refreshSkills, dialog, toasts, toast],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

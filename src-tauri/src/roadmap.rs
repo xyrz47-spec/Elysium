@@ -128,7 +128,7 @@ pub fn parse_next(text: &str, max_parts: usize, engines: &[EngineId]) -> (Vec<Ne
         .enumerate()
         .map(|(i, it)| NextPart {
             engine: it.engine.as_deref().and_then(|e| engine_in(e, engines)),
-            part: Part { title: if it.title.trim().is_empty() { format!("#{}", i + 1) } else { it.title.trim().to_string() }, task: it.task, files: it.files, members: 1 },
+            part: Part { title: if it.title.trim().is_empty() { format!("#{}", i + 1) } else { it.title.trim().to_string() }, task: it.task, files: it.files, members: 1, org: vec![] },
         })
         .collect();
     (next, clean)
@@ -140,7 +140,7 @@ mod tests {
     use EngineId::*;
 
     fn part(title: &str) -> Part {
-        Part { title: title.into(), task: format!("{title} 만들기"), files: vec![], members: 1 }
+        Part { title: title.into(), task: format!("{title} 만들기"), files: vec![], members: 1, org: vec![] }
     }
 
     #[test]

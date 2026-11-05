@@ -6,6 +6,7 @@ import Segmented from "./Segmented";
 import { AgentsIcon, ArrowDownIcon, ArrowUpIcon, ChatIcon, ChevronIcon, CloseIcon, DownloadIcon, FolderIcon, InfoIcon, ListIcon, SearchIcon, SendIcon, StopIcon, TrashIcon } from "./Icons";
 import Markdown from "./Markdown";
 import { LeadSection, QueueCard } from "./LeadPanel";
+import { BgJobs } from "./BgJobs";
 import { tailText } from "../lib/panel";
 import { INTEGRATE, pair, ROLE_LABEL } from "./Thread";
 
@@ -246,11 +247,12 @@ function AgentsTab({ onClose }: { onClose: () => void }) {
               <ul className="agent-runs">
                 {runs.length === 0 && <li className="agent-run wait">{waiting ? A.approval : A.preparing}</li>}
                 {runs
-                  .filter((a) => !l.lead || (!a.key.startsWith("agent:") && a.key !== "lead"))
+                  .filter((a) => !l.lead || (!a.key.startsWith("agent:") && !a.key.startsWith("lead")))
                   .map((a) => (
                     <AgentRow key={a.key} l={l} a={a} now={now} />
                   ))}
               </ul>
+              <BgJobs l={l} />
               <div className="row">
                 {l.conversationId !== conversationId && (
                   <button

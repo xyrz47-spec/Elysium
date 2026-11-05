@@ -34,8 +34,10 @@ export interface Settings {
   agentsAuto: boolean;
   /** 입력하는 동안 JEV가 모드·스킬을 추천한다 */
   jevSuggest: boolean;
-  /** 게임 창을 띄우는 테스트를 동시에 몇 개까지 돌릴지(앱 전체, 1~8) */
+  /** 창을 띄우는 실행(창 테스트)을 동시에 몇 개까지 돌릴지(앱 전체, 1~8) */
   testSlots: number;
+  /** 병렬 작업에서 워커가 끝낼 때마다 총괄이 변경을 검토·보정한 뒤 커밋한다 */
+  leadCommit: boolean;
 }
 
 /** 채팅에 붙은 파일(사용자가 올렸거나 에이전트가 답에 붙임) */
@@ -182,7 +184,7 @@ export interface MessageData {
   judgedBy?: EngineId;
   synthBy?: EngineId;
   /** work: 병렬 작업(하위 작업마다 폴더 사본에서 고친 뒤 합침) — title·files·conflicts가 있다 */
-  team?: { agents: { engine: EngineId; model: string | null; ok: boolean; text: string; title?: string; files?: string[] }[]; synth: EngineId | null; work?: boolean; conflicts?: string[]; decisions?: LeadDecision[]; groupLog?: GroupNote[] };
+  team?: { agents: { engine: EngineId; model: string | null; ok: boolean; text: string; title?: string; files?: string[] }[]; synth: EngineId | null; work?: boolean; conflicts?: string[]; decisions?: LeadDecision[]; groupLog?: GroupNote[]; leadLog?: LeadNote[]; orgLog?: OrgPost[] };
   debate?: { participants: EngineId[]; judge: EngineId | null; rounds: { round: number; engine: EngineId; text: string }[] };
   council?: { agents: { engine: EngineId; model: string | null }[]; rounds: CouncilTurn[]; synth: EngineId | null; agreed: boolean; agree: number | null; maxRounds: number };
   jevChecks?: JevCheck[];
@@ -304,27 +306,82 @@ export interface GroupInfo {
   keys: string[];
 }
 
+/** 조직으로 일할 때 하위 작업(팀) 하나: 속한 부서(바깥 → 안쪽)와 보고를 주고받는 팀 */
+export interface OrgUnit {
+  index: number;
+  title: string;
+  org: string[];
+  keys: string[];
+  peers: number[];
+}
+
+/** 팀장이 다른 팀장에게 올린 보고 */
+export interface OrgPost {
+  taskId: string;
+  from: number;
+  title: string;
+  to: number[];
+  text: string;
+  at: string;
+}
+
 export interface TestItem {
   id: number;
   task: string;
   key: string;
   command: string;
+  startedAt: number | null;
+}
+
+/** 끝난 창 테스트(최근 몇 개) */
+export interface TestDone {
+  id: number;
+  task: string;
+  key: string;
+  command: string;
+  ok: boolean;
+  summary: string;
+  startedAt: number | null;
+  endedAt: number;
 }
 
 export interface QueueView {
   capacity: number;
   running: TestItem[];
   waiting: TestItem[];
+  recent: TestDone[];
+}
+
+/** 총괄이 한 일 한 줄 */
+export interface LeadNote {
+  taskId: string;
+  kind: "review" | "consult" | "merge" | "conflict" | "commit" | "hold" | "work" | "test" | "warn" | "info";
+  text: string;
+  at: string;
+}
+
+/** 총괄이 만든 커밋 */
+export interface LeadCommit {
+  taskId: string;
+  sha: string;
+  message: string;
+  files: string[];
+  note: string;
 }
 
 export const api = {
-  leadSend: (taskId: string, text: string, about: string | null) => invoke<void>("lead_send", { taskId, text, about }),
+  leadSend: (taskId: string, text: string, about: string | null, direct = false) => invoke<void>("lead_send", { taskId, text, about, direct }),
   leadAnswer: (questionId: string, text: string) => invoke<void>("lead_answer", { questionId, text }),
   leadQuestions: () => invoke<LeadQuestion[]>("lead_questions"),
   leadRevoke: (taskId: string) => invoke<void>("lead_revoke", { taskId }),
   testCancel: (id: number) => invoke<boolean>("test_cancel", { id }),
   queueGet: () => invoke<QueueView>("queue_get"),
+  testLog: (id: number) => invoke<string[]>("test_log", { id }),
+  bgJobs: (taskId?: string) => invoke<BgJob[]>("bg_jobs", { taskId }),
+  bgRead: (id: string) => invoke<string>("bg_read", { id }),
+  bgStop: (id: string) => invoke<boolean>("bg_stop", { id }),
   workerWindowOpen: (taskId: string, key: string, title: string) => invoke<void>("worker_window_open", { taskId, key, title }),
+  powerSleep: (on: boolean, monitorOff: boolean) => invoke<void>("power_sleep", { on, monitorOff }),
   appInfo: () => invoke<AppInfo>("app_info"),
   settingsGet: () => invoke<Settings>("settings_get"),
   settingsUpdate: (settings: Settings) => invoke<Settings>("settings_update", { settings }),
@@ -381,7 +438,7 @@ export const api = {
   usageSummary: (range: UsageRange) => invoke<UsageSummary>("usage_summary", { range }),
   pricingList: () => invoke<ModelPrice[]>("pricing_list"),
   remoteStatus: () => invoke<RemoteStatus>("remote_status"),
-  remoteConfigure: (enabled: boolean, allowApprove: boolean) => invoke<RemoteStatus>("remote_configure", { enabled, allowApprove }),
+  remoteConfigure: (enabled: boolean, allowApprove: boolean, relay?: boolean) => invoke<RemoteStatus>("remote_configure", { enabled, allowApprove, relay }),
   remotePairStart: () => invoke<PairInfo>("remote_pair_start"),
   remotePairCancel: () => invoke<void>("remote_pair_cancel"),
   remoteRevoke: (id: string) => invoke<RemoteStatus>("remote_revoke", { id }),
@@ -390,11 +447,13 @@ export const api = {
 
 /** 원격 제어(폰 앱) 상태. 토큰 값은 PC에도 남기지 않는다(해시만). */
 export interface RemoteStatus {
-  config: { enabled: boolean; port: number; allowApprove: boolean };
+  config: { enabled: boolean; port: number; allowApprove: boolean; relay: boolean };
   running: number | null;
   addresses: { ip: string; kind: "lan" | "tailscale"; name: string }[];
   fingerprint: string | null;
   devices: { id: string; name: string; createdAt: string; lastSeenAt: string | null }[];
+  /** 다른 네트워크 연결(iroh 터널) 상태. 꺼져 있으면 null */
+  relay: "starting" | "online" | "error" | null;
 }
 
 export interface PairInfo {
@@ -480,4 +539,19 @@ export function stripFileMarkers(text: string): string {
 export function baseName(path: string): string {
   const parts = path.replace(/[\\/]+$/, "").split(/[\\/]/);
   return parts[parts.length - 1] || path;
+}
+
+/** 에이전트가 뒤에서 돌리는 명령 */
+export interface BgJob {
+  id: string;
+  taskId: string;
+  /** 이 명령을 돌린 실행 key */
+  key: string;
+  command: string;
+  /** claude: Claude Code의 백그라운드 셸, elysium: Elysium이 워커 대신 실행 */
+  source: "claude" | "elysium";
+  state: "run" | "ok" | "fail" | "stopped";
+  startedAt: string;
+  endedAt: string | null;
+  stoppable: boolean;
 }

@@ -1,4 +1,4 @@
-//! 게임 창을 띄우는 테스트의 대기열. 앱 전체에 하나이고, 먼저 온 순서대로 자리가 나면 시작한다.
+//! 창을 띄우는 실행(창 테스트)의 대기열. 앱 전체에 하나이고, 먼저 온 순서대로 자리가 나면 시작한다.
 
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -14,7 +14,30 @@ pub struct TestItem {
     pub task: String,
     pub key: String,
     pub command: String,
+    /// 실행을 시작한 시각(ms). 기다리는 중이면 None.
+    #[serde(default)]
+    pub started_at: Option<i64>,
 }
+
+/// 끝난 테스트 하나(최근 몇 개만 둔다)
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestDone {
+    pub id: u64,
+    pub task: String,
+    pub key: String,
+    pub command: String,
+    pub ok: bool,
+    /// 결과 첫 줄(종료 코드·취소 이유)
+    pub summary: String,
+    pub started_at: Option<i64>,
+    pub ended_at: i64,
+}
+
+/// 테스트마다 보관하는 로그 줄 수(넘으면 앞에서부터 버린다)
+pub const LOG_LINES: usize = 4000;
+/// 끝난 테스트를 몇 개까지 보여 줄지
+const RECENT: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -22,6 +45,7 @@ pub struct QueueView {
     pub capacity: usize,
     pub running: Vec<TestItem>,
     pub waiting: Vec<TestItem>,
+    pub recent: Vec<TestDone>,
 }
 
 struct State {
@@ -29,6 +53,8 @@ struct State {
     running: Vec<TestItem>,
     waiting: VecDeque<TestItem>,
     stops: HashMap<u64, CancellationToken>,
+    recent: VecDeque<TestDone>,
+    logs: HashMap<u64, VecDeque<String>>,
 }
 
 type OnChange = Box<dyn Fn(QueueView) + Send + Sync>;
@@ -80,7 +106,7 @@ impl Drop for WaitSpot<'_> {
 impl TestQueue {
     pub fn new(capacity: usize) -> Self {
         TestQueue {
-            state: Mutex::new(State { capacity: capacity.max(1), running: vec![], waiting: VecDeque::new(), stops: HashMap::new() }),
+            state: Mutex::new(State { capacity: capacity.max(1), running: vec![], waiting: VecDeque::new(), stops: HashMap::new(), recent: VecDeque::new(), logs: HashMap::new() }),
             notify: Notify::new(),
             next: AtomicU64::new(1),
             on_change: Mutex::new(None),
@@ -113,9 +139,43 @@ impl TestQueue {
         self.changed();
     }
 
+    /// 지금 열려 있는 창 테스트 수(목록을 복사하지 않는다)
+    pub fn running_count(&self) -> usize {
+        self.lock().running.len()
+    }
+
     pub fn snapshot(&self) -> QueueView {
         let s = self.lock();
-        QueueView { capacity: s.capacity, running: s.running.clone(), waiting: s.waiting.iter().cloned().collect() }
+        QueueView { capacity: s.capacity, running: s.running.clone(), waiting: s.waiting.iter().cloned().collect(), recent: s.recent.iter().rev().cloned().collect() }
+    }
+
+    /// 테스트 로그 한 줄을 보관한다.
+    pub fn push_log(&self, id: u64, line: &str) {
+        let mut s = self.lock();
+        let log = s.logs.entry(id).or_default();
+        log.push_back(line.to_string());
+        while log.len() > LOG_LINES {
+            log.pop_front();
+        }
+    }
+
+    /// 보관 중인 로그(실행 중이거나 최근에 끝난 테스트)
+    pub fn log(&self, id: u64) -> Vec<String> {
+        self.lock().logs.get(&id).map(|l| l.iter().cloned().collect()).unwrap_or_default()
+    }
+
+    /// 끝난 테스트를 기록한다. 오래된 기록의 로그는 버린다.
+    pub fn finish(&self, item: &TestItem, started_at: Option<i64>, ok: bool, summary: &str) {
+        {
+            let mut s = self.lock();
+            s.recent.push_back(TestDone { id: item.id, task: item.task.clone(), key: item.key.clone(), command: item.command.clone(), ok, summary: summary.chars().take(200).collect(), started_at, ended_at: now_ms() });
+            while s.recent.len() > RECENT {
+                if let Some(old) = s.recent.pop_front() {
+                    s.logs.remove(&old.id);
+                }
+            }
+        }
+        self.changed();
     }
 
     /// 대기 순번(1부터). 이미 시작했거나 없으면 None.
@@ -152,7 +212,8 @@ impl TestQueue {
                 let mut s = self.lock();
                 let head = s.waiting.front().is_some_and(|i| i.id == id);
                 if head && s.running.len() < s.capacity {
-                    let it = s.waiting.pop_front().expect("head");
+                    let mut it = s.waiting.pop_front().expect("head");
+                    it.started_at = Some(now_ms());
                     s.running.push(it);
                     true
                 } else {
@@ -172,13 +233,17 @@ impl TestQueue {
     }
 }
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
 
     fn item(q: &TestQueue, name: &str) -> TestItem {
-        TestItem { id: q.next_id(), task: "t".into(), key: name.into(), command: name.into() }
+        TestItem { id: q.next_id(), task: "t".into(), key: name.into(), command: name.into(), started_at: None }
     }
 
     async fn soon<T>(f: impl std::future::Future<Output = T>) -> T {
@@ -263,6 +328,26 @@ mod tests {
         assert!(q.snapshot().waiting.is_empty());
         drop(a);
         assert!(soon(q.acquire(item(&q, "c"), &c)).await.is_some(), "빠진 뒤에도 줄이 막히지 않는다");
+    }
+
+    #[test]
+    fn logs_are_capped_and_dropped_with_old_history() {
+        let q = TestQueue::new(1);
+        let first = item(&q, "a");
+        for i in 0..LOG_LINES + 5 {
+            q.push_log(first.id, &i.to_string());
+        }
+        let log = q.log(first.id);
+        assert_eq!(log.len(), LOG_LINES);
+        assert_eq!(log[0], "5", "오래된 줄부터 버린다");
+        q.finish(&first, None, true, "종료 코드 0");
+        assert_eq!(q.snapshot().recent[0].summary, "종료 코드 0");
+        for _ in 0..RECENT {
+            let it = item(&q, "b");
+            q.finish(&it, None, false, "x");
+        }
+        assert!(q.log(first.id).is_empty(), "기록에서 밀려나면 로그도 버린다");
+        assert_eq!(q.snapshot().recent.len(), RECENT);
     }
 
     #[tokio::test]

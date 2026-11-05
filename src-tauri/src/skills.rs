@@ -269,6 +269,96 @@ const BUILTIN_SKILLS: &[Builtin] = &[
         files: &[
             ("SKILL.md", include_str!("../seed-skills/root-cause/SKILL.md")),
         ],
+    },    // 여러 분야의 기본 스킬(2026-11-04 추가)
+    Builtin {
+        dir: "test-writer",
+        version: 1,
+        files: &[("SKILL.md", include_str!("../seed-skills/test-writer/SKILL.md"))],
+    },
+    Builtin {
+        dir: "refactor",
+        version: 1,
+        files: &[("SKILL.md", include_str!("../seed-skills/refactor/SKILL.md"))],
+    },
+    Builtin {
+        dir: "security-audit",
+        version: 1,
+        files: &[("SKILL.md", include_str!("../seed-skills/security-audit/SKILL.md"))],
+    },
+    Builtin {
+        dir: "sql-helper",
+        version: 1,
+        files: &[("SKILL.md", include_str!("../seed-skills/sql-helper/SKILL.md"))],
+    },
+    Builtin {
+        dir: "api-design",
+        version: 1,
+        files: &[("SKILL.md", include_str!("../seed-skills/api-design/SKILL.md"))],
+    },
+    Builtin {
+        dir: "doc-writer",
+        version: 1,
+        files: &[("SKILL.md", include_str!("../seed-skills/doc-writer/SKILL.md"))],
+    },
+    Builtin {
+        dir: "commit-message",
+        version: 1,
+        files: &[("SKILL.md", include_str!("../seed-skills/commit-message/SKILL.md"))],
+    },
+    Builtin {
+        dir: "data-analysis",
+        version: 1,
+        files: &[("SKILL.md", include_str!("../seed-skills/data-analysis/SKILL.md"))],
+    },
+    Builtin {
+        dir: "excel-formula",
+        version: 1,
+        files: &[("SKILL.md", include_str!("../seed-skills/excel-formula/SKILL.md"))],
+    },
+    Builtin {
+        dir: "email-writer",
+        version: 1,
+        files: &[("SKILL.md", include_str!("../seed-skills/email-writer/SKILL.md"))],
+    },
+    Builtin {
+        dir: "meeting-notes",
+        version: 1,
+        files: &[("SKILL.md", include_str!("../seed-skills/meeting-notes/SKILL.md"))],
+    },
+    Builtin {
+        dir: "business-plan",
+        version: 1,
+        files: &[("SKILL.md", include_str!("../seed-skills/business-plan/SKILL.md"))],
+    },
+    Builtin {
+        dir: "marketing-copy",
+        version: 1,
+        files: &[("SKILL.md", include_str!("../seed-skills/marketing-copy/SKILL.md"))],
+    },
+    Builtin {
+        dir: "presentation",
+        version: 1,
+        files: &[("SKILL.md", include_str!("../seed-skills/presentation/SKILL.md"))],
+    },
+    Builtin {
+        dir: "study-tutor",
+        version: 1,
+        files: &[("SKILL.md", include_str!("../seed-skills/study-tutor/SKILL.md"))],
+    },
+    Builtin {
+        dir: "resume",
+        version: 1,
+        files: &[("SKILL.md", include_str!("../seed-skills/resume/SKILL.md"))],
+    },
+    Builtin {
+        dir: "travel-plan",
+        version: 1,
+        files: &[("SKILL.md", include_str!("../seed-skills/travel-plan/SKILL.md"))],
+    },
+    Builtin {
+        dir: "prompt-engineer",
+        version: 1,
+        files: &[("SKILL.md", include_str!("../seed-skills/prompt-engineer/SKILL.md"))],
     },
 ];
 
@@ -405,11 +495,27 @@ mod tests {
     }
 
     #[test]
+    fn every_builtin_skill_has_valid_front_matter() {
+        for b in BUILTIN_SKILLS {
+            let (m, body) = parse_skill_md(b.files[0].1);
+            assert_eq!(m.get("name").map(String::as_str), Some(b.dir), "{}: name이 폴더 이름과 같아야 한다", b.dir);
+            assert!(m.get("description").is_some_and(|d| !d.trim().is_empty() && !d.contains('<')), "{}: 설명", b.dir);
+            if let Some(t) = m.get("tier") {
+                assert!(["light", "standard", "deep"].contains(&t.as_str()), "{}: tier {t}", b.dir);
+            }
+            if let Some(mode) = m.get("mode") {
+                assert!(["chat", "work"].contains(&mode.as_str()), "{}: mode {mode}", b.dir);
+            }
+            assert!(body.lines().count() >= 20 && body.contains("## "), "{}: 본문", b.dir);
+        }
+    }
+
+    #[test]
     fn seed_load_match_and_toggle() {
         let tmp = tempfile::tempdir().unwrap();
         seed(tmp.path()).unwrap();
         let cat = load(tmp.path(), &HashMap::new());
-        assert_eq!(cat.skills.len(), 10, "예시 스킬 4 + 기본 스킬 5 + 플러그인 스킬 1");
+        assert_eq!(cat.skills.len(), 4 + BUILTIN_SKILLS.len() + 1, "예시 스킬 4 + 기본 스킬 + 플러그인 스킬 1");
         assert!(cat.skills.iter().any(|s| s.id == "root-cause"));
         let ui = cat.skills.iter().find(|s| s.id == "ui-craft").unwrap();
         let refs = references(&ui.path);

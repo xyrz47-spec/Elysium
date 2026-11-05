@@ -91,6 +91,13 @@ export const MoonIcon = () => (
     <path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z" />
   </Svg>
 );
+/** 취침 모드: 달과 작은 z */
+export const SleepIcon = () => (
+  <Svg size={16}>
+    <path d="M17.5 15.5A7 7 0 1 1 8.5 6.5a5.5 5.5 0 0 0 9 9z" />
+    <path d="M15 4h4l-4 4h4" />
+  </Svg>
+);
 export const AutoIcon = () => (
   <Svg size={16}>
     <circle cx="12" cy="12" r="8" />

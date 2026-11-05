@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 /// 사본에 넣지 않는 폴더(의존성·빌드 산출물·VCS). 에이전트가 사본에서 설치·빌드해도 합치지 않는다.
 const SKIP_DIRS: &[&str] = &[
-    ".git", ".hg", ".svn", "node_modules", "target", "dist", "build", "out", ".next", ".nuxt", ".svelte-kit", ".turbo", ".cache", ".parcel-cache", ".venv", "venv", "env", "__pycache__", ".pytest_cache", ".mypy_cache", ".gradle", ".idea", ".vs", "bin", "obj", "coverage", ".elysium-team",
+    ".git", ".hg", ".svn", "node_modules", "target", "dist", "build", "out", ".next", ".nuxt", ".svelte-kit", ".turbo", ".cache", ".parcel-cache", ".venv", "venv", "env", "__pycache__", ".pytest_cache", ".mypy_cache", ".gradle", ".idea", ".vs", "bin", "obj", "coverage", ".elysium-team", ".elysium",
 ];
 /// 이보다 크면 사본을 만들지 않고 한 에이전트로 돌아간다.
 const MAX_FILES: usize = 20_000;
@@ -50,6 +50,14 @@ pub const GITIGNORE_NOTE: &str = "- 폴더가 커서 .gitignore에 걸린 파일
 /// git worktree에서 일하는 AI에게 알리는 말
 pub const WORKTREE_NOTE: &str = "- 이 작업 공간은 git worktree입니다. 커밋·브랜치·stash를 만들지 마세요. 끝나면 바뀐 파일만 합칩니다.\n";
 
+/// 사본에서 일하는 AI에게 알리는 말: 사본은 저장소 안에 있어 git 명령이 원래 저장소를 건드린다.
+pub const COPY_NOTE: &str = "- 이 작업 공간은 사본입니다. git 명령(commit·add·reset·checkout·stash 등)을 쓰지 마세요. 상위 폴더의 원래 저장소를 건드립니다.\n";
+
+/// 병렬 작업 공간의 기본 위치: 프로젝트의 .elysium/worktrees
+pub fn workspace_home(root: &Path) -> PathBuf {
+    root.join(".elysium").join("worktrees")
+}
+
 /// 에이전트 작업 공간을 어떻게 만들었는가
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Prepared {
@@ -72,7 +80,7 @@ fn is_git_meta(name: &str) -> bool {
     name.eq_ignore_ascii_case(".git")
 }
 
-fn hash_file(p: &Path) -> std::io::Result<[u8; 32]> {
+pub(crate) fn hash_file(p: &Path) -> std::io::Result<[u8; 32]> {
     let data = std::fs::read(p)?;
     Ok(Sha256::digest(&data).into())
 }
@@ -265,6 +273,21 @@ pub fn prepare_dirs(root: &Path, tmp: &Path, n: usize, base: &Snapshot) -> Resul
     Ok(AgentDirs { dirs, how: Prepared::Copy })
 }
 
+/// 단계 중에 늘린 워커의 작업 공간 하나(tmp 바로 아래 name). base는 지금 메인 폴더의 상태다.
+pub fn prepare_extra(root: &Path, tmp: &Path, name: &str, base: &Snapshot, worktree: bool) -> Result<PathBuf, String> {
+    let top = tmp.join(name);
+    if worktree {
+        let prefix = git_output(git_in(root).args(["rev-parse", "--show-prefix"]))?;
+        git_output(git_in(root).args(["worktree", "add", "--detach"]).arg(&top).arg("HEAD"))?;
+        let dir = prefix.split('/').filter(|s| !s.is_empty()).fold(top, |p, part| p.join(part));
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        sync_to_base(root, &dir, base)?;
+        return Ok(dir);
+    }
+    copy_tree(root, &top, base)?;
+    Ok(top)
+}
+
 /// 작업 공간을 지운다. worktree는 저장소의 등록까지 지운다.
 pub fn remove_dirs(root: &Path, tmp: &Path) {
     let worktrees: Vec<PathBuf> = std::fs::read_dir(tmp).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.join(".git").is_file()).collect();
@@ -308,40 +331,6 @@ pub fn diff(base: &Snapshot, after: &Snapshot) -> Changes {
     c
 }
 
-/// 합치는 방법: 파일마다 어느 에이전트의 판을 원래 폴더에 쓸지, 그리고 충돌 목록.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Merge {
-    /// (경로, 에이전트 번호, 지움 여부)
-    pub apply: Vec<(String, usize, bool)>,
-    /// 둘 이상이 서로 다르게 바꾼 파일 → 바꾼 에이전트 번호들(먼저 쓴 판은 apply에도 들어 있다)
-    pub conflicts: BTreeMap<String, Vec<usize>>,
-}
-
-/// None인 칸은 실패하거나 중지된 에이전트(합치지 않는다).
-pub fn plan_merge(all: &[Option<Changes>]) -> Merge {
-    // 경로 → (에이전트, 결과: Some(해시)=씀, None=지움)
-    let mut by_path: BTreeMap<String, Vec<(usize, Option<[u8; 32]>)>> = BTreeMap::new();
-    for (i, c) in all.iter().enumerate() {
-        let Some(c) = c else { continue };
-        for (p, h) in &c.written {
-            by_path.entry(p.clone()).or_default().push((i, Some(*h)));
-        }
-        for p in &c.deleted {
-            by_path.entry(p.clone()).or_default().push((i, None));
-        }
-    }
-    let mut m = Merge::default();
-    for (p, v) in by_path {
-        let (first, result) = v[0];
-        m.apply.push((p.clone(), first, result.is_none()));
-        // 모두 같은 결과면(같은 내용으로 고쳤거나 모두 지웠으면) 충돌이 아니다.
-        if v.iter().any(|(_, r)| *r != result) {
-            m.conflicts.insert(p, v.iter().map(|(i, _)| *i).collect());
-        }
-    }
-    m
-}
-
 /// 에이전트 사본(from)의 파일 하나를 원래 폴더(to)에 쓰거나 지운다.
 pub fn apply_one(from: &Path, to: &Path, rel_path: &str, delete: bool) -> Result<(), String> {
     let dst = join(to, rel_path);
@@ -356,6 +345,52 @@ pub fn apply_one(from: &Path, to: &Path, rel_path: &str, delete: bool) -> Result
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
     std::fs::copy(join(from, rel_path), &dst).map(|_| ()).map_err(|e| format!("{rel_path}: {e}"))
+}
+
+/// 워커 판을 메인 폴더에 반영한 결과
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Applied {
+    /// 반영한 경로(쓰거나 지움)
+    pub written: Vec<String>,
+    /// 메인 폴더가 워커가 본 판과 달라 반영하지 않은 경로(지움 여부)
+    pub clashes: Vec<(String, bool)>,
+    pub errors: Vec<String>,
+}
+
+/// 워커 작업 공간(from)에서 바뀐 파일을 메인 폴더(to)에 반영한다. last는 워커가 그 파일을 마지막으로 본 판이다.
+/// 메인 폴더 파일이 그 판과 같거나 이미 워커 판과 같으면 반영하고, 다른 쪽이 먼저 고쳤으면 덮지 않고 충돌로 돌려준다.
+pub fn apply_checked(to: &Path, from: &Path, last: &Snapshot, changes: &Changes) -> Applied {
+    let mut out = Applied::default();
+    let now = |p: &str| hash_file(&join(to, p)).ok();
+    for (p, h) in &changes.written {
+        let main = now(p);
+        if main.as_ref() == Some(h) {
+            continue;
+        }
+        if main.as_ref() == last.files.get(p) {
+            match apply_one(from, to, p, false) {
+                Ok(()) => out.written.push(p.clone()),
+                Err(e) => out.errors.push(e),
+            }
+        } else {
+            out.clashes.push((p.clone(), false));
+        }
+    }
+    for p in &changes.deleted {
+        let main = now(p);
+        if main.is_none() {
+            continue;
+        }
+        if main.as_ref() == last.files.get(p) {
+            match apply_one(from, to, p, true) {
+                Ok(()) => out.written.push(p.clone()),
+                Err(e) => out.errors.push(e),
+            }
+        } else {
+            out.clashes.push((p.clone(), true));
+        }
+    }
+    out
 }
 
 /// 충돌 파일 한 판을 통합 AI에게 보여 줄 글(너무 크면 None → 경로만 준다)
@@ -392,6 +427,9 @@ pub struct Part {
     /// 이 하위 작업을 함께 맡는 워커 수. 2 이상이면 그룹으로 대화하며 같은 작업 공간에서 일한다.
     #[serde(default = "one")]
     pub members: usize,
+    /// 이 하위 작업(팀)이 속한 부서들(바깥 → 안쪽). 비어 있으면 총괄 바로 아래다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub org: Vec<String>,
 }
 
 fn one() -> usize {
@@ -416,6 +454,7 @@ pub fn parse_parts(text: &str, n: usize) -> Option<Vec<Part>> {
     let mut parts: Vec<Part> = parts.into_iter().filter(|p| !p.task.trim().is_empty()).take(n).collect();
     for p in &mut parts {
         p.members = p.members.max(1);
+        p.org = p.org.iter().map(|d| d.trim().to_string()).filter(|d| !d.is_empty()).take(MAX_ORG_DEPTH).collect();
     }
     // 합이 워커 수를 넘으면 가장 큰 그룹부터 줄인다.
     while parts.iter().map(|p| p.members).sum::<usize>() > n {
@@ -429,9 +468,28 @@ pub fn parse_parts(text: &str, n: usize) -> Option<Vec<Part>> {
 }
 
 /// 나누는 AI에게 적힌 팀 구성을 그대로 지키라고 알린다.
-pub fn teams_note(sizes: &[usize]) -> String {
+pub fn teams_note(sizes: &[usize], depts: &[Vec<String>]) -> String {
     let list = sizes.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
-    format!("반드시 작성된 팀 순서대로 정확히 {count}개의 하위 작업을 생성하고, 각 members 값은 {list}의 순서대로 지정하십시오. 팀을 병합하거나 추가해서는 안 됩니다.", count = sizes.len())
+    let mut s = format!("반드시 작성된 팀 순서대로 정확히 {count}개의 하위 작업을 생성하고, 각 members 값은 {list}의 순서대로 지정하십시오. 팀을 병합하거나 추가해서는 안 됩니다.", count = sizes.len());
+    if depts.iter().any(|d| !d.is_empty()) {
+        let orgs = depts.iter().enumerate().map(|(i, d)| format!("{}팀: {}", i + 1, if d.is_empty() { "-".to_string() } else { d.join(" / ") })).collect::<Vec<_>>().join(", ");
+        s.push_str(&format!(" 팀마다 부서는 정해져 있습니다({orgs}). 같은 부서의 팀끼리 얽힌 일을 맡기세요."));
+    }
+    s
+}
+
+/// 하위 작업이 들어갈 수 있는 부서의 최대 깊이
+pub const MAX_ORG_DEPTH: usize = 4;
+
+/// 요청문에 적힌 팀 크기대로 맞추고, 적힌 부서가 있으면 그대로 쓴다.
+pub fn fit_to_org(parts: Vec<Part>, sizes: &[usize], depts: &[Vec<String>]) -> Vec<Part> {
+    let mut parts = fit_to_teams(parts, sizes);
+    if depts.iter().any(|d| !d.is_empty()) {
+        for (p, d) in parts.iter_mut().zip(depts) {
+            p.org = d.clone();
+        }
+    }
+    parts
 }
 
 /// 요청문에 적힌 팀 크기대로 맞춘다. 팀보다 많은 하위 작업은 마지막 팀이 이어 맡는다.
@@ -461,8 +519,10 @@ pub fn split_prompt(request: &str, listing: &str, n: usize) -> String {
          - 각 task는 다른 에이전트의 결과를 보지 않고도 끝낼 수 있게 필요한 이름·경로·인터페이스를 구체적으로 적으세요.\n\
          - 나눌수록 손해인 작은 요청이거나 서로 너무 얽혀 있으면 하위 작업 1개만 쓰세요.\n\
          - 그룹: members가 2 이상인 하위 작업은 그 수만큼의 워커가 한 그룹이 되어 대화하며 같은 작업 공간에서 함께 합니다. 요청문에 적힌 그룹은 그대로 따르세요. 적혀 있지 않으면 서로 많이 얽혀 혼자 하기 어려운 하위 작업만 묶고 나머지는 members를 1로 두세요. members의 합은 {n}을 넘을 수 없습니다.\n\
+         - 부서(org): 요청문이 팀을 본부·부서로 묶었거나 하위 작업이 6개 이상인 큰 작업이면, 서로 맞춰야 하는 하위 작업끼리 같은 부서 이름을 org에 쓰세요(바깥 부서부터, 최대 {depth}단계). 같은 부서의 팀장끼리만 짧게 보고를 주고받으므로, 서로 상관없는 하위 작업은 다른 부서에 두거나 org를 비우세요.\n\
          파일을 고치지 말고, 설명 없이 아래 형식의 JSON 배열 하나만 답하세요.\n\
-         [{{\"title\": \"짧은 이름\", \"task\": \"이 에이전트가 할 일(구체적으로)\", \"files\": [\"맡는 파일·폴더 경로\"], \"members\": 1}}]"
+         [{{\"title\": \"짧은 이름\", \"task\": \"이 에이전트가 할 일(구체적으로)\", \"files\": [\"맡는 파일·폴더 경로\"], \"members\": 1, \"org\": []}}]",
+        depth = MAX_ORG_DEPTH
     )
 }
 
@@ -491,6 +551,59 @@ pub fn part_system(i: usize, parts: &[Part]) -> String {
 pub fn part_prompt(request: &str, part: &Part) -> String {
     let files = if part.files.is_empty() { String::new() } else { format!("\n[맡은 파일·폴더]\n{}\n", part.files.join("\n")) };
     format!("[전체 요청]\n{request}\n\n[당신이 맡은 하위 작업: {}]\n{}\n{files}", part.title, part.task)
+}
+
+/// 부서가 하나라도 있으면 조직으로 일한다(팀장끼리 보고를 주고받는다).
+pub fn org_active(paths: &[Vec<String>]) -> bool {
+    paths.iter().any(|p| !p.is_empty())
+}
+
+/// 부서를 대표하는 하위 작업(부서장): 부서 안 첫 하위 작업
+fn head_of(paths: &[Vec<String>], dept: &[String]) -> Option<usize> {
+    paths.iter().position(|p| p.starts_with(dept))
+}
+
+/// 하위 작업 i의 팀장 보고를 받는 하위 작업들. 한 부서(또는 총괄 바로 아래) 안에서 바로 아래 단위의 대표끼리만 주고받는다.
+/// 바로 아래 단위는 팀(하위 작업) 또는 하위 부서이고, 하위 부서는 그 부서의 첫 팀장(부서장)이 대표한다.
+pub fn org_peers(paths: &[Vec<String>]) -> Vec<Vec<usize>> {
+    if !org_active(paths) {
+        return vec![vec![]; paths.len()];
+    }
+    // 부서 경로 → 그 안에서 말하는 대표들
+    let mut rooms: BTreeMap<Vec<String>, BTreeSet<usize>> = BTreeMap::new();
+    for (i, p) in paths.iter().enumerate() {
+        rooms.entry(p.clone()).or_default().insert(i);
+        // 부서장이면 한 단계 위 방에서도 그 부서를 대표한다.
+        for level in (0..p.len()).rev() {
+            if head_of(paths, &p[..=level]) != Some(i) {
+                break;
+            }
+            rooms.entry(p[..level].to_vec()).or_default().insert(i);
+        }
+    }
+    let mut out = vec![BTreeSet::new(); paths.len()];
+    for who in rooms.values() {
+        for i in who {
+            out[*i].extend(who.iter().filter(|j| *j != i).copied());
+        }
+    }
+    out.into_iter().map(|s| s.into_iter().collect()).collect()
+}
+
+/// 조직으로 일할 때 하위 작업 i의 워커에게 붙이는 안내(짧게)
+pub fn org_note(i: usize, parts: &[Part], peers: &[Vec<usize>], group: bool) -> String {
+    let Some(me) = parts.get(i) else { return String::new() };
+    let dept = if me.org.is_empty() { "총괄 직속".to_string() } else { me.org.join(" / ") };
+    let names: Vec<String> = peers.get(i).into_iter().flatten().filter_map(|j| parts.get(*j)).map(|p| format!("'{}'", p.title)).collect();
+    let mut s = format!("\n[조직] 당신의 팀 '{}'은(는) {dept} 소속입니다.", me.title);
+    if names.is_empty() {
+        s.push_str(" 다른 팀과 직접 대화하지 않습니다.\n");
+    } else if group {
+        s.push_str(&format!(" 그룹장(그룹원 1)이 팀을 대표해 {} 팀장과 짧은 보고를 주고받습니다.\n", names.join(", ")));
+    } else {
+        s.push_str(&format!(" 당신이 팀장으로 {} 팀장과 짧은 보고를 주고받습니다. 받은 보고는 다음 차례 앞에 붙습니다.\n", names.join(", ")));
+    }
+    s
 }
 
 /// 통합 AI가 받는 각 에이전트의 결과
@@ -548,10 +661,6 @@ pub fn integrate_prompt(request: &str, results: &[PartResult], conflicts: &[Conf
 mod tests {
     use super::*;
 
-    fn h(b: u8) -> [u8; 32] {
-        [b; 32]
-    }
-
     #[test]
     fn snapshot_copy_diff_and_apply_round_trip() {
         let src = tempfile::tempdir().unwrap();
@@ -574,11 +683,8 @@ mod tests {
         assert_eq!(c.written.keys().cloned().collect::<Vec<_>>(), vec!["a/b/one.txt", "new.txt"]);
         assert_eq!(c.deleted.iter().cloned().collect::<Vec<_>>(), vec!["two.txt"]);
 
-        let m = plan_merge(&[Some(c)]);
-        assert!(m.conflicts.is_empty());
-        for (p, _, del) in &m.apply {
-            apply_one(copy.path(), src.path(), p, *del).unwrap();
-        }
+        let a = apply_checked(src.path(), copy.path(), &base, &c);
+        assert!(a.clashes.is_empty() && a.errors.is_empty());
         assert_eq!(std::fs::read_to_string(src.path().join("a/b/one.txt")).unwrap(), "changed");
         assert!(src.path().join("new.txt").exists() && !src.path().join("two.txt").exists());
     }
@@ -659,6 +765,27 @@ run/
     }
 
     #[test]
+    fn extra_workspace_joins_the_stage_and_is_cleaned_up() {
+        let r = repo();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = snapshot_like(r.path(), Scope::GitIgnore).unwrap();
+        let prepared = prepare_dirs(r.path(), tmp.path(), 1, &base).unwrap();
+        assert!(tmp.path().join("agent-1").join(".git").is_file());
+        // 단계 중에 메인 폴더가 바뀐 뒤 늘린 워커는 바뀐 상태에서 시작한다.
+        std::fs::write(r.path().join("sub/kept.txt"), b"merged").unwrap();
+        let now = snapshot_like(r.path(), Scope::GitIgnore).unwrap();
+        let extra = prepare_extra(r.path(), tmp.path(), "agent-x1", &now, true).unwrap();
+        assert!(extra.join(".git").is_file());
+        assert_eq!(std::fs::read(extra.join("sub/kept.txt")).unwrap(), b"merged");
+        assert!(diff(&now, &snapshot_like(&extra, now.scope).unwrap()).paths().is_empty());
+        let copied = prepare_extra(r.path(), tmp.path(), "agent-x2", &now, false).unwrap();
+        assert_eq!(std::fs::read(copied.join("sub/edited.txt")).unwrap(), b"uncommitted");
+        drop(prepared);
+        remove_dirs(r.path(), tmp.path());
+        assert_eq!(git(r.path(), &["worktree", "list"]).lines().count(), 1, "늘린 공간의 등록도 지운다");
+    }
+
+    #[test]
     fn worktree_agents_work_in_the_same_subfolder() {
         let r = repo();
         let tmp = tempfile::tempdir().unwrap();
@@ -709,30 +836,69 @@ run/
     }
 
     #[test]
-    fn merge_finds_conflicts_and_skips_failed_agents() {
-        let mut a = Changes::default();
-        a.written.insert("same.txt".into(), h(1));
-        a.written.insert("shared.txt".into(), h(1));
-        a.written.insert("only-a.txt".into(), h(1));
-        let mut b = Changes::default();
-        b.written.insert("same.txt".into(), h(1));
-        b.written.insert("shared.txt".into(), h(2));
-        b.deleted.insert("old.txt".into());
-        let mut failed = Changes::default();
-        failed.written.insert("shared.txt".into(), h(9));
-        let m = plan_merge(&[Some(a), None, Some(b)]);
-        assert_eq!(m.conflicts.keys().cloned().collect::<Vec<_>>(), vec!["shared.txt"], "같은 내용으로 고친 파일은 충돌이 아니다");
-        assert_eq!(m.conflicts["shared.txt"], vec![0, 2]);
-        assert!(m.apply.contains(&("old.txt".into(), 2, true)));
-        assert!(m.apply.contains(&("shared.txt".into(), 0, false)));
-        assert!(!m.apply.iter().any(|(_, i, _)| *i == 1));
-        drop(failed);
+    fn checked_apply_never_overwrites_a_file_someone_else_changed_first() {
+        let main = tempfile::tempdir().unwrap();
+        std::fs::write(main.path().join("shared.txt"), "base").unwrap();
+        std::fs::write(main.path().join("mine.txt"), "base").unwrap();
+        std::fs::write(main.path().join("gone.txt"), "base").unwrap();
+        let base = snapshot(main.path()).unwrap();
+        let w = tempfile::tempdir().unwrap();
+        copy_tree(main.path(), w.path(), &base).unwrap();
+        // 워커: 세 파일을 바꾸고 하나는 지운다
+        std::fs::write(w.path().join("shared.txt"), "worker").unwrap();
+        std::fs::write(w.path().join("mine.txt"), "worker").unwrap();
+        std::fs::write(w.path().join("new.txt"), "n").unwrap();
+        std::fs::remove_file(w.path().join("gone.txt")).unwrap();
+        // 그 사이 다른 워커가 shared.txt를 먼저 반영했다
+        std::fs::write(main.path().join("shared.txt"), "other").unwrap();
+        let after = snapshot(w.path()).unwrap();
+        let a = apply_checked(main.path(), w.path(), &base, &diff(&base, &after));
+        assert_eq!(a.clashes, vec![("shared.txt".to_string(), false)]);
+        assert_eq!(std::fs::read_to_string(main.path().join("shared.txt")).unwrap(), "other", "먼저 반영된 판을 덮지 않는다");
+        assert_eq!(std::fs::read_to_string(main.path().join("mine.txt")).unwrap(), "worker");
+        assert!(main.path().join("new.txt").exists() && !main.path().join("gone.txt").exists());
+        assert_eq!(a.written.len(), 3);
+        // 두 번째 반영은 지난 반영 이후 바뀐 것만 본다
+        std::fs::write(w.path().join("mine.txt"), "worker 2").unwrap();
+        let again = snapshot(w.path()).unwrap();
+        let b = apply_checked(main.path(), w.path(), &after, &diff(&after, &again));
+        assert_eq!((b.written.clone(), b.clashes.len()), (vec!["mine.txt".to_string()], 0));
     }
 
     #[test]
     fn teams_note_states_count_and_sizes() {
-        let n = teams_note(&[2, 3]);
-        assert!(n.contains('2') && n.contains("2, 3") && n.contains("members"), "{n}");
+        let n = teams_note(&[2, 3], &[vec![], vec![]]);
+        assert!(n.contains('2') && n.contains("2, 3") && n.contains("members") && !n.contains("부서"), "{n}");
+        let d = teams_note(&[2, 3], &[vec!["앱 본부".into()], vec![]]);
+        assert!(d.contains("1팀: 앱 본부") && d.contains("2팀: -"), "{d}");
+    }
+
+    fn paths(list: &[&[&str]]) -> Vec<Vec<String>> {
+        list.iter().map(|p| p.iter().map(|x| x.to_string()).collect()).collect()
+    }
+
+    #[test]
+    fn org_peers_talk_only_between_leaders_of_the_same_level() {
+        assert_eq!(org_peers(&paths(&[&[], &[], &[]])), vec![Vec::<usize>::new(); 3], "부서가 없으면 지금처럼 서로 대화하지 않는다");
+        // 0,1: 앱 본부 / 2,3: 앱 본부·서버 부서 / 4: 데이터 본부 / 5: 직속
+        let p = paths(&[&["앱"], &["앱"], &["앱", "서버"], &["앱", "서버"], &["데이터"], &[]]);
+        let peers = org_peers(&p);
+        assert_eq!(peers[0], vec![1, 2, 4, 5], "앱 본부장(0)은 본부 안 대표와, 다른 본부장·직속 팀과 말한다");
+        assert_eq!(peers[1], vec![0, 2], "팀장은 같은 본부 대표들과만");
+        assert_eq!(peers[2], vec![0, 1, 3], "서버 부서장은 부서 안과 본부 안에서");
+        assert_eq!(peers[3], vec![2], "부서 안 팀장은 부서 안에서만");
+        assert_eq!(peers[4], vec![0, 5]);
+        assert_eq!(peers[5], vec![0, 4]);
+    }
+
+    #[test]
+    fn written_departments_are_kept_and_cleaned() {
+        let parts = parse_parts("[{\"title\":\"a\",\"task\":\"x\",\"org\":[\" 앱 \",\"\"]},{\"title\":\"b\",\"task\":\"y\"}]", 4).unwrap();
+        assert_eq!(parts[0].org, vec!["앱".to_string()]);
+        let fit = fit_to_org(parts, &[1, 1], &[vec![], vec!["서버 본부".into()]]);
+        assert_eq!((fit[0].org.len(), fit[1].org.clone()), (0, vec!["서버 본부".to_string()]), "적힌 부서가 이긴다");
+        let note = org_note(1, &fit, &org_peers(&fit.iter().map(|p| p.org.clone()).collect::<Vec<_>>()), false);
+        assert!(note.contains("서버 본부") && note.contains("'a'"), "{note}");
     }
 
     #[test]

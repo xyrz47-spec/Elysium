@@ -2,6 +2,7 @@
 //!
 //! 보안
 //! - 기본은 꺼짐. 켜면 모든 네트워크 주소(같은 Wi-Fi, Tailscale, 포트 포워딩)에서 TLS로만 받는다.
+//! - 다른 네트워크의 폰은 iroh 터널(relay.rs)로 들어온다. 터널 안에서도 같은 TLS·토큰을 쓴다.
 //! - 인증서는 이 PC가 처음 켤 때 만든 자체 서명 인증서다. 폰은 페어링 QR에 담긴 SHA-256 지문과 같은 인증서만 믿는다.
 //! - 페어링 코드는 PC에서 연 지 5분 동안 한 번만 쓸 수 있고, 여러 번 틀리면 닫힌다.
 //! - 기기마다 무작위 토큰(256비트)을 주고, DB에는 해시만 둔다. 설정에서 기기를 끊으면 바로 막힌다.
@@ -41,11 +42,13 @@ pub struct RemoteConfig {
     pub port: u16,
     /// 폰에서 작업 모드 허락까지 할 수 있는지
     pub allow_approve: bool,
+    /// 다른 네트워크에서도 연결(iroh 터널, 포트 포워딩 불필요)
+    pub relay: bool,
 }
 
 impl Default for RemoteConfig {
     fn default() -> Self {
-        RemoteConfig { enabled: false, port: DEFAULT_PORT, allow_approve: true }
+        RemoteConfig { enabled: false, port: DEFAULT_PORT, allow_approve: true, relay: true }
     }
 }
 
@@ -73,7 +76,16 @@ fn bus() -> &'static broadcast::Sender<String> {
     BUS.get_or_init(|| broadcast::channel(2048).0)
 }
 
+/// 돌고 있는 작업의 에이전트 상태(폰이 늦게 붙어도 한 번에 받는다)
+fn snap() -> &'static Mutex<crate::livesnap::Snap> {
+    static SNAP: OnceLock<Mutex<crate::livesnap::Snap>> = OnceLock::new();
+    SNAP.get_or_init(Default::default)
+}
+
 pub fn publish(name: &str, payload: &Value) {
+    if name.starts_with("task:") || name == "lead:started" {
+        snap().lock().unwrap_or_else(|p| p.into_inner()).apply(name, payload);
+    }
     let tx = bus();
     if tx.receiver_count() > 0 {
         let _ = tx.send(json!({ "event": name, "payload": payload }).to_string());
@@ -218,13 +230,19 @@ pub struct Address {
     pub name: String,
 }
 
-/// 폰이 붙을 수 있는 이 PC의 IPv4 주소들(Tailscale 100.64.0.0/10은 따로 표시)
+/// 폰이 닿을 수 없는 가상 어댑터(WSL·Hyper-V·VM·Docker). 이 주소를 앞에 두면 폰이 주소마다 연결 시간 초과를 기다린다.
+fn virtual_adapter(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    ["vethernet", "virtualbox", "vmware", "hyper-v", "wsl", "docker", "loopback", "vpn"].iter().any(|v| n.contains(v))
+}
+
+/// 폰이 붙을 수 있는 이 PC의 IPv4 주소들(Tailscale 100.64.0.0/10은 따로 표시). 실제 LAN을 먼저 둔다.
 pub fn addresses() -> Vec<Address> {
     let mut out: Vec<Address> = local_ip_address::list_afinet_netifas()
         .unwrap_or_default()
         .into_iter()
         .filter_map(|(name, ip)| match ip {
-            IpAddr::V4(v) if !v.is_loopback() && !v.is_link_local() && !v.is_unspecified() => {
+            IpAddr::V4(v) if !v.is_loopback() && !v.is_link_local() && !v.is_unspecified() && !virtual_adapter(&name) => {
                 let o = v.octets();
                 let tailscale = o[0] == 100 && (64..128).contains(&o[1]);
                 Some(Address { ip: v.to_string(), kind: if tailscale { "tailscale" } else { "lan" }.into(), name })
@@ -237,11 +255,17 @@ pub fn addresses() -> Vec<Address> {
     out
 }
 
-/// 페어링 링크: elysium://pair?v=1&h=주소들&p=포트&f=지문&c=코드&n=PC이름
-pub fn pair_link(addrs: &[Address], port: u16, fingerprint: &str, code: &str) -> String {
+/// 페어링 링크: elysium://pair?v=1&h=주소들&p=포트&f=지문&c=코드&n=PC이름[&i=터널 공개키]
+pub fn pair_link(addrs: &[Address], port: u16, fingerprint: &str, code: &str, node: Option<&str>) -> String {
     let hosts: Vec<&str> = addrs.iter().map(|a| a.ip.as_str()).collect();
     let name: String = pc_name().chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
-    format!("elysium://pair?v=1&h={}&p={port}&f={fingerprint}&c={code}&n={name}", hosts.join(","))
+    let node = node.map(|n| format!("&i={n}")).unwrap_or_default();
+    format!("elysium://pair?v=1&h={}&p={port}&f={fingerprint}&c={code}&n={name}{node}", hosts.join(","))
+}
+
+/// 폰에 알려 줄 터널 공개키(외부 연결을 꺼 두었으면 None)
+pub fn tunnel_id(db: &Db, data_dir: &FsPath) -> Option<String> {
+    load_config(db).ok().filter(|c| c.relay).and_then(|_| crate::relay::endpoint_id(data_dir).ok())
 }
 
 pub fn qr_svg(text: &str) -> AppResult<String> {
@@ -260,6 +284,7 @@ pub fn running_port() -> Option<u16> {
 }
 
 pub fn stop() {
+    crate::relay::stop();
     if let Some((h, _)) = RUNNING.lock().unwrap_or_else(|p| p.into_inner()).take() {
         h.graceful_shutdown(Some(Duration::from_secs(1)));
     }
@@ -287,6 +312,12 @@ pub async fn start(app: AppHandle, st: Arc<AppState>) -> AppResult<u16> {
         Ok(Some(a)) => {
             *RUNNING.lock().unwrap_or_else(|p| p.into_inner()) = Some((handle, a.port()));
             audit::record(&st.db, "user", "remote.started", "ok", json!({ "port": a.port() }));
+            // 외부 연결이 안 돼도 같은 Wi-Fi 연결은 그대로 쓴다.
+            if cfg.relay {
+                if let Err(e) = crate::relay::start(&st.data_dir, a.port()).await {
+                    eprintln!("{e}");
+                }
+            }
             Ok(a.port())
         }
         _ => {
@@ -351,6 +382,12 @@ fn router(ctx: Ctx) -> Router {
         .route("/api/attachments", post(upload).layer(axum::extract::DefaultBodyLimit::max(72 * 1024 * 1024)))
         .route("/api/attachments/{id}", get(attachment).delete(discard))
         .route("/api/tasks/{id}/cancel", post(cancel))
+        .route("/api/agents", get(agents))
+        .route("/api/tasks/{id}/agents/{key}/cancel", post(agent_cancel))
+        .route("/api/tasks/{id}/agents/{key}/message", post(agent_message))
+        .route("/api/tasks/{id}/lead", post(lead_send))
+        .route("/api/tasks/{id}/message", post(task_message))
+        .route("/api/side", post(side))
         .route("/api/approvals", get(approvals))
         .route("/api/approvals/{id}", post(decide))
         .route("/api/questions", get(questions))
@@ -377,12 +414,15 @@ async fn pair(State(ctx): State<Ctx>, Json(req): Json<PairReq>) -> ApiResult<Val
     let id = add_device(&ctx.st.db, &name, &token)?;
     audit::record(&ctx.st.db, "remote", "remote.paired", "ok", json!({ "device": name }));
     let _ = ctx.app.emit("remote:changed", ());
-    Ok(Json(json!({ "token": token, "deviceId": id, "pcName": pc_name(), "version": env!("CARGO_PKG_VERSION") })))
+    Ok(Json(json!({ "token": token, "deviceId": id, "pcName": pc_name(), "version": env!("CARGO_PKG_VERSION"), "node": tunnel_id(&ctx.st.db, &ctx.st.data_dir) })))
 }
 
 async fn info(State(ctx): State<Ctx>, Authed(d): Authed) -> ApiResult<Value> {
     let cfg = load_config(&ctx.st.db)?;
-    Ok(Json(json!({ "pcName": pc_name(), "version": env!("CARGO_PKG_VERSION"), "allowApprove": cfg.allow_approve, "device": d.name })))
+    // 지금 주소도 알려 준다: PC 주소가 바뀌어도(DHCP) 폰이 다시 페어링하지 않고 따라온다.
+    let hosts: Vec<String> = addresses().into_iter().map(|a| a.ip).collect();
+    // 터널 공개키도 알려 준다: 예전에 페어링한 폰도 다시 페어링하지 않고 밖에서 붙을 수 있다.
+    Ok(Json(json!({ "pcName": pc_name(), "version": env!("CARGO_PKG_VERSION"), "allowApprove": cfg.allow_approve, "device": d.name, "hosts": hosts, "node": tunnel_id(&ctx.st.db, &ctx.st.data_dir) })))
 }
 
 async fn engines(State(ctx): State<Ctx>, _: Authed) -> ApiResult<Value> {
@@ -461,6 +501,80 @@ async fn cancel(State(ctx): State<Ctx>, Authed(d): Authed, Path(id): Path<String
     Ok(Json(json!({ "cancelled": ok })))
 }
 
+/// 지금 돌고 있는 작업과 그 에이전트(상태·지금 하는 일·토큰·출력 끝부분). 끝난 차례나 메시지를 기다리는 워커도 들어 있다.
+async fn agents(_: Authed) -> ApiResult<Vec<crate::livesnap::TaskSnap>> {
+    Ok(Json(snap().lock().unwrap_or_else(|p| p.into_inner()).list()))
+}
+
+/// 작업의 모든 에이전트에게 같은 메시지를 보낸다.
+async fn task_message(State(ctx): State<Ctx>, Authed(d): Authed, Path(task): Path<String>, Json(req): Json<TextReq>) -> ApiResult<Value> {
+    let text = req.text.trim();
+    if text.is_empty() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "보낼 내용이 없습니다".into()));
+    }
+    let n = orchestrator::message_task(&ctx.app, &ctx.st, &task, text);
+    audit::record(&ctx.st.db, "remote", "remote.task.message", "ok", json!({ "device": d.name, "agents": n }));
+    Ok(Json(json!({ "sent": n })))
+}
+
+#[derive(Deserialize)]
+struct TextReq {
+    text: String,
+    #[serde(default)]
+    about: Option<String>,
+}
+
+async fn agent_cancel(State(ctx): State<Ctx>, Authed(d): Authed, Path((task, key)): Path<(String, String)>) -> ApiResult<Value> {
+    let ok = orchestrator::cancel_agent(&ctx.st, &task, &key);
+    audit::record(&ctx.st.db, "remote", "remote.agent.cancel", if ok { "ok" } else { "missing" }, json!({ "device": d.name, "key": key }));
+    Ok(Json(json!({ "cancelled": ok })))
+}
+
+async fn agent_message(State(ctx): State<Ctx>, Authed(d): Authed, Path((task, key)): Path<(String, String)>, Json(req): Json<TextReq>) -> ApiResult<Value> {
+    let text = req.text.trim();
+    if text.is_empty() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "보낼 내용이 없습니다".into()));
+    }
+    if !orchestrator::message_agent(&ctx.app, &ctx.st, &task, &key, text) {
+        return Err(ApiError(StatusCode::CONFLICT, "이미 끝난 에이전트입니다".into()));
+    }
+    audit::record(&ctx.st.db, "remote", "remote.agent.message", "ok", json!({ "device": d.name, "key": key }));
+    Ok(Json(json!({ "sent": true })))
+}
+
+/// 총괄에게 전체 지시를 보내거나 특정 워커(about)의 문제를 알린다.
+async fn lead_send(State(ctx): State<Ctx>, Authed(d): Authed, Path(task): Path<String>, Json(req): Json<TextReq>) -> ApiResult<Value> {
+    let text = req.text.trim().to_string();
+    if text.is_empty() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "보낼 내용이 없습니다".into()));
+    }
+    let lead = ctx.st.leads.lock().unwrap_or_else(|p| p.into_inner()).get(&task).cloned().ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "총괄이 있는 작업이 아닙니다".into()))?;
+    audit::record(&ctx.st.db, "remote", "remote.lead.send", "ok", json!({ "device": d.name, "about": req.about }));
+    crate::leadrun::user_message(crate::leadrun::Ctx { app: ctx.app.clone(), st: ctx.st.clone(), lead }, text, req.about, false);
+    Ok(Json(json!({ "sent": true })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SideReq {
+    side_id: String,
+    #[serde(default)]
+    conversation_id: Option<String>,
+    question: String,
+    #[serde(default)]
+    thread: Vec<orchestrator::SideTurn>,
+}
+
+/// 곁질문: 대화 기록에 남기지 않는 짧은 질문. 답은 side:* 이벤트로 온다(멈추기는 /api/tasks/{sideId}/cancel).
+async fn side(State(ctx): State<Ctx>, Authed(d): Authed, Json(req): Json<SideReq>) -> ApiResult<Value> {
+    if req.side_id.len() > 80 || !req.side_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "잘못된 곁질문 번호입니다".into()));
+    }
+    audit::record(&ctx.st.db, "remote", "side.asked", "ok", json!({ "device": d.name }));
+    orchestrator::side_ask(&ctx.app, &ctx.st, req.side_id, req.conversation_id, None, req.question, None, req.thread).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
+    Ok(Json(json!({ "started": true })))
+}
+
 async fn approvals(State(ctx): State<Ctx>, _: Authed) -> ApiResult<Vec<store::Approval>> {
     Ok(Json(store::pending_approvals(&ctx.st.db)?))
 }
@@ -535,6 +649,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn virtual_adapters_are_left_out() {
+        for n in ["vEthernet (WSL)", "VirtualBox Host-Only Network", "VMware Network Adapter VMnet8", "Docker NAT"] {
+            assert!(virtual_adapter(n), "{n}");
+        }
+        for n in ["Wi-Fi", "이더넷", "Ethernet 2", "Tailscale"] {
+            assert!(!virtual_adapter(n), "{n}");
+        }
+    }
+
+    #[test]
     fn pairing_is_one_shot_and_locks_after_failures() {
         let (code, ttl) = pair_start();
         assert_eq!((code.len(), ttl), (20, 300));
@@ -567,8 +691,8 @@ mod tests {
         let b = identity(dir.path()).unwrap();
         assert_eq!(a.fingerprint, b.fingerprint, "두 번째부터는 같은 인증서");
         assert_eq!(a.fingerprint.len(), 64);
-        let link = pair_link(&[Address { ip: "192.168.0.5".into(), kind: "lan".into(), name: "Wi-Fi".into() }], 47820, &a.fingerprint, "abc");
-        assert!(link.starts_with("elysium://pair?v=1&h=192.168.0.5&p=47820&f=") && link.contains("&c=abc&n="));
+        let link = pair_link(&[Address { ip: "192.168.0.5".into(), kind: "lan".into(), name: "Wi-Fi".into() }], 47820, &a.fingerprint, "abc", Some("ab12"));
+        assert!(link.starts_with("elysium://pair?v=1&h=192.168.0.5&p=47820&f=") && link.contains("&c=abc&n=") && link.ends_with("&i=ab12"));
         assert!(qr_svg(&link).unwrap().contains("<svg"));
     }
 
@@ -576,6 +700,6 @@ mod tests {
     fn config_defaults_off() {
         let db = Db::open_in_memory().unwrap();
         let c = load_config(&db).unwrap();
-        assert!(!c.enabled && c.allow_approve && c.port == DEFAULT_PORT);
+        assert!(!c.enabled && c.allow_approve && c.relay && c.port == DEFAULT_PORT);
     }
 }

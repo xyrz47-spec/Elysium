@@ -178,52 +178,52 @@ function PricingView({
         <span className="pricing-note">기준: 1,000,000(1M) 토큰당 USD</span>
       </div>
 
-      <div className="pricing-table-wrap">
-        <table className="utable upricing-table">
-          <thead>
-            <tr>
-              <th>구분</th>
-              <th>엔진</th>
-              <th>모델명</th>
-              <th>입력 (1M)</th>
-              <th>출력 (1M)</th>
-              <th>캐시 입력 (1M)</th>
-              <th>설명</th>
-            </tr>
-          </thead>
-          <tbody>
-            {filtered.map((p) => {
-              const isSelected = selected?.model === p.model;
-              return (
-                <tr
-                  key={`${p.engine}-${p.model}`}
-                  className={`pricing-row ${isSelected ? "selected" : ""}`}
-                  onClick={() => {
-                    setCalcModel(p.model);
-                    onSelectModel?.(p);
-                  }}
-                  title="클릭하면 아래 계산기에 이 모델이 적용됩니다"
-                >
-                  <td>
-                    <span className={`kind-tag ${p.kind}`}>{p.kind.toUpperCase()}</span>
-                  </td>
-                  <td>
-                    <b>{p.engineLabel}</b>
-                  </td>
-                  <td>
-                    <code className="model-code">{p.displayName}</code>
-                  </td>
-                  <td className="cost-num">{p.inputUsdPerM === 0 ? "무료 ($0)" : perM(p.inputUsdPerM)}</td>
-                  <td className="cost-num">{p.outputUsdPerM === 0 ? "무료 ($0)" : perM(p.outputUsdPerM)}</td>
-                  <td className="cost-sub">{p.cachedUsdPerM == null || p.inputUsdPerM === 0 ? "—" : perM(p.cachedUsdPerM)}</td>
-                  <td>
-                    <small className="price-desc">{p.description}</small>
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+      <div className="price-list" role="list">
+        {filtered.map((p) => {
+          const isSelected = selected?.model === p.model;
+          const free = p.inputUsdPerM === 0 && p.outputUsdPerM === 0;
+          return (
+            <button
+              key={`${p.engine}-${p.model}`}
+              role="listitem"
+              className={`price-row ${isSelected ? "selected" : ""}`}
+              onClick={() => {
+                setCalcModel(p.model);
+                onSelectModel?.(p);
+              }}
+              title="클릭하면 아래 계산기에 이 모델이 적용됩니다"
+            >
+              <span className="price-id">
+                <span className={`kind-tag ${p.kind}`}>{p.kind.toUpperCase()}</span>
+                <b>{p.engineLabel}</b>
+                <code className="model-code">{p.displayName}</code>
+              </span>
+              <span className="price-chips">
+                {free ? (
+                  <span className="price-chip free">무료 ($0)</span>
+                ) : (
+                  <>
+                    <span className="price-chip">
+                      <small>입력 (1M)</small>
+                      {perM(p.inputUsdPerM)}
+                    </span>
+                    <span className="price-chip">
+                      <small>출력 (1M)</small>
+                      {perM(p.outputUsdPerM)}
+                    </span>
+                    {p.cachedUsdPerM != null && (
+                      <span className="price-chip dim">
+                        <small>캐시 입력 (1M)</small>
+                        {perM(p.cachedUsdPerM)}
+                      </span>
+                    )}
+                  </>
+                )}
+              </span>
+              {p.description && <small className="price-desc">{p.description}</small>}
+            </button>
+          );
+        })}
       </div>
 
       {/* 실시간 토큰 비용 계산기 */}
@@ -233,46 +233,40 @@ function PricingView({
           <span className="calc-sub">위 목록에서 모델을 클릭하거나 선택하여 직접 예상 비용을 확인하세요.</span>
         </div>
 
-        <div className="calc-grid">
-          <div className="calc-field">
-            <label>대상 모델</label>
-            <select
-              value={calcModel}
-              onChange={(e) => setCalcModel(e.target.value)}
-              className="calc-select"
-            >
-              {pricingList.map((p) => (
-                <option key={`${p.engine}-${p.model}`} value={p.model}>
-                  [{p.engineLabel}] {p.displayName} (입력 ${p.inputUsdPerM} / 출력 ${p.outputUsdPerM})
-                </option>
-              ))}
-            </select>
-          </div>
-
-          <div className="calc-field">
-            <label>입력 토큰 수</label>
-            <input
-              type="number"
-              min={0}
-              step={1000}
-              value={calcInput}
-              onChange={(e) => setCalcInput(Math.max(0, Number(e.target.value) || 0))}
-              className="calc-input"
-            />
-            <small>≈ {tokens(calcInput)} 토큰</small>
-          </div>
-
-          <div className="calc-field">
-            <label>출력 토큰 수</label>
-            <input
-              type="number"
-              min={0}
-              step={500}
-              value={calcOutput}
-              onChange={(e) => setCalcOutput(Math.max(0, Number(e.target.value) || 0))}
-              className="calc-input"
-            />
-            <small>≈ {tokens(calcOutput)} 토큰</small>
+        <div className="calc-layout">
+          <div className="calc-inputs">
+            <div className="calc-field">
+              <label>대상 모델</label>
+              <select value={calcModel} onChange={(e) => setCalcModel(e.target.value)} className="calc-select">
+                {pricingList.map((p) => (
+                  <option key={`${p.engine}-${p.model}`} value={p.model}>
+                    {p.engineLabel} · {p.displayName}
+                  </option>
+                ))}
+              </select>
+            </div>
+            {(
+              [
+                ["입력 토큰 수", calcInput, setCalcInput],
+                ["출력 토큰 수", calcOutput, setCalcOutput],
+              ] as const
+            ).map(([label, value, set]) => (
+              <div className="calc-field" key={label}>
+                <label>
+                  {label} <small>≈ {tokens(value)} 토큰</small>
+                </label>
+                <div className="calc-amount">
+                  <input type="number" min={0} step={1000} value={value} onChange={(e) => set(Math.max(0, Number(e.target.value) || 0))} className="calc-input" />
+                  <div className="calc-presets">
+                    {[1e3, 1e4, 1e5, 1e6].map((n) => (
+                      <button key={n} className={value === n ? "on" : ""} onClick={() => set(n)}>
+                        {tokens(n)}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            ))}
           </div>
 
           <div className="calc-result">
@@ -281,7 +275,6 @@ function PricingView({
             <div className="calc-res-krw">약 {calcResult.krw.toLocaleString()}원 (환율 1,380원 기준)</div>
             <div className="calc-res-breakdown">
               <span>입력 {usd(calcResult.inCost)}</span>
-              <span>+</span>
               <span>출력 {usd(calcResult.outCost)}</span>
             </div>
           </div>

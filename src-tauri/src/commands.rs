@@ -135,13 +135,14 @@ pub fn conversation_rename(st: S, conversation_id: String, title: String) -> App
 }
 
 #[tauri::command]
-pub fn conversation_delete(st: S, conversation_id: String) -> AppResult<()> {
+pub fn conversation_delete(app: AppHandle, st: S, conversation_id: String) -> AppResult<()> {
     let files: Vec<attachments::Attachment> = store::list_messages(&st.db, &conversation_id)?.iter().flat_map(|m| attachments::of_data(m.data.as_ref())).collect();
     store::delete_conversation(&st.db, &conversation_id)?;
     for f in &files {
         attachments::remove(&st.data_dir, &f.id);
     }
     audit::record(&st.db, "user", "conversation.deleted", "ok", json!({}));
+    orchestrator::emit(&app, "conversation:deleted", json!({ "conversationId": conversation_id }));
     Ok(())
 }
 
@@ -317,12 +318,12 @@ fn lead_ctx(app: &AppHandle, st: &S, task_id: &str) -> AppResult<crate::leadrun:
 
 /// 총괄에게 전체 지시를 보내거나 특정 워커(about)의 문제를 알린다.
 #[tauri::command]
-pub fn lead_send(app: AppHandle, st: S, task_id: String, text: String, about: Option<String>) -> AppResult<()> {
+pub fn lead_send(app: AppHandle, st: S, task_id: String, text: String, about: Option<String>, direct: Option<bool>) -> AppResult<()> {
     let text = text.trim().to_string();
     if text.is_empty() {
         return Err(AppError::msg("보낼 내용이 없습니다"));
     }
-    crate::leadrun::user_message(lead_ctx(&app, &st, &task_id)?, text, about);
+    crate::leadrun::user_message(lead_ctx(&app, &st, &task_id)?, text, about, direct.unwrap_or(false));
     Ok(())
 }
 
@@ -347,6 +348,29 @@ pub fn lead_revoke(app: AppHandle, st: S, task_id: String) -> AppResult<()> {
 #[tauri::command]
 pub fn test_cancel(st: S, id: u64) -> bool {
     st.tests.cancel_test(id)
+}
+
+#[tauri::command]
+pub fn test_log(st: S, id: u64) -> Vec<String> {
+    st.tests.log(id)
+}
+
+/// 에이전트가 뒤에서 돌리는 명령(task를 주면 그 작업만)
+#[tauri::command]
+pub fn bg_jobs(st: S, task_id: Option<String>) -> Vec<crate::bgjobs::JobView> {
+    st.bg.list(task_id.as_deref())
+}
+
+/// 백그라운드 명령의 지금까지 출력(끝부분)
+#[tauri::command]
+pub fn bg_read(st: S, id: String) -> AppResult<String> {
+    st.bg.read(&id).map_err(AppError::msg)
+}
+
+/// Elysium이 돌리는 백그라운드 명령을 멈춘다.
+#[tauri::command]
+pub fn bg_stop(st: S, id: String) -> bool {
+    st.bg.stop(&id)
 }
 
 #[tauri::command]
@@ -462,12 +486,14 @@ pub struct RemoteStatus {
     addresses: Vec<remote::Address>,
     fingerprint: Option<String>,
     devices: Vec<remote::Device>,
+    /// 다른 네트워크 연결: "starting" | "online" | "error" | null(꺼짐)
+    relay: Option<&'static str>,
 }
 
 fn remote_status_of(st: &orchestrator::AppState) -> AppResult<RemoteStatus> {
     let config = remote::load_config(&st.db)?;
     let fingerprint = if config.enabled { remote::identity(&st.data_dir).ok().map(|i| i.fingerprint) } else { None };
-    Ok(RemoteStatus { config, running: remote::running_port(), addresses: remote::addresses(), fingerprint, devices: remote::devices(&st.db)? })
+    Ok(RemoteStatus { config, running: remote::running_port(), addresses: remote::addresses(), fingerprint, devices: remote::devices(&st.db)?, relay: crate::relay::state() })
 }
 
 #[tauri::command]
@@ -477,14 +503,27 @@ pub fn remote_status(st: S) -> AppResult<RemoteStatus> {
 
 /// 원격 제어 켜기/끄기·폰 허락 허용. 켜면 서버를 띄우고, 끄면 닫고 페어링 창도 닫는다.
 #[tauri::command]
-pub async fn remote_configure(app: AppHandle, st: S<'_>, enabled: bool, allow_approve: bool) -> AppResult<RemoteStatus> {
+pub async fn remote_configure(app: AppHandle, st: S<'_>, enabled: bool, allow_approve: bool, relay: Option<bool>) -> AppResult<RemoteStatus> {
     let mut c = remote::load_config(&st.db)?;
     c.enabled = enabled;
     c.allow_approve = allow_approve;
+    let relay_changed = relay.is_some_and(|r| r != c.relay);
+    c.relay = relay.unwrap_or(c.relay);
     remote::save_config(&st.db, &c)?;
     if enabled {
-        if remote::running_port().is_none() {
-            remote::start(app, st.inner().clone()).await?;
+        match remote::running_port() {
+            None => {
+                remote::start(app, st.inner().clone()).await?;
+            }
+            // 켜진 채로 외부 연결만 바꿨다.
+            Some(port) if relay_changed => {
+                if c.relay {
+                    crate::relay::start(&st.data_dir, port).await?;
+                } else {
+                    crate::relay::stop();
+                }
+            }
+            Some(_) => {}
         }
     } else {
         remote::stop();
@@ -508,7 +547,7 @@ pub fn remote_pair_start(st: S) -> AppResult<PairInfo> {
     let port = remote::running_port().ok_or_else(|| AppError::msg("먼저 원격 제어를 켜세요"))?;
     let id = remote::identity(&st.data_dir)?;
     let (code, ttl) = remote::pair_start();
-    let link = remote::pair_link(&remote::addresses(), port, &id.fingerprint, &code);
+    let link = remote::pair_link(&remote::addresses(), port, &id.fingerprint, &code, remote::tunnel_id(&st.db, &st.data_dir).as_deref());
     audit::record(&st.db, "user", "remote.pair_opened", "ok", json!({}));
     Ok(PairInfo { qr_svg: remote::qr_svg(&link)?, link, expires_in: ttl })
 }
@@ -651,6 +690,17 @@ pub fn pricing_list() -> Vec<crate::pricing::ModelPrice> { crate::pricing::all_p
     }
     store::delete_all(&st.db)?;
     attachments::remove_all(&st.data_dir);
-    let _ = app.emit("data:cleared", ());
+    orchestrator::emit(&app, "data:cleared", json!({}));
+    Ok(())
+}
+
+/// 취침 모드: 켜면 작업이 도는 동안 PC가 잠들지 않게 하고, monitor_off면 모니터를 끈다.
+#[tauri::command]
+pub fn power_sleep(st: S, on: bool, monitor_off: bool) -> AppResult<()> {
+    crate::power::set_sleep(st.inner().clone(), on);
+    if on && monitor_off {
+        crate::power::monitor_off(st.inner());
+    }
+    audit::record(&st.db, "user", "power.sleep", if on { "on" } else { "off" }, json!({ "monitorOff": monitor_off }));
     Ok(())
 }

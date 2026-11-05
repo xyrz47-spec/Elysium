@@ -1,9 +1,13 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { applyTheme, loadTheme, watchSystem, type ThemeChoice } from "../lib/theme";
-import { baseName } from "../lib/api";
+import { baseName, type Conversation } from "../lib/api";
 import { ask } from "../lib/confirm";
 import { useApp } from "../store";
-import { AutoIcon, ChartIcon, FolderIcon, GearIcon, MoonIcon, PanelIcon, PlusIcon, PuzzleIcon, SunIcon, TrashIcon } from "./Icons";
+import { AutoIcon, ChartIcon, FolderIcon, GearIcon, MoonIcon, PanelIcon, PlusIcon, PuzzleIcon, SleepIcon, SunIcon, TrashIcon } from "./Icons";
+import { setSleep } from "../lib/sleep";
+
+const SLEEP_TIP = "취침 모드: 화면 끄고 AI 작업 유지";
 
 const THEME_NEXT: Record<ThemeChoice, ThemeChoice> = { system: "dark", dark: "light", light: "system" };
 const THEME_LABEL: Record<ThemeChoice, string> = { system: "시스템 따라가기", dark: "다크 모드", light: "화이트 모드" };
@@ -63,6 +67,9 @@ export function Dock({ panelOpen, onTogglePanel }: { panelOpen: boolean; onToggl
         <PuzzleIcon />
       </button>
       <ThemeButton />
+      <button className="dock-btn" onClick={() => setSleep(true)} aria-label={SLEEP_TIP} data-tip={SLEEP_TIP}>
+        <SleepIcon />
+      </button>
       <button className="dock-btn" onClick={() => setDialog("settings")} aria-label="설정" data-tip="설정 (Ctrl+,)">
         <GearIcon />
         <span className="dock-count" title="쓸 수 있는 AI 수">
@@ -73,12 +80,69 @@ export function Dock({ panelOpen, onTogglePanel }: { panelOpen: boolean; onToggl
   );
 }
 
+const DEL_LABEL = "세션 삭제";
+const DEL_TIP = "삭제";
+
+/** 우클릭 메뉴: 누른 자리에 뜨고, 바깥을 누르거나 Esc·스크롤·창 크기 변경이면 닫힌다. */
+function ContextMenu({ x, y, label, onClose, children }: { x: number; y: number; label: string; onClose: () => void; children: ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState({ left: x, top: y });
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    // 화면 밖으로 넘치지 않게 맞춘다.
+    const r = el.getBoundingClientRect();
+    setPos({ left: Math.max(4, Math.min(x, window.innerWidth - r.width - 4)), top: Math.max(4, Math.min(y, window.innerHeight - r.height - 4)) });
+    el.querySelector<HTMLElement>("[role=menuitem]")?.focus();
+  }, [x, y]);
+  useEffect(() => {
+    const down = (e: PointerEvent) => {
+      if (!ref.current?.contains(e.target as Node)) onClose();
+    };
+    const key = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        onClose();
+      }
+    };
+    window.addEventListener("pointerdown", down, true);
+    window.addEventListener("keydown", key, true);
+    window.addEventListener("resize", onClose);
+    window.addEventListener("blur", onClose);
+    document.addEventListener("scroll", onClose, true);
+    return () => {
+      window.removeEventListener("pointerdown", down, true);
+      window.removeEventListener("keydown", key, true);
+      window.removeEventListener("resize", onClose);
+      window.removeEventListener("blur", onClose);
+      document.removeEventListener("scroll", onClose, true);
+    };
+  }, [onClose]);
+  // 패널의 유리 효과 안에서는 fixed가 패널 기준이 되므로 body에 그린다.
+  return createPortal(
+    <div ref={ref} className="ctx-menu" role="menu" aria-label={label} style={pos} onContextMenu={(e) => e.preventDefault()}>
+      {children}
+    </div>,
+    document.body,
+  );
+}
+
 /** 세션 패널: 세션마다 카드 한 장. 카드에 그 세션의 작업 폴더가 보인다. */
 export default function SessionPanel({ open, onPicked }: { open: boolean; onPicked: () => void }) {
   const { conversations, conversationId, openConversation, deleteConversation, live } = useApp();
   const [q, setQ] = useState("");
   const busy = new Set(live.map((l) => l.conversationId));
   const list = useMemo(() => conversations.filter((c) => !q || c.title.toLowerCase().includes(q.toLowerCase()) || (c.workspaceDir ?? "").toLowerCase().includes(q.toLowerCase())), [conversations, q]);
+  const [menu, setMenu] = useState<{ c: Conversation; x: number; y: number } | null>(null);
+  const remove = async (c: Conversation) => {
+    const ok = await ask({
+      title: `'${c.title}' 세션을 삭제할까요?`,
+      body: "이 세션의 대화, 답, 세션 메모리(요약), 과정 기록이 모두 지워지고 되돌릴 수 없습니다. 작업 폴더의 파일은 지우지 않습니다.",
+      confirmLabel: "영구 삭제",
+      danger: true,
+    });
+    if (ok) deleteConversation(c.id);
+  };
 
   return (
     <aside className={`panel ${open ? "open" : ""}`} aria-label="세션" aria-hidden={!open} inert={!open}>
@@ -102,12 +166,20 @@ export default function SessionPanel({ open, onPicked }: { open: boolean; onPick
                 openConversation(c.id);
                 onPicked();
               }}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                setMenu({ c, x: e.clientX, y: e.clientY });
+              }}
               role="button"
               tabIndex={0}
               onKeyDown={(e) => {
                 if (e.key === "Enter") {
                   openConversation(c.id);
                   onPicked();
+                } else if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) {
+                  e.preventDefault();
+                  const r = e.currentTarget.getBoundingClientRect();
+                  setMenu({ c, x: r.left + 16, y: r.top + r.height / 2 });
                 }
               }}
             >
@@ -120,17 +192,11 @@ export default function SessionPanel({ open, onPicked }: { open: boolean; onPick
               </div>
               <button
                 className="session-del"
-                aria-label="세션 삭제"
-                title="삭제"
-                onClick={async (e) => {
+                aria-label={DEL_LABEL}
+                title={DEL_TIP}
+                onClick={(e) => {
                   e.stopPropagation();
-                  const ok = await ask({
-                    title: `'${c.title}' 세션을 삭제할까요?`,
-                    body: "이 세션의 대화, 답, 세션 메모리(요약), 과정 기록이 모두 지워지고 되돌릴 수 없습니다. 작업 폴더의 파일은 지우지 않습니다.",
-                    confirmLabel: "영구 삭제",
-                    danger: true,
-                  });
-                  if (ok) deleteConversation(c.id);
+                  remove(c);
                 }}
               >
                 <TrashIcon />
@@ -139,6 +205,22 @@ export default function SessionPanel({ open, onPicked }: { open: boolean; onPick
           ))}
         </nav>
       </div>
+      {menu && (
+        <ContextMenu x={menu.x} y={menu.y} label={menu.c.title} onClose={() => setMenu(null)}>
+          <button
+            type="button"
+            role="menuitem"
+            className="danger"
+            onClick={() => {
+              const c = menu.c;
+              setMenu(null);
+              remove(c);
+            }}
+          >
+            <TrashIcon /> {DEL_TIP}
+          </button>
+        </ContextMenu>
+      )}
     </aside>
   );
 }

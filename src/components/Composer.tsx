@@ -14,6 +14,8 @@ const SUGGEST_DELAY_MS = 700;
 const SUGGEST_MIN_CHARS = 8;
 
 /** 대화창 아래 입력 상자: 대화/작업 모드 · 보내기 · 만들기(폴더 안에서 끝까지 완성) · 엔진 고르기 · /스킬 자동 완성 */
+const SEND_MORE = "전송 방식 선택";
+
 export default function Composer({ draft, onDraftUsed }: { draft?: string | null; onDraftUsed?: () => void }) {
   const { send, engines, live, conversationId, cancel, skills, conversations, newFolder, chooseFolder, resetFolder, toast, settings } = useApp();
   const [text, setText] = useState("");
@@ -24,6 +26,7 @@ export default function Composer({ draft, onDraftUsed }: { draft?: string | null
   // 작업 모드: 보내기(Enter)로도 파일을 고칠 수 있다(실행 전에 허락을 받는다).
   const [work, setWork] = useState(false);
   const [menu, setMenu] = useState(false);
+  const [sendMenu, setSendMenu] = useState(false);
   const [pick, setPick] = useState(0);
   const ref = useRef<HTMLTextAreaElement>(null);
 
@@ -207,6 +210,28 @@ export default function Composer({ draft, onDraftUsed }: { draft?: string | null
           ))}
         </div>
       )}
+      {sendMenu && !running && (
+        <div className="menu send-menu" role="menu" onMouseLeave={() => setSendMenu(false)}>
+          <button role="menuitem" disabled={(!text.trim() && files.length === 0) || installed.length === 0} onClick={() => (setSendMenu(false), submit(false))}>
+            <b>
+              <SendIcon /> {work ? "작업 보내기" : "질문 보내기"}
+            </b>
+            <span>{work ? "작업 보내기: 허락을 받은 뒤 폴더 안의 파일을 고칩니다 (Enter)" : "질문 보내기: 파일은 고치지 않습니다 (Enter)"}</span>
+          </button>
+          <button role="menuitem" disabled={(!text.trim() && files.length === 0) || installed.length === 0} onClick={() => (setSendMenu(false), submit(false, true))}>
+            <b>
+              <CouncilIcon size={14} /> 회의
+            </b>
+            <span>{councilHint}</span>
+          </button>
+          <button role="menuitem" disabled={(!text.trim() && files.length === 0) || !canBuild} onClick={() => (setSendMenu(false), submit(true))}>
+            <b>
+              <WrenchIcon /> 만들기
+            </b>
+            <span>{buildHint}</span>
+          </button>
+        </div>
+      )}
       {/* .composer가 backdrop-filter의 경계라 그 안에 두면 유리가 뒤 화면을 보지 못한다: slash-menu처럼 밖에 둔다 */}
       {menu && (
         <div className="menu" role="menu" onMouseLeave={() => setMenu(false)}>
@@ -339,7 +364,7 @@ export default function Composer({ draft, onDraftUsed }: { draft?: string | null
               </button>
             </>
           ) : (
-            <>
+            <div className="send-group">
               <button
                 className="send quiet"
                 onClick={() => submit(false)}
@@ -349,13 +374,10 @@ export default function Composer({ draft, onDraftUsed }: { draft?: string | null
               >
                 <SendIcon />
               </button>
-              <button className="council-btn" onClick={() => submit(false, true)} disabled={(!text.trim() && files.length === 0) || installed.length === 0} title={councilHint} aria-label="AI 회의 시작">
-                <CouncilIcon /> 회의
+              <button className="send-more" onClick={() => setSendMenu((m) => !m)} aria-label={SEND_MORE} title={SEND_MORE} aria-haspopup="menu" aria-expanded={sendMenu}>
+                <ChevronIcon open={sendMenu} />
               </button>
-              <button className="build-btn" onClick={() => submit(true)} disabled={(!text.trim() && files.length === 0) || !canBuild} title={buildHint}>
-                <WrenchIcon /> 만들기
-              </button>
-            </>
+            </div>
           )}
         </div>
       </div>
