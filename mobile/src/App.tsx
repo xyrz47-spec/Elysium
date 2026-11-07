@@ -429,7 +429,7 @@ export default function App() {
           case "task:agent-removed":
             patch((l) => {
               const drop = <T,>(r: Record<string, T>) => Object.fromEntries(Object.entries(r).filter(([k]) => k !== p.key));
-              return { ...l, agents: drop(l.agents), parts: drop(l.parts), streams: drop(l.streams), usage: drop(l.usage), gone: { ...l.gone, [p.key]: true } };
+              return { ...l, agents: drop(l.agents), parts: drop(l.parts), streams: drop(l.streams), gone: { ...l.gone, [p.key]: true } };
             });
             break;
           case "lead:started":

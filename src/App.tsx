@@ -3,10 +3,13 @@ import { baseName } from "./lib/api";
 import { useApp } from "./store";
 import SessionPanel, { Dock } from "./components/SessionRail";
 import ParticleOrb, { type OrbMode } from "./components/ParticleOrb";
+import Starfield from "./components/Starfield";
 import UsageDialog from "./components/UsageDialog";
 import ConfirmDialog from "./components/ConfirmDialog";
+import PowerBanner from "./components/PowerBanner";
 import MemoryButton from "./components/MemoryButton";
-import { ToolDock, ToolPanel, type ToolTab } from "./components/Tools";
+import { A as AGENT_TEXT, AgentsTab, ToolDock, ToolPanel, type ToolTab } from "./components/Tools";
+import Segmented from "./components/Segmented";
 import { clampPanel, DOCK, PANEL_DEFAULT } from "./lib/panel";
 import Thread from "./components/Thread";
 import Composer from "./components/Composer";
@@ -16,8 +19,15 @@ import { FolderIcon } from "./components/Icons";
 import SleepScreen from "./components/SleepScreen";
 import { GlassDefs, useGlassLight, useLiquidRefraction } from "./lib/glass";
 
+export type MainView = "chat" | "agents";
+
+const VIEW_TEXT = {
+  chat: "채팅",
+  label: "화면 전환",
+};
+
 /** 세션 머리: 제목과 이 세션의 작업 폴더(눌러서 바꾸기) */
-function SessionHead() {
+function SessionHead({ view, onView, running }: { view: MainView; onView: (v: MainView) => void; running: number }) {
   const { conversations, conversationId, chooseFolder, live } = useApp();
   const c = conversations.find((x) => x.id === conversationId);
   const busy = live.some((l) => l.conversationId === conversationId);
@@ -37,6 +47,16 @@ function SessionHead() {
       )}
       {c && <MemoryButton conversationId={c.id} />}
       <div className="spacer" />
+      <Segmented
+        label={VIEW_TEXT.label}
+        className="view-switch"
+        value={view}
+        onChange={onView}
+        options={[
+          { value: "chat", label: VIEW_TEXT.chat },
+          { value: "agents", label: <>{AGENT_TEXT.title}{running > 0 && <span className="dock-count inline">{running}</span>}</> },
+        ]}
+      />
     </header>
   );
 }
@@ -104,7 +124,7 @@ function loadPanel(): boolean {
 }
 
 export default function App() {
-  const { dialog, setDialog, toasts, openConversation, engines, live, approvals } = useApp();
+  const { dialog, setDialog, toasts, openConversation, engines, live, approvals, conversationId } = useApp();
   useGlassLight();
   useLiquidRefraction();
   const [draft, setDraft] = useState<string | null>(null);
@@ -122,10 +142,26 @@ export default function App() {
   }, []);
   // 오른쪽 도구 패널(세션 정보·에이전트·곁질문·목차·찾기·내보내기)
   const [tool, setTool] = useState<ToolTab | null>(null);
-  const [findKey, setFindKey] = useState(0);
   const lastTool = useRef<ToolTab>("info");
   const toolsWidth = useToolsWidth();
   if (tool) lastTool.current = tool;
+  // Main area: chat or the agent board. A multi-agent task in this session brings the board to the front once.
+  const [view, setView] = useState<MainView>("chat");
+  const agentTask = live.find((l) => l.conversationId === conversationId && (l.lead || Object.keys(l.agents).length >= 2));
+  const autoFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (agentTask && autoFor.current !== agentTask.taskId) {
+      autoFor.current = agentTask.taskId;
+      setView("agents");
+    }
+  }, [agentTask?.taskId]);
+  useEffect(() => {
+    if (!agentTask) setView("chat");
+    // Only when the session changes; staying on the board after the task ends is fine.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [conversationId]);
+  const running = live.reduce((n, l) => n + Object.values(l.agents).filter((a) => a.state === "run").length, 0);
+  const pickView = setView;
   // 구의 상태: 허락 대기 > 처리 중 > 대기, 쓸 AI가 없으면 꺼짐
   const orb: OrbMode = approvals.length ? "approval" : live.length ? "thinking" : engines.some((e) => e.installed) ? "idle" : "off";
 
@@ -138,10 +174,6 @@ export default function App() {
         setDialog(null);
       } else if (e.key === "Escape" && tool) {
         setTool(null);
-      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
-        e.preventDefault();
-        setTool("find");
-        setFindKey((k) => k + 1);
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "j") {
         e.preventDefault();
         setTool((t) => (t ? null : lastTool.current));
@@ -163,6 +195,7 @@ export default function App() {
   return (
     <div className={`app ${panel ? "panel-open" : ""} ${tool ? "tools-open" : ""} ${toolsWidth.dragging ? "tools-dragging" : ""}`} style={{ "--tools-w": `${toolsWidth.width}px` } as React.CSSProperties}>
       <GlassDefs />
+      <Starfield />
       <ParticleOrb mode={orb} />
       <Dock panelOpen={panel} onTogglePanel={togglePanel} />
       <SessionPanel
@@ -173,16 +206,23 @@ export default function App() {
         }}
       />
       <ToolDock tab={tool} onTab={setTool} />
-      <ToolPanel tab={tool} onTab={setTool} focusKey={findKey} onResizeStart={toolsWidth.onResizeStart} onResizeKey={toolsWidth.onResizeKey} />
+      <ToolPanel tab={tool} onTab={setTool} onResizeStart={toolsWidth.onResizeStart} onResizeKey={toolsWidth.onResizeKey} />
       <main className="main">
-        <SessionHead />
-        <Thread onPick={setDraft} />
+        <SessionHead view={view} onView={pickView} running={running} />
+        {view === "agents" ? (
+          <div className="agents-main">
+            <AgentsTab main onClose={() => {}} />
+          </div>
+        ) : (
+          <Thread onPick={setDraft} />
+        )}
         <Composer draft={draft} onDraftUsed={clearDraft} />
       </main>
       {(dialog === "settings" || dialog === "keys") && <SettingsDialog focusKeys={dialog === "keys"} />}
       {dialog === "skills" && <SkillsDialog />}
       {dialog === "usage" && <UsageDialog />}
       <ConfirmDialog />
+      <PowerBanner />
       <SleepScreen />
       <div className="toasts" role="status">
         {toasts.map((t) => (

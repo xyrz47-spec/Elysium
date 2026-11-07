@@ -7,6 +7,7 @@ import "katex/dist/katex.min.css";
 import { CheckIcon, CopyIcon } from "./Icons";
 import { api } from "../lib/api";
 import { normalizeMath } from "../lib/math";
+import remarkNoStrike from "../lib/remarkNoStrike";
 
 function textOf(node: ReactNode): string {
   if (typeof node === "string" || typeof node === "number") return String(node);
@@ -49,7 +50,7 @@ function Markdown({ text }: { text: string }) {
   return (
     <div className="md">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkMath]}
+        remarkPlugins={[remarkGfm, remarkNoStrike, remarkMath]}
         rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: "ignore" }]]}
         components={{
           pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,

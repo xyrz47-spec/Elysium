@@ -20,6 +20,9 @@ impl Tok {
     fn add(self, o: Tok) -> Tok {
         Tok { input: self.input + o.input, output: self.output + o.output, cost: self.cost + o.cost }
     }
+    fn max(self, o: Tok) -> Tok {
+        Tok { input: self.input.max(o.input), output: self.output.max(o.output), cost: self.cost.max(o.cost) }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -36,6 +39,11 @@ pub struct AgentSnap {
     /// 끝난 차례의 합계와 지금 차례의 값
     pub done: Tok,
     pub cur: Tok,
+    /// `done` when the current run started, and the turn the live value belongs to (one run can have several turns).
+    #[serde(skip)]
+    pub base: Tok,
+    #[serde(skip)]
+    pub turn: u64,
     pub tail: String,
     /// 도구를 쓴 횟수
     pub tools: u32,
@@ -127,9 +135,15 @@ impl Snap {
                 a.stopped = p["stopped"].as_bool().unwrap_or(false);
                 if a.state == "run" {
                     a.cur = Tok::default();
+                    a.base = a.done;
+                    a.turn = 0;
                 } else {
-                    let final_ = tok(p, "inputTokens", "outputTokens", "costUsd").unwrap_or(a.cur);
-                    a.done = a.done.add(final_);
+                    // The final report covers every turn of this run; never show less than what was already seen live.
+                    let seen = a.done.add(a.cur);
+                    a.done = match tok(p, "inputTokens", "outputTokens", "costUsd") {
+                        Some(f) => a.base.add(f).max(seen),
+                        None => seen,
+                    };
                     a.cur = Tok::default();
                     a.last = None;
                 }
@@ -146,7 +160,17 @@ impl Snap {
                         a.state = "run".into();
                         a.wait = p["note"].as_str().map(str::to_string);
                     }
-                    "task:agent-usage" => a.cur = tok(p, "input", "output", "costUsd").unwrap_or_default(),
+                    "task:agent-usage" => {
+                        // A new turn inside the same run: the previous turn's usage joins the total instead of being overwritten.
+                        let turn = p["turn"].as_u64().unwrap_or(0);
+                        if turn != 0 && a.turn != 0 && turn != a.turn {
+                            a.done = a.done.add(a.cur);
+                        }
+                        if turn != 0 {
+                            a.turn = turn;
+                        }
+                        a.cur = tok(p, "input", "output", "costUsd").unwrap_or_default();
+                    }
                     "task:agent-bg" => a.bg = p["count"].as_u64().unwrap_or(0) as u32,
                     "task:agent-delta" => {
                         a.tail.push_str(p["delta"].as_str().unwrap_or(""));
@@ -207,5 +231,25 @@ mod tests {
         assert!(s.list().is_empty());
         s.apply("task:agent-delta", &json!({ "taskId": "x", "key": "k", "delta": "?" }));
         assert!(s.list().is_empty(), "모르는 작업의 글은 무시한다");
+    }
+
+    #[test]
+    fn later_turns_add_to_the_total_instead_of_replacing_it() {
+        let mut s = Snap::default();
+        s.apply("task:started", &json!({ "taskId": "t", "conversationId": "c" }));
+        s.apply("task:agent", &json!({ "taskId": "t", "key": "a", "state": "ok", "inputTokens": 1000, "outputTokens": 10, "costUsd": 1.0 }));
+        s.apply("task:agent", &json!({ "taskId": "t", "key": "a", "state": "run" }));
+        let usage = |s: &mut Snap, turn: u64, input: u64, cost: f64| s.apply("task:agent-usage", &json!({ "taskId": "t", "key": "a", "turn": turn, "input": input, "output": 0, "costUsd": cost }));
+        usage(&mut s, 1, 500, 5.0);
+        usage(&mut s, 1, 900, 9.0);
+        // A message from the lead starts turn 2 in the same run: its counter starts low again.
+        usage(&mut s, 2, 100, 1.0);
+        let a = &s.list()[0].agents["a"];
+        assert_eq!((a.done.cost + a.cur.cost) as i64, 11, "earlier run 1 + turn 1 (9) + turn 2 (1)");
+        // The final report misses the stalled turn: the live total must not shrink.
+        s.apply("task:agent", &json!({ "taskId": "t", "key": "a", "state": "ok", "inputTokens": 150, "outputTokens": 0, "costUsd": 2.0 }));
+        let a = &s.list()[0].agents["a"];
+        assert_eq!(a.done.cost as i64, 11);
+        assert_eq!(a.done.input, 2000);
     }
 }

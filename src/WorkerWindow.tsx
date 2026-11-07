@@ -1,4 +1,4 @@
-// 워커·그룹 하나를 따로 보여 주는 창. 다른 모니터로 옮길 수 있다. 상태는 메인 창에서 받아 채우고 이후 이벤트를 따른다.
+// 워커·팀 하나를 따로 보여 주는 창. 다른 모니터로 옮길 수 있다. 상태는 메인 창에서 받아 채우고 이후 이벤트를 따른다.
 import { emit } from "@tauri-apps/api/event";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Elapsed, LT, NowLine, runState, shownState, splitActivity, VERDICT } from "./components/LeadPanel";
@@ -12,6 +12,7 @@ import { hideBlocks, STREAM_KEEP } from "./lib/panel";
 import type { AgentRun, PartInfo } from "./store";
 import { TOKEN_TEXT } from "./components/TokenMeter";
 import { liveTurn, shortTokens, total, turnEvent, usd, type RunUsage } from "./lib/usage";
+import { LoadEarlier, TAIL_TEXT, useKeepScroll, useTail } from "./lib/tail";
 
 export interface WorkerSnapshot {
   label: string;
@@ -56,13 +57,18 @@ function Metric({ label, children, accent = false }: { label: string; children: 
   );
 }
 
+/** Feed entries drawn at first; older ones load on demand. */
+const FEED_STEP = 30;
+const ACT_STEP = 60;
+
 /** 사용한 도구를 최신 것부터 */
 function Timeline({ items }: { items: string[] }) {
+  const tail = useTail(items.length, ACT_STEP);
   if (!items.length) return <div className="worker-empty">{LT.emptyActivity}</div>;
   return (
     <ol className="worker-timeline">
       {items
-        .slice()
+        .slice(items.length - tail.shown)
         .reverse()
         .map((a, i) => {
           const { tool, detail } = splitActivity(a);
@@ -76,21 +82,34 @@ function Timeline({ items }: { items: string[] }) {
             </li>
           );
         })}
+      {tail.hidden > 0 && (
+        <li className="more">
+          <LoadEarlier hidden={tail.hidden} label={TAIL_TEXT.items} onMore={tail.more} />
+        </li>
+      )}
     </ol>
   );
 }
 
-/** 그룹 대화: 누가 몇 라운드에 무엇을 말했는지, 맡은 파일 */
+/** 팀 대화: 누가 몇 라운드에 무엇을 말했는지, 맡은 파일 */
 function Talk({ log }: { log: GroupNote[] }) {
   const box = useRef<HTMLOListElement>(null);
+  const tail = useTail(log.length, FEED_STEP);
+  const keep = useKeepScroll(box, tail.shown);
   useEffect(() => {
     if (box.current) box.current.scrollTop = box.current.scrollHeight;
   }, [log.length]);
   if (!log.length) return <div className="worker-empty">{LT.noTalk}</div>;
+  const from = log.length - tail.shown;
   return (
     <ol ref={box} className="worker-feed">
-      {log.map((g, i) => (
-        <li key={i} className={g.done ? "done" : ""}>
+      {tail.hidden > 0 && (
+        <li className="more">
+          <LoadEarlier hidden={tail.hidden} label={TAIL_TEXT.items} onMore={() => (keep(), tail.more())} />
+        </li>
+      )}
+      {log.slice(from).map((g, j) => (
+        <li key={from + j} className={g.done ? "done" : ""}>
           <div className="worker-feed-head">
             <b>{g.who}</b>
             <span className="agent-sub">{LT.round.replace("{n}", String(g.round + 1))}</span>
@@ -112,10 +131,18 @@ function Talk({ log }: { log: GroupNote[] }) {
 
 /** 팀장 보고: 이 팀이 보내거나 받은 것 */
 function OrgFeed({ log, unit }: { log: OrgPost[]; unit: OrgUnit }) {
+  const tail = useTail(log.length, FEED_STEP);
   if (!log.length) return <div className="worker-empty">{LT.emptyOrg}</div>;
+  const from = log.length - tail.shown;
   return (
     <ol className="worker-feed">
-      {log.map((p, i) => {
+      {tail.hidden > 0 && (
+        <li className="more">
+          <LoadEarlier hidden={tail.hidden} label={TAIL_TEXT.items} onMore={tail.more} />
+        </li>
+      )}
+      {log.slice(from).map((p, j) => {
+        const i = from + j;
         const mine = p.from === unit.index;
         return (
           <li key={i} className={mine ? "mine" : ""}>

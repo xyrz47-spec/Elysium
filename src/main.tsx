@@ -11,12 +11,14 @@ import "./styles.css";
 import "./elysium.css";
 import { applyTheme, loadTheme, watchStorage } from "./lib/theme";
 import { applyView } from "./lib/view";
+import { initLowSpec } from "./lib/perf";
 
 // 첫 화면이 그려지기 전에 테마를 정해 깜빡임을 막는다.
 applyTheme(loadTheme());
 watchStorage();
 // 화면 배율·대화 폭(워커 창도 같은 배율로)
 applyView();
+initLowSpec();
 
 const query = new URLSearchParams(window.location.search);
 const workerTask = query.get("window") === "worker" ? query.get("task") : null;

@@ -239,57 +239,61 @@ pub fn locate(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// models: 엔진별로 설정에서 고른 모델(없으면 기본값)
+/// models: 엔진별로 설정에서 고른 모델(없으면 기본값). CLI마다 따로 확인하므로 한꺼번에(동시에) 돌린다.
 pub async fn detect(models: &std::collections::BTreeMap<String, String>) -> Vec<EngineInfo> {
-    let mut out = Vec::new();
-    for id in ALL {
-        if let Some(a) = crate::apis::api(id) {
-            out.push(EngineInfo {
-                id,
-                label: id.label(),
-                kind: "api",
-                installed: crate::secrets::get(a.secret).is_some(),
-                path: None,
-                version: Some(models.get(id.as_str()).cloned().unwrap_or_else(|| a.default_model.to_string())),
-                verified: false,
-                install_hint: id.install_hint(),
-                models: vec![],
-            });
-            continue;
+    futures_util::future::join_all(ALL.iter().map(|&id| probe(id, models, true))).await
+}
+
+/// 시작할 때 바로 쓰는 목록: 실행 파일이 있는지만 본다(버전·모델 목록은 detect가 뒤에서 채운다).
+pub async fn detect_quick(models: &std::collections::BTreeMap<String, String>) -> Vec<EngineInfo> {
+    futures_util::future::join_all(ALL.iter().map(|&id| probe(id, models, false))).await
+}
+
+async fn probe(id: EngineId, models: &std::collections::BTreeMap<String, String>, run: bool) -> EngineInfo {
+    if let Some(a) = crate::apis::api(id) {
+        return EngineInfo {
+            id,
+            label: id.label(),
+            kind: "api",
+            installed: crate::secrets::get(a.secret).is_some(),
+            path: None,
+            version: Some(models.get(id.as_str()).cloned().unwrap_or_else(|| a.default_model.to_string())),
+            verified: false,
+            install_hint: id.install_hint(),
+            models: vec![],
+        };
+    }
+    let path = locate(id.exe_name());
+    let mut version = None;
+    let mut list = vec![];
+    if let (true, Some(p)) = (run, &path) {
+        let mut c = command(p);
+        c.arg("--version").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+        if let Ok(Ok(o)) = tokio::time::timeout(Duration::from_secs(8), c.output()).await {
+            version = String::from_utf8_lossy(&o.stdout).lines().next().map(|l| l.trim().to_string()).filter(|l| !l.is_empty());
         }
-        let path = locate(id.exe_name());
-        let mut version = None;
-        if let Some(p) = &path {
-            let mut c = command(p);
-            c.arg("--version").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
-            if let Ok(Ok(o)) = tokio::time::timeout(Duration::from_secs(8), c.output()).await {
-                version = String::from_utf8_lossy(&o.stdout).lines().next().map(|l| l.trim().to_string()).filter(|l| !l.is_empty());
-            }
-        }
-        let mut list = vec![];
-        if let (EngineId::OpenCode, Some(p)) = (id, &path) {
+        if id == EngineId::OpenCode {
             let mut c = command(p);
             c.arg("models").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
             if let Ok(Ok(o)) = tokio::time::timeout(Duration::from_secs(20), c.output()).await {
                 list = free_models(&String::from_utf8_lossy(&o.stdout));
             }
-            if list.is_empty() {
-                list.push(OPENCODE_DEFAULT.to_string());
-            }
         }
-        out.push(EngineInfo {
-            id,
-            label: id.label(),
-            kind: "cli",
-            installed: path.is_some(),
-            path: path.map(|p| p.to_string_lossy().to_string()),
-            version,
-            verified: id.verified(),
-            install_hint: id.install_hint(),
-            models: list,
-        });
     }
-    out
+    if id == EngineId::OpenCode && path.is_some() && list.is_empty() {
+        list.push(OPENCODE_DEFAULT.to_string());
+    }
+    EngineInfo {
+        id,
+        label: id.label(),
+        kind: "cli",
+        installed: path.is_some(),
+        path: path.map(|p| p.to_string_lossy().to_string()),
+        version,
+        verified: id.verified(),
+        install_hint: id.install_hint(),
+        models: list,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +332,8 @@ pub enum Event {
     Text(String),
     /// 도구 사용 등 진행 상황(사람이 읽는 짧은 설명)
     Activity(String),
+    /// A shell command the agent ran itself (full text), for the lead's command log
+    Command(String),
     Session(String),
     /// 이번 실행에서 지금까지 쓴 토큰(실행 중에 늘어난다. 최종 값은 Done이 정한다)
     Usage { input: u64, output: u64 },
@@ -441,9 +447,73 @@ impl Pulse {
     }
 }
 
-const CHAT_TOOLS: &str = "Read,Grep,Glob,WebFetch,WebSearch";
+const CHAT_TOOLS: &str = "Read,Grep,Glob,WebFetch,WebSearch,Skill";
 /// 작업 모드는 PowerShell 명령까지 허용한다(Bash는 쓰지 않는다). Windows에서는 샌드박스가 없어 사용자 권한으로 돈다.
-const WORK_TOOLS: &str = "Read,Grep,Glob,Edit,Write,PowerShell,WebFetch,WebSearch";
+const WORK_TOOLS: &str = "Read,Grep,Glob,Edit,Write,PowerShell,WebFetch,WebSearch,Skill";
+
+/// Claude Code's own config file (local-scope MCP servers live under `projects.<path>.mcpServers`).
+fn claude_user_config() -> Option<PathBuf> {
+    if let Ok(d) = std::env::var("CLAUDE_CONFIG_DIR") {
+        let p = Path::new(&d).join(".claude.json");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok()?;
+    Some(Path::new(&home).join(".claude.json")).filter(|p| p.is_file())
+}
+
+fn read_json(p: &Path) -> Option<Value> {
+    serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()
+}
+
+fn names(v: Option<&Value>) -> Vec<String> {
+    v.and_then(Value::as_array).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default()
+}
+
+/// MCP servers installed for this project: project scope (`<cwd>/.mcp.json`) and local scope (`~/.claude.json`).
+/// `--strict-mcp-config` drops every config not passed with `--mcp-config`, so these must be handed over explicitly.
+/// User-scope (global) servers stay off on purpose: they add tokens to every run.
+pub fn project_mcp(cwd: &Path) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    let key = |p: &str| p.replace('\\', "/").trim_end_matches('/').to_lowercase();
+    let want = key(&cwd.to_string_lossy());
+    let mut disabled: Vec<String> = vec![];
+    if let Some(cfg) = claude_user_config().and_then(|p| read_json(&p)) {
+        if let Some((_, proj)) = cfg.get("projects").and_then(Value::as_object).and_then(|m| m.iter().find(|(k, _)| key(k) == want)) {
+            disabled.extend(names(proj.get("disabledMcpjsonServers")));
+            disabled.extend(names(proj.get("disabledMcpServers")));
+            if let Some(m) = proj.get("mcpServers").and_then(Value::as_object) {
+                out.extend(m.clone());
+            }
+        }
+    }
+    for f in [".claude/settings.json", ".claude/settings.local.json"] {
+        if let Some(v) = read_json(&cwd.join(f)) {
+            disabled.extend(names(v.get("disabledMcpjsonServers")));
+        }
+    }
+    if let Some(m) = read_json(&cwd.join(".mcp.json")).and_then(|v| v.get("mcpServers").and_then(Value::as_object).cloned()) {
+        for (k, v) in m {
+            out.entry(k).or_insert(v);
+        }
+    }
+    out.retain(|k, _| !disabled.contains(k));
+    out
+}
+
+/// Writes the servers to a temp file (inline JSON would pass through cmd.exe quoting) and returns its path.
+fn mcp_config_file(servers: &serde_json::Map<String, Value>) -> Option<String> {
+    let body = serde_json::json!({ "mcpServers": servers }).to_string();
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    body.hash(&mut h);
+    let p = std::env::temp_dir().join(format!("elysium-mcp-{:016x}.json", h.finish()));
+    if !p.is_file() {
+        std::fs::write(&p, &body).ok()?;
+    }
+    Some(p.to_string_lossy().to_string())
+}
 
 /// 홈 폴더의 전역 지시문을 뺀다. 프로젝트 자신의 CLAUDE.md·규칙은 그대로 읽는다.
 fn claude_settings(home: &str) -> String {
@@ -454,12 +524,28 @@ fn claude_settings(home: &str) -> String {
 /// 대기열을 쓰는 Claude가 직접 띄우지 못하게 막는 창 띄우기 작업. 패턴이라 모든 경우를 막지는 못한다.
 const WINDOW_BLOCK: &str = "PowerShell(*runClient*),PowerShell(*runGame*),PowerShell(*frameBenchmark*),PowerShell(*clientWorldReloadTest*),PowerShell(*launcherProfileTest*),PowerShell(*gradlew*Client),PowerShell(*gradlew*Client *),PowerShell(*Start-Process*),PowerShell(start *),PowerShell(saps *),PowerShell(*Invoke-Item*),PowerShell(ii *),PowerShell(*explorer.exe*),PowerShell(*msedge*),PowerShell(*chrome.exe*),PowerShell(*firefox*),PowerShell(*electron*),PowerShell(*tauri dev*),PowerShell(*npm run tauri*),PowerShell(* --open*)";
 
+/// Claude Code의 입력 토큰을 줄이는 환경 변수. 도구를 쓸 때마다 지금까지의 대화 전체를 다시 보내므로
+/// 대화가 길어질수록 한 번의 실행이 수천만 토큰이 된다(2026-11-05 실측: 워커 1회 4,867만 입력 · 18만 출력).
+/// - 자동 요약을 기본(약 95%)보다 일찍 해 대화가 커지지 않게 한다(셸 환경 변수로 줘야 듣는다).
+/// - 명령 출력이 대화에 그대로 쌓이지 않게 길이를 줄인다(기본 3만 자).
+pub const CLAUDE_TOKEN_ENV: [(&str, &str); 2] = [("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "50"), ("BASH_MAX_OUTPUT_LENGTH", "12000")];
+
 /// CLI 인자. 요청 본문은 들어가지 않는다(표준 입력으로 보냄).
 pub fn args(spec: &RunSpec) -> Vec<String> {
     let s = |x: &str| x.to_string();
     match spec.engine {
         EngineId::Claude => {
-            let tools = if spec.work { WORK_TOOLS } else { CHAT_TOOLS };
+            // The lead's judging calls may run any PowerShell command except the system-damaging ones.
+            let judge = !spec.work && spec.system.contains(crate::lead::LEAD_JUDGE_SYSTEM);
+            let judge_tools = format!("{CHAT_TOOLS},PowerShell");
+            // The lead summing up a side question answers from what the workers said: no tools at all.
+            let bare = !spec.work && spec.system.contains(crate::orchestrator::SIDE_LEAD_SYSTEM);
+            let tools: &str = if spec.work { WORK_TOOLS } else if judge { &judge_tools } else if bare { "" } else { CHAT_TOOLS };
+            let allow_base = tools.to_string();
+            let mcp = if bare { Default::default() } else { project_mcp(&spec.cwd) };
+            let mcp_file = if mcp.is_empty() { None } else { mcp_config_file(&mcp) };
+            // Non-interactive runs deny any tool not listed here, so each project MCP server is allowed by name.
+            let allowed = if mcp_file.is_some() { format!("{allow_base},{}", mcp.keys().map(|k| format!("mcp__{k}")).collect::<Vec<_>>().join(",")) } else { allow_base };
             // 사용자 전역 설정(훅·플러그인·MCP)은 불러오지 않는다: 매 요청 수만 토큰이 늘고(실측 약 5만 → 8천) 예기치 않은 명령이 돈다.
             let mut a = vec![
                 s("-p"),
@@ -469,22 +555,31 @@ pub fn args(spec: &RunSpec) -> Vec<String> {
                 s("--setting-sources"), s("project"),
                 s("--strict-mcp-config"),
                 s("--tools"), s(tools),
-                s("--allowedTools"), s(tools),
+                s("--allowedTools"), allowed,
                 s("--permission-mode"), s(if spec.work { "acceptEdits" } else { "default" }),
             ];
+            if let Some(f) = mcp_file {
+                a.push(s("--mcp-config"));
+                a.push(f);
+            }
             // --setting-sources project still reads ~/.claude as an ancestor project when the workspace is under the home folder.
             if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
                 a.push(s("--settings"));
                 a.push(claude_settings(&home));
             }
             // 창 테스트 대기열을 쓰는 실행(워커·통합)과 총괄의 직접 작업은 창을 직접 띄우지 못한다.
-            if spec.work && (spec.system.contains(crate::lead::QUEUE_SYSTEM) || spec.system.contains(crate::lead::LEAD_WINDOW_SYSTEM)) {
+            // Every run with PowerShell is kept away from commands that can damage the PC.
+            let windows = spec.work && (spec.system.contains(crate::lead::QUEUE_SYSTEM) || spec.system.contains(crate::lead::LEAD_WINDOW_SYSTEM));
+            if spec.work || judge {
+                // Shutdown/restart/log off are never run by agents: Elysium does it after the task (power.rs).
+                let deny = format!("{},{}", crate::lead::SYSTEM_DENY, crate::lead::POWER_DENY);
                 a.push(s("--disallowedTools"));
-                a.push(s(WINDOW_BLOCK));
+                a.push(if windows { format!("{WINDOW_BLOCK},{deny}") } else { deny });
             }
-            if !spec.system.is_empty() {
+            let system = if spec.work { format!("{}{}", spec.system, crate::lead::CLAUDE_DIR_NOTE) } else { spec.system.clone() };
+            if !system.is_empty() {
                 a.push(s("--append-system-prompt"));
-                a.push(spec.system.clone());
+                a.push(system);
             }
             if let Some(m) = &spec.model {
                 a.push(s("--model"));
@@ -567,6 +662,23 @@ pub fn args(spec: &RunSpec) -> Vec<String> {
     }
 }
 
+/// Side question to a running Claude Code worker, in place of `/btw` (which `-p` refuses: "unavailable_headless").
+/// The worker's session is forked, so the original session is never written to. Tools, system prompt, model and effort
+/// stay exactly as the worker's so the prompt cache of its whole context is reused; plan mode and a read-only allow
+/// list keep the fork from editing files or running commands.
+pub fn fork_args(spec: &RunSpec) -> Vec<String> {
+    let mut a = args(spec);
+    let mut set = |flag: &str, v: &str| {
+        if let Some(i) = a.iter().position(|x| x == flag) {
+            a[i + 1] = v.to_string();
+        }
+    };
+    set("--permission-mode", "plan");
+    set("--allowedTools", "Read,Grep,Glob");
+    a.push("--fork-session".into());
+    a
+}
+
 /// OpenCode `--file`로 넘기는 파일(글·이미지). 나머지 형식은 모델이 받지 못하면 실행 자체가 실패하므로 경로만 알려 준다.
 fn opencode_inlines(f: &AttachedFile) -> bool {
     f.kind == "text" || f.kind == "image"
@@ -600,6 +712,15 @@ fn short(v: &Value) -> String {
     let s = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
     let s = s.replace('\n', " ");
     if s.chars().count() > 80 { format!("{}…", s.chars().take(80).collect::<String>()) } else { s }
+}
+
+/// The full command line when a tool call runs a shell command (PowerShell, Bash, run_command …).
+fn command_of(name: &str, input: &Value) -> Option<Event> {
+    const SHELLS: [&str; 7] = ["powershell", "bash", "run_command", "shell", "exec", "execute_command", "run_shell_command"];
+    if !SHELLS.contains(&name.to_lowercase().as_str()) {
+        return None;
+    }
+    ["command", "CommandLine", "cmd"].iter().find_map(|k| input[*k].as_str()).map(|c| c.trim()).filter(|c| !c.is_empty()).map(|c| Event::Command(c.to_string()))
 }
 
 fn tool_activity(name: &str, input: &Value) -> String {
@@ -665,6 +786,7 @@ impl ClaudeParser {
                 for c in v["message"]["content"].as_array().into_iter().flatten() {
                     if c["type"] == "tool_use" {
                         out.push(Event::Activity(tool_activity(c["name"].as_str().unwrap_or("도구"), &c["input"])));
+                        out.extend(command_of(c["name"].as_str().unwrap_or(""), &c["input"]));
                         if c["input"]["run_in_background"].as_bool() == Some(true) {
                             if let (Some(id), Some(cmd)) = (c["id"].as_str(), c["input"]["command"].as_str()) {
                                 self.bg_tools.insert(id.to_string(), cmd.to_string());
@@ -733,7 +855,10 @@ impl GenericParser {
                     out.push(Event::Text(format!("{t}\n")));
                 }
             }
-            "item.started" if item["type"] == "command_execution" => out.push(Event::Activity(format!("명령 · {}", short(&item["command"])))),
+            "item.started" if item["type"] == "command_execution" => {
+                out.push(Event::Activity(format!("명령 · {}", short(&item["command"]))));
+                out.extend(item["command"].as_str().map(|c| Event::Command(c.to_string())));
+            }
             "item.started" | "item.completed" if item["type"] == "file_change" => out.push(Event::Activity("파일 수정".into())),
             "turn.completed" => {
                 self.usage.input_tokens = v["usage"]["input_tokens"].as_u64();
@@ -755,7 +880,10 @@ impl GenericParser {
                     out.push(Event::Text(t.into()));
                 }
             }
-            "tool_use" => out.push(Event::Activity(tool_activity(v["tool_name"].as_str().unwrap_or("도구"), &v["parameters"]))),
+            "tool_use" => {
+                out.push(Event::Activity(tool_activity(v["tool_name"].as_str().unwrap_or("도구"), &v["parameters"])));
+                out.extend(command_of(v["tool_name"].as_str().unwrap_or(""), &v["parameters"]));
+            }
             "result" => {
                 let ok = v["status"].as_str().is_none_or(|s| s == "success");
                 out.push(Event::Done(Finish {
@@ -775,7 +903,11 @@ impl GenericParser {
                             out.push(Event::Text(format!("{t}\n")));
                         }
                     }
-                    Some("exec_command_begin") => out.push(Event::Activity(format!("명령 · {}", short(&m["command"])))),
+                    Some("exec_command_begin") => {
+                        out.push(Event::Activity(format!("명령 · {}", short(&m["command"]))));
+                        let c = m["command"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" ")).or_else(|| m["command"].as_str().map(str::to_string));
+                        out.extend(c.filter(|c| !c.is_empty()).map(Event::Command));
+                    }
                     _ => {}
                 }
             }
@@ -832,6 +964,7 @@ impl AgyParser {
                     Some("tool") if s["state"] == "ACTIVE" => {
                         let name = s["tool_name"].as_str().unwrap_or("도구");
                         out.push(Event::Activity(tool_activity(name, &s["tool_info"]["parameters"])));
+                        out.extend(command_of(name, &s["tool_info"]["parameters"]));
                     }
                     _ => {}
                 }
@@ -888,7 +1021,10 @@ impl OpenCodeParser {
                     out.push(Event::Text(t.to_string()));
                 }
             }
-            Some("tool_use") => out.push(Event::Activity(tool_activity(part["tool"].as_str().unwrap_or("도구"), &part["state"]["input"]))),
+            Some("tool_use") => {
+                out.push(Event::Activity(tool_activity(part["tool"].as_str().unwrap_or("도구"), &part["state"]["input"])));
+                out.extend(command_of(part["tool"].as_str().unwrap_or(""), &part["state"]["input"]));
+            }
             Some("step_finish") => {
                 let t = &part["tokens"];
                 let input = t["input"].as_u64().unwrap_or(0) + t["cache"]["read"].as_u64().unwrap_or(0) + t["cache"]["write"].as_u64().unwrap_or(0);
@@ -951,6 +1087,15 @@ pub async fn run(http: &reqwest::Client, spec: &RunSpec, timeout: Duration, canc
         let model = spec.model.clone().or_else(|| crate::apis::api(spec.engine).map(|a| a.default_model.to_string())).unwrap_or_default();
         return crate::apis::run(http, spec, &model, timeout, cancel, &mut on_event).await;
     }
+    run_cli(spec, args(spec), timeout, cancel, on_event).await
+}
+
+/// Asks a running Claude Code worker through a fork of its session (see `fork_args`). The worker keeps working untouched.
+pub async fn run_fork(spec: &RunSpec, timeout: Duration, cancel: &CancellationToken, on_event: impl FnMut(&Event)) -> Outcome {
+    run_cli(spec, fork_args(spec), timeout, cancel, on_event).await
+}
+
+async fn run_cli(spec: &RunSpec, argv: Vec<String>, timeout: Duration, cancel: &CancellationToken, mut on_event: impl FnMut(&Event)) -> Outcome {
     let started = Instant::now();
     let mut out = Outcome::default();
     let fail = |mut o: Outcome, msg: String| {
@@ -966,10 +1111,15 @@ pub async fn run(http: &reqwest::Client, spec: &RunSpec, timeout: Duration, canc
         return fail(out, format!("작업 폴더를 만들 수 없습니다: {e}"));
     }
     let mut cmd = command(&program);
-    cmd.args(args(spec)).current_dir(&spec.cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    if spec.engine == EngineId::Claude && spec.work {
+    cmd.args(argv).current_dir(&spec.cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if spec.engine == EngineId::Claude && (spec.work || spec.system.contains(crate::lead::LEAD_JUDGE_SYSTEM)) {
         // Claude Code의 PowerShell 도구는 이 환경 변수로 켠다(Windows는 단계적 배포라 꺼져 있을 수 있음).
         cmd.env("CLAUDE_CODE_USE_POWERSHELL_TOOL", "1");
+    }
+    if spec.engine == EngineId::Claude {
+        for (k, v) in CLAUDE_TOKEN_ENV {
+            cmd.env(k, v);
+        }
     }
     if spec.engine == EngineId::OpenCode {
         cmd.env("OPENCODE_CONFIG_CONTENT", opencode_config(spec));
@@ -1023,7 +1173,7 @@ pub async fn run(http: &reqwest::Client, spec: &RunSpec, timeout: Duration, canc
                             Event::Text(t) => out.text.push_str(t),
                             Event::Activity(a) => out.activities.push(a.clone()),
                             Event::Session(s) => out.session_id = Some(s.clone()),
-                            Event::Usage { .. } | Event::Bg(_) => {}
+                            Event::Usage { .. } | Event::Bg(_) | Event::Command(_) => {}
                             Event::Done(f) => finish = Some(f.clone()),
                         }
                         on_event(&ev);
@@ -1096,6 +1246,20 @@ mod tests {
             steer: None,
             attachments: vec![],
         }
+    }
+
+    #[test]
+    fn side_question_fork_keeps_the_worker_prompt_but_cannot_edit() {
+        let worker = spec(EngineId::Claude, true);
+        let (a, f) = (args(&worker), fork_args(&worker));
+        let val = |v: &[String], k: &str| v.iter().position(|x| x == k).map(|i| v[i + 1].clone());
+        // Same tools and system prompt as the worker, so its cached context is reused.
+        assert_eq!(val(&a, "--tools"), val(&f, "--tools"));
+        assert_eq!(val(&a, "--append-system-prompt"), val(&f, "--append-system-prompt"));
+        assert_eq!(val(&f, "--resume").as_deref(), Some("abc"));
+        assert_eq!(val(&f, "--permission-mode").as_deref(), Some("plan"));
+        assert_eq!(val(&f, "--allowedTools").as_deref(), Some("Read,Grep,Glob"));
+        assert!(f.contains(&"--fork-session".to_string()) && !a.contains(&"--fork-session".to_string()));
     }
 
     #[tokio::test]
@@ -1368,10 +1532,51 @@ if \"%FAKE_MODE%\"==\"busy\" (for /L %%i in (1,1,5) do (echo {} & ping -n 2 127.
     }
 
     #[test]
+    fn shell_tool_calls_give_the_full_command() {
+        let long = format!("Get-ChildItem {}", "x".repeat(200));
+        assert_eq!(command_of("PowerShell", &serde_json::json!({ "command": long })), Some(Event::Command(long.clone())));
+        assert_eq!(command_of("run_command", &serde_json::json!({ "CommandLine": "npm test" })), Some(Event::Command("npm test".into())));
+        assert_eq!(command_of("Read", &serde_json::json!({ "file_path": "a" })), None);
+    }
+
+    #[test]
+    fn lead_judging_gets_powershell_without_system_damage() {
+        let judge = args(&RunSpec { system: crate::lead::LEAD_JUDGE_SYSTEM.into(), ..spec(EngineId::Claude, false) });
+        let i = judge.iter().position(|x| x == "--tools").unwrap();
+        assert!(judge[i + 1].ends_with(",PowerShell"));
+        let j = judge.iter().position(|x| x == "--allowedTools").unwrap();
+        assert!(judge[j + 1].split(',').any(|t| t == "PowerShell"), "every command is allowed");
+        let d = judge.iter().position(|x| x == "--disallowedTools").unwrap();
+        assert!(judge[d + 1].contains("PowerShell(*Format-Volume*)") && judge[d + 1].contains("PowerShell(*Stop-Process*elysium*)"), "except the ones that can damage the PC");
+        let asked = args(&RunSpec { system: format!("{}{}", crate::lead::LEAD_JUDGE_SYSTEM, crate::lead::LEAD_POWER_SYSTEM), ..spec(EngineId::Claude, false) });
+        let d = asked.iter().position(|x| x == "--disallowedTools").unwrap();
+        assert!(asked[d + 1].contains("PowerShell(*shutdown*)"), "agents never shut down the PC themselves, even when the user asked");
+        let chat = args(&spec(EngineId::Claude, false));
+        assert!(!chat.iter().any(|x| x.contains("PowerShell")), "ordinary chat stays without commands");
+        let work = args(&spec(EngineId::Claude, true));
+        assert!(work.iter().any(|x| x.contains(crate::lead::CLAUDE_DIR_NOTE.trim())), "work runs learn how to change .claude files");
+    }
+
+    #[test]
+    fn project_mcp_servers_are_passed_and_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".mcp.json"), r#"{"mcpServers":{"docs":{"command":"npx","args":["docs-mcp"]},"off":{"command":"x"}}}"#).unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        std::fs::write(dir.path().join(".claude/settings.local.json"), r#"{"disabledMcpjsonServers":["off"]}"#).unwrap();
+        let m = project_mcp(dir.path());
+        assert!(m.contains_key("docs") && !m.contains_key("off"));
+        let a = args(&RunSpec { cwd: dir.path().to_path_buf(), ..spec(EngineId::Claude, true) });
+        let f = a.windows(2).find(|w| w[0] == "--mcp-config").map(|w| w[1].clone()).expect("--mcp-config");
+        assert!(std::fs::read_to_string(f).unwrap().contains("docs-mcp"));
+        assert!(a.windows(2).any(|w| w[0] == "--allowedTools" && w[1].ends_with(",mcp__docs")));
+        assert!(a.iter().any(|x| x == "--strict-mcp-config"));
+    }
+
+    #[test]
     fn chat_mode_is_read_only_and_work_mode_allows_edits() {
         let chat = args(&spec(EngineId::Claude, false));
         let i = chat.iter().position(|x| x == "--tools").unwrap();
-        assert_eq!(chat[i + 1], "Read,Grep,Glob,WebFetch,WebSearch");
+        assert_eq!(chat[i + 1], "Read,Grep,Glob,WebFetch,WebSearch,Skill");
         assert!(!chat.iter().any(|x| x.contains("Edit") || x.contains("Bash")));
         assert!(chat.windows(2).any(|w| w[0] == "--permission-mode" && w[1] == "default"));
         let work = args(&spec(EngineId::Claude, true));
@@ -1451,8 +1656,9 @@ if \"%FAKE_MODE%\"==\"busy\" (for /L %%i in (1,1,5) do (echo {} & ping -n 2 127.
         .collect();
         assert_eq!(evs[0], Event::Session("t-9".into()));
         assert_eq!(evs[1], Event::Activity("명령 · ls".into()));
-        assert_eq!(evs[2], Event::Text("완료\n".into()));
-        assert_eq!(evs[3], Event::Text("평문 줄\n".into()));
+        assert_eq!(evs[2], Event::Command("ls".into()), "the full command goes to the lead's command log");
+        assert_eq!(evs[3], Event::Text("완료\n".into()));
+        assert_eq!(evs[4], Event::Text("평문 줄\n".into()));
         assert_eq!(p.finish().output_tokens, Some(4));
         let mut g = GenericParser::default();
         let evs: Vec<Event> = [
@@ -1487,7 +1693,9 @@ if \"%FAKE_MODE%\"==\"busy\" (for /L %%i in (1,1,5) do (echo {} & ping -n 2 127.
         let queued = args(&spec(crate::lead::QUEUE_SYSTEM));
         let at = queued.iter().position(|a| a == "--disallowedTools").expect("차단 규칙");
         assert!(queued[at + 1].contains("PowerShell(*runClient*)"), "{}", queued[at + 1]);
-        assert!(!args(&spec("다른 지시")).iter().any(|a| a == "--disallowedTools"), "대기열을 안 쓰는 실행은 그대로");
+        let plain = args(&spec("다른 지시"));
+        let at = plain.iter().position(|a| a == "--disallowedTools").expect("system-damage block applies to every work run");
+        assert!(!plain[at + 1].contains("runClient") && plain[at + 1].contains("PowerShell(*diskpart*)"), "대기열을 안 쓰는 실행은 창 차단 없이 시스템 보호만");
     }
 
     #[test]

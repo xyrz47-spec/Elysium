@@ -6,6 +6,13 @@ import { useApp } from "../store";
 import { CloseIcon, FolderIcon, RefreshIcon } from "./Icons";
 import Segmented from "./Segmented";
 import { loadAutoSleep, loadMonitorOff, saveAutoSleep, saveMonitorOff, setSleep } from "../lib/sleep";
+import { applyLowSpec, loadLowSpec } from "../lib/perf";
+import { POWER_TEXT } from "./PowerBanner";
+
+const PERF_TEXT = {
+  title: "저사양 모드",
+  help: "배경 애니메이션과 블러 등 그래픽 효과를 최소화하여 화면 끊김을 줄입니다. 이 설정은 현재 PC에만 저장됩니다.",
+};
 
 const SLEEP = {
   title: "취침 모드",
@@ -56,7 +63,6 @@ function SleepSettings() {
   );
 }
 import RemoteSection from "./RemoteSection";
-import { A as AGENT_TEXT, agentChoice } from "./Tools";
 
 const REVIEW: { id: ReviewMode; label: string; help: string }[] = [
   { id: "auto", label: "자동", help: "어려운 요청은 다른 AI가 검토하고, 정확도가 중요한 요청은 두 AI가 토론한 뒤 판정 AI가 정리합니다(JEV를 켜면 JEV가 판단)" },
@@ -94,7 +100,6 @@ const KEYS: [string, string][] = [
   ["Ctrl + N", "새 세션"],
   ["Ctrl + B", "세션 목록 펼치기·접기"],
   ["Ctrl + J", "도구 패널 열기·닫기"],
-  ["Ctrl + F", "세션에서 찾기"],
   ["Ctrl + /", "단축키 보기"],
   ["Ctrl + ,", "설정"],
   ["Enter", "보내기(대화 모드: 질문 · 작업 모드: 허락 후 파일 수정)"],
@@ -223,6 +228,7 @@ function PromptSettings({ settings, save }: { settings: Settings; save: (s: Sett
 function ViewSettings({ settings, save }: { settings: Settings; save: (s: Settings) => void }) {
   const [scale, setScale] = useState<UiScale>(loadScale);
   const [width, setWidth] = useState<ChatWidth>(loadWidth);
+  const [low, setLow] = useState(loadLowSpec);
   return (
     <>
       <div className="set-row">
@@ -248,6 +254,7 @@ function ViewSettings({ settings, save }: { settings: Settings; save: (s: Settin
           options={[
             { value: "normal", label: "보통" },
             { value: "wide", label: "넓게" },
+            { value: "full", label: "꽉 차게" },
           ]}
           onChange={(v) => {
             setWidth(v);
@@ -256,6 +263,22 @@ function ViewSettings({ settings, save }: { settings: Settings; save: (s: Settin
         />
       </div>
       <p className="help">크기와 폭은 이 PC에만 기억합니다. 넓게는 표와 코드가 많은 답을 볼 때 좋습니다.</p>
+      <label className="toggle-row">
+        <span>
+          {PERF_TEXT.title}
+          <small>{PERF_TEXT.help}</small>
+        </span>
+        <input
+          type="checkbox"
+          className="switch"
+          role="switch"
+          checked={low}
+          onChange={(e) => {
+            setLow(e.target.checked);
+            applyLowSpec(e.target.checked);
+          }}
+        />
+      </label>
       <label className="toggle-row">
         <span>
           작업이 끝나면 알리기
@@ -267,21 +290,13 @@ function ViewSettings({ settings, save }: { settings: Settings; save: (s: Settin
   );
 }
 
-/** 설정 맨 위의 바로 가기 */
-const NAV: [string, string][] = [
-  ["answer", "답변 방식"],
-  ["prompts", "프롬프트"],
-  ["view", "화면·알림"],
-  ["cli", "CLI"],
-  ["api", "API 키"],
-  ["jev", "JEV"],
-  ["review", "검토"],
-  ["agents", "에이전트"],
-  ["folder", "작업 폴더"],
-  ["remote", "폰 연결"],
-  ["sleep", "취침"],
-  ["keys", "단축키"],
-  ["data", "데이터"],
+/** 설정 묶음: 한 번에 한 묶음만 보여 준다 */
+type GroupId = "general" | "ai" | "work" | "etc";
+const GROUPS: { id: GroupId; label: string; sections: string[] }[] = [
+  { id: "general", label: "일반", sections: ["answer", "prompts", "view", "folder"] },
+  { id: "ai", label: "AI 연결", sections: ["cli", "api", "jev"] },
+  { id: "work", label: "작업 방식", sections: ["review", "queue"] },
+  { id: "etc", label: "기타", sections: ["remote", "sleep", "keys", "data"] },
 ];
 
 /** API 키 한 줄: 키 저장·지우기·확인, 모델 이름 */
@@ -368,8 +383,13 @@ export default function SettingsDialog({ focusKeys = false }: { focusKeys?: bool
   const [tsKey, setTsKey] = useState("");
   const [jev, setJev] = useState<{ ok: boolean; text: string } | null>(null);
   const keysRef = useRef<HTMLElement>(null);
+  const [group, setGroup] = useState<GroupId>(focusKeys ? "etc" : "general");
+  const shown = GROUPS.find((g) => g.id === group)!.sections;
   useEffect(() => {
-    if (focusKeys) keysRef.current?.scrollIntoView({ block: "start" });
+    if (focusKeys) {
+      setGroup("etc");
+      requestAnimationFrame(() => keysRef.current?.scrollIntoView({ block: "start" }));
+    }
   }, [focusKeys]);
 
   const loadSecrets = () => api.secretsStatus().then(setSecrets).catch(() => {});
@@ -428,7 +448,6 @@ export default function SettingsDialog({ focusKeys = false }: { focusKeys?: bool
   return (
     <div className="modal-back" onMouseDown={(e) => e.target === e.currentTarget && setDialog(null)}>
       <div className="modal wide settings-modal" role="dialog" aria-label="설정">
-        <div className="modal-scroll">
         <div className="set-top">
         <div className="modal-head">
           <h2>설정</h2>
@@ -441,27 +460,45 @@ export default function SettingsDialog({ focusKeys = false }: { focusKeys?: bool
             </button>
           </div>
         </div>
-        <nav className="set-nav" aria-label="설정 항목">
-          {NAV.map(([id, label]) => (
-            <button key={id} type="button" onClick={() => document.getElementById(`set-${id}`)?.scrollIntoView({ behavior: "smooth", block: "start" })}>
-              {label}
+        <nav className="set-groups" role="tablist" aria-label="설정 묶음">
+          {GROUPS.map((g) => (
+            <button
+              key={g.id}
+              type="button"
+              role="tab"
+              aria-selected={group === g.id}
+              className={group === g.id ? "on" : ""}
+              onClick={() => {
+                setGroup(g.id);
+                document.querySelector(".settings-modal .modal-scroll")?.scrollTo({ top: 0 });
+              }}
+            >
+              {g.label}
             </button>
           ))}
         </nav>
         </div>
+        <div className="modal-scroll">
 
+        {shown.includes("answer") && (
         <Section id="answer" title="답변 방식" i={0}>
           <AnswerSettings settings={settings} save={saveSettings} />
         </Section>
+        )}
 
+        {shown.includes("prompts") && (
         <Section id="prompts" title="자주 쓰는 프롬프트" i={1}>
           <PromptSettings settings={settings} save={saveSettings} />
         </Section>
+        )}
 
+        {shown.includes("view") && (
         <Section id="view" title="화면 · 알림" i={2}>
           <ViewSettings settings={settings} save={saveSettings} />
         </Section>
+        )}
 
+        {shown.includes("cli") && (
         <Section
           id="cli"
           title="CLI"
@@ -517,7 +554,9 @@ export default function SettingsDialog({ focusKeys = false }: { focusKeys?: bool
           )}
           <p className="help">CLI는 파일을 읽고(만들기에서는 만들고 고치고) 세션을 이어 씁니다. 로그인은 각 CLI에서 합니다.</p>
         </Section>
+        )}
 
+        {shown.includes("api") && (
         <Section id="api" title="API 키 & 모델 단가" i={4}>
           <div className="api-grid">
             {apis.map((e) => (
@@ -526,7 +565,9 @@ export default function SettingsDialog({ focusKeys = false }: { focusKeys?: bool
           </div>
           <p className="help">키는 Windows 자격 증명 관리자에만 안전하게 저장됩니다. 공식 API 단가에 따라 토큰 비용이 투명하게 계산됩니다.</p>
         </Section>
+        )}
 
+        {shown.includes("jev") && (
         <Section id="jev" title="JEV" i={5}>
           <label className="toggle-row">
             <span>
@@ -554,6 +595,7 @@ export default function SettingsDialog({ focusKeys = false }: { focusKeys?: bool
           </div>
           {jev && <div className={`check ${jev.ok ? "ok" : "err"}`}>{jev.text}</div>}
         </Section>
+        )}
 
 
 
@@ -561,20 +603,13 @@ export default function SettingsDialog({ focusKeys = false }: { focusKeys?: bool
 
 
 
+        {shown.includes("review") && (
         <Section id="review" title="검토" i={6}>
           <Segmented label="검토" className="wide" value={settings.review} options={REVIEW.map((r) => ({ value: r.id, label: r.label }))} onChange={(v) => saveSettings({ ...settings, review: v })} />
           <p className="help">{REVIEW.find((r) => r.id === settings.review)?.help}</p>
         </Section>
-        <Section id="agents" title={AGENT_TEXT.preset} i={7}>
-          <Segmented
-            label={AGENT_TEXT.preset}
-            className="wide dense"
-            value={agentChoice.value(settings)}
-            options={agentChoice.options}
-            onChange={(v) => saveSettings(agentChoice.apply(settings, v))}
-          />
-          <p className="help">{agentChoice.help(settings)}</p>
-        </Section>
+        )}
+        {shown.includes("queue") && (
         <Section id="queue" title={LT.queue} i={8}>
           <SlotsPicker />
           <p className="help">{LT.slotsHelp}</p>
@@ -585,7 +620,16 @@ export default function SettingsDialog({ focusKeys = false }: { focusKeys?: bool
             </span>
             <input type="checkbox" className="switch" role="switch" checked={settings.leadCommit ?? true} onChange={(e) => saveSettings({ ...settings, leadCommit: e.target.checked })} />
           </label>
+          <label className="toggle-row">
+            <span>
+              {POWER_TEXT.toggle}
+              <small>{POWER_TEXT.help}</small>
+            </span>
+            <input type="checkbox" className="switch" role="switch" checked={settings.powerOnDone ?? false} onChange={(e) => saveSettings({ ...settings, powerOnDone: e.target.checked })} />
+          </label>
         </Section>
+        )}
+        {shown.includes("folder") && (
         <Section id="folder" title="기본 작업 폴더" i={9}>
           <div className="row">
             <div className="path">{info?.workspace}</div>
@@ -598,12 +642,18 @@ export default function SettingsDialog({ focusKeys = false }: { focusKeys?: bool
           </div>
           <p className="help">새 세션은 이 폴더에서 시작합니다. 세션마다 다른 폴더는 입력창의 폴더 칩이나 세션 머리에서 고르세요.</p>
         </Section>
+        )}
+        {shown.includes("remote") && (
         <Section id="remote" title="폰 연결" i={10}>
           <RemoteSection />
         </Section>
+        )}
+        {shown.includes("sleep") && (
         <Section id="sleep" title={SLEEP.title} i={11}>
           <SleepSettings />
         </Section>
+        )}
+        {shown.includes("keys") && (
         <Section id="keys" title="단축키" i={12} sectionRef={keysRef}>
           <dl className="tool-keys">
             {KEYS.map(([k, v]) => (
@@ -621,7 +671,9 @@ export default function SettingsDialog({ focusKeys = false }: { focusKeys?: bool
             ))}
           </dl>
         </Section>
+        )}
 
+        {shown.includes("data") && (
         <Section id="data" title="데이터" i={13}>
           <div className="row">
             <input type="text" value={confirmText} onChange={(e) => setConfirmText(e.target.value)} placeholder="DELETE 입력" style={{ maxWidth: 160 }} />
@@ -630,6 +682,7 @@ export default function SettingsDialog({ focusKeys = false }: { focusKeys?: bool
             </button>
           </div>
         </Section>
+        )}
 
         <div className="modal-foot">
           <span>Elysium v{info?.version}</span>

@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { isLight } from "../lib/theme";
+import { isLowSpec, PERF_EVENT } from "../lib/perf";
 
 export type OrbMode = "off" | "idle" | "thinking" | "approval" | "error";
 
@@ -25,11 +26,14 @@ const LOOK: Record<OrbMode, Look> = {
 };
 
 // 구(0) + 둘레 먼지(1) + 창 전체로 퍼지는 성운(2). 성운이 바탕과 구를 하나로 잇는다.
-const SPHERE = 5200;
-const HALO = 2600;
-const FIELD = 4200;
+// Perf: about 40% of the earlier counts (5200/2600/4200); the look holds because points are additive and soft.
+const SPHERE = 2400;
+const HALO = 1100;
+const FIELD = 1800;
 // 떠오르는 빛 입자: 작고 또렷한 것 + 크고 흐린 것(초점이 나간 빛). 구와 상관없이 늘 보인다.
-const MOTES = 90;
+const MOTES = 60;
+/** The small status orb in the session header draws only every n-th sphere point and no halo or nebula. */
+const MINI_STRIDE = 4;
 
 const VS = `#version 300 es
 in vec3 aPos;
@@ -127,7 +131,7 @@ function compile(gl: WebGL2RenderingContext, type: number, src: string) {
 
 /** 입자 수. lite(폰)는 GPU가 약하고 화면이 작아 적게 그린다. */
 function counts(lite: boolean) {
-  return lite ? { SPHERE: 2200, HALO: 800, FIELD: 1000, MOTES: 36 } : { SPHERE, HALO, FIELD, MOTES };
+  return lite ? { SPHERE: 1600, HALO: 600, FIELD: 800, MOTES: 30 } : { SPHERE, HALO, FIELD, MOTES };
 }
 
 function buildGeometry(lite: boolean) {
@@ -137,14 +141,18 @@ function buildGeometry(lite: boolean) {
   const seed = new Float32Array(n);
   const kind = new Float32Array(n);
   const golden = Math.PI * (3 - Math.sqrt(5));
-  for (let i = 0; i < SPHERE; i++) {
+  // Stored in stride order (0, n, 2n, … then 1, n+1, …): the first SPHERE/MINI_STRIDE points alone still cover the whole sphere.
+  const order: number[] = [];
+  for (let r = 0; r < MINI_STRIDE; r++) for (let k = r; k < SPHERE; k += MINI_STRIDE) order.push(k);
+  for (let slot = 0; slot < SPHERE; slot++) {
+    const i = order[slot];
     // 피보나치 구면 배치 + 약간의 흔들림
     const y = 1 - (i / (SPHERE - 1)) * 2;
     const r = Math.sqrt(1 - y * y);
     const th = golden * i;
     const j = 1 + (Math.random() - 0.5) * 0.04;
-    pos.set([Math.cos(th) * r * j, y * j, Math.sin(th) * r * j], i * 3);
-    seed[i] = Math.random();
+    pos.set([Math.cos(th) * r * j, y * j, Math.sin(th) * r * j], slot * 3);
+    seed[slot] = Math.random();
   }
   const shell = (i: number, rr: number, k: number) => {
     const u = Math.random() * 2 - 1;
@@ -165,7 +173,7 @@ function buildGeometry(lite: boolean) {
     seed[i] = Math.random();
     kind[i] = 3;
   }
-  return { pos, seed, kind, n };
+  return { pos, seed, kind, n, sphere: SPHERE, motes: MOTES };
 }
 
 /** 구가 자리 잡을 곳: 첫 화면의 큰 자리(data-orb-anchor)가 먼저, 대화 중에는 머리의 작은 상태 구 자리(data-orb-anchor="mini").
@@ -196,6 +204,11 @@ export default function ParticleOrb({ mode, lite = false }: { mode: OrbMode; lit
   modeRef.current = mode;
 
   useEffect(() => {
+    // Shader compile and particle setup wait two frames, so the window paints its content first at startup.
+    let alive = true;
+    let wait = 0;
+    let cleanup: (() => void) | undefined;
+    const start = (): (() => void) | undefined => {
     const canvas = ref.current;
     const gl = canvas?.getContext("webgl2", { premultipliedAlpha: true, antialias: false, alpha: true });
     if (!canvas || !gl) return;
@@ -213,7 +226,7 @@ export default function ParticleOrb({ mode, lite = false }: { mode: OrbMode; lit
     gl.useProgram(prog);
     const geo = buildGeometry(lite);
     // 폰은 화면 배율이 3배까지 올라가 픽셀 수가 9배가 된다. 입자 배경은 1.25배면 충분하다.
-    const maxDpr = lite ? 1.25 : 2;
+    const maxDpr = lite ? 1.25 : 1.5;
     const vao = gl.createVertexArray();
     gl.bindVertexArray(vao);
     const attr = (name: string, data: Float32Array, size: number) => {
@@ -267,9 +280,10 @@ export default function ParticleOrb({ mode, lite = false }: { mode: OrbMode; lit
       raf = requestAnimationFrame(draw);
       // 고주사율 화면에서도 60fps, 대화 화면(구가 옅을 때)에서는 30fps면 충분하다. 뒤가 덜 바뀌면 유리 판의 backdrop-filter도 덜 다시 계산된다.
       // 작은 상태 구(대화 중)나 옅은 구는 30fps면 충분하다.
-      const calm = (at.dim < 0.5 || at.radius / dpr < 40) && modeRef.current !== "thinking";
+      // Perf: the canvas covers the whole window, so every frame forces all glass panels to re-filter their backdrop.
+      const calm = at.dim < 0.5 || at.radius / dpr < 40;
       // 폰: 처리 중 30fps, 그 밖에는 20fps(배터리·발열)
-      const budget = lite ? (calm ? 1000 / 20 : 1000 / 30) : calm ? 1000 / 30 : 1000 / 60;
+      const budget = lite ? (calm ? 1000 / 20 : 1000 / 30) : calm ? 1000 / 24 : 1000 / 60;
       acc += now - tick;
       tick = now;
       if (acc < budget - 1) return;
@@ -345,14 +359,19 @@ export default function ParticleOrb({ mode, lite = false }: { mode: OrbMode; lit
       // 화이트 모드에서는 밝은 입자가 바탕에 묻히므로 진한 회색 쪽으로 내린다.
       gl.uniform3fv(u.a, cur.a.map((v) => v * (light ? 0.26 : 1)));
       gl.uniform3fv(u.b, cur.b.map((v) => v * (light ? 0.5 : 1)));
-      gl.drawArrays(gl.POINTS, 0, geo.n);
+      if (at.radius / dpr < 40) {
+        // Small status orb: a sparse sphere plus the floating motes; the halo and nebula would be invisible anyway.
+        gl.drawArrays(gl.POINTS, 0, Math.ceil(geo.sphere / MINI_STRIDE));
+        gl.drawArrays(gl.POINTS, geo.n - geo.motes, geo.motes);
+      } else gl.drawArrays(gl.POINTS, 0, geo.n);
     };
-    raf = requestAnimationFrame(draw);
+    if (!isLowSpec()) raf = requestAnimationFrame(draw);
     // 창을 내리거나 가리면 멈춘다.
     const onVis = () => {
       cancelAnimationFrame(raf);
       raf = 0;
-      if (!document.hidden && !document.documentElement.hasAttribute("data-sleep")) {
+      if (isLowSpec()) gl.clear(gl.COLOR_BUFFER_BIT);
+      if (!document.hidden && !document.documentElement.hasAttribute("data-sleep") && !isLowSpec()) {
         last = tick = performance.now();
         acc = 0;
         raf = requestAnimationFrame(draw);
@@ -360,12 +379,25 @@ export default function ParticleOrb({ mode, lite = false }: { mode: OrbMode; lit
     };
     document.addEventListener("visibilitychange", onVis);
     window.addEventListener("elysium:sleep", onVis);
+    window.addEventListener(PERF_EVENT, onVis);
     return () => {
+      window.removeEventListener(PERF_EVENT, onVis);
       cancelAnimationFrame(raf);
       document.removeEventListener("visibilitychange", onVis);
       window.removeEventListener("elysium:sleep", onVis);
       // 개발 모드(StrictMode)는 같은 캔버스로 다시 마운트하므로 컨텍스트를 버리지 않는다.
       ro.disconnect();
+    };
+    };
+    wait = requestAnimationFrame(() => {
+      wait = requestAnimationFrame(() => {
+        if (alive) cleanup = start();
+      });
+    });
+    return () => {
+      alive = false;
+      cancelAnimationFrame(wait);
+      cleanup?.();
     };
     // lite는 처음 한 번 정해지고 바뀌지 않는다.
     // eslint-disable-next-line react-hooks/exhaustive-deps

@@ -28,6 +28,14 @@ export const GearIcon = () => (
     <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z" />
   </Svg>
 );
+export const SlidersIcon = () => (
+  <Svg size={16}>
+    <path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1" />
+    <circle cx="15" cy="6" r="2" />
+    <circle cx="9" cy="12" r="2" />
+    <circle cx="17" cy="18" r="2" />
+  </Svg>
+);
 export const SparkIcon = ({ size = 18 }: { size?: number }) => (
   <Svg size={size}>
     <path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z" />
@@ -73,6 +81,12 @@ export const CloseIcon = () => (
 export const ChatIcon = () => (
   <Svg size={15}>
     <path d="M4 5h16v11H8l-4 4z" />
+  </Svg>
+);
+export const TerminalIcon = () => (
+  <Svg size={15}>
+    <rect x="3" y="4.5" width="18" height="15" rx="3" />
+    <path d="M7.5 10l3 2.5-3 2.5M12.5 15.5h4" />
   </Svg>
 );
 export const WrenchIcon = () => (
@@ -210,5 +224,15 @@ export const BookIcon = () => (
   <Svg size={16}>
     <path d="M12 6.5C10.5 5.2 8.3 4.5 4 4.5v13c4.3 0 6.5.7 8 2 1.5-1.3 3.7-2 8-2v-13c-4.3 0-6.5.7-8 2z" />
     <path d="M12 6.5v13" />
+  </Svg>
+);
+export const GripIcon = () => (
+  <Svg size={14}>
+    <circle cx="9" cy="6" r="1.2" fill="currentColor" />
+    <circle cx="15" cy="6" r="1.2" fill="currentColor" />
+    <circle cx="9" cy="12" r="1.2" fill="currentColor" />
+    <circle cx="15" cy="12" r="1.2" fill="currentColor" />
+    <circle cx="9" cy="18" r="1.2" fill="currentColor" />
+    <circle cx="15" cy="18" r="1.2" fill="currentColor" />
   </Svg>
 );

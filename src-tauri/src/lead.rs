@@ -8,14 +8,70 @@ const COMMIT_FENCE: &str = "elysium-commit";
 const CHAIN: &[&str] = &[";", "|", "&", ">", "`", "$(", "\n", "\r"];
 const INTERPRETERS: &[&str] = &["powershell", "pwsh", "cmd", "bash", "sh", "python", "node", "iex", "invoke-expression", "start-process"];
 
+/// Shut down, restart and log off: blocked unless the user asked for it in this task (see `asks_power`).
+pub const POWER_DENY: &str = r"PowerShell(*Stop-Computer*),PowerShell(*Restart-Computer*),PowerShell(*shutdown*),PowerShell(*logoff*),PowerShell(*Logoff-*),PowerShell(*rundll32*user32*LockWorkStation*),PowerShell(*tsdiscon*)";
+/// Added to the lead's instructions when the user asked to shut down/restart/log off and the switch is on.
+pub const LEAD_POWER_SYSTEM: &str = "
+[전원] 사용자가 요청한 PC 종료, 재부팅 또는 로그오프는 모든 작업 완료 및 답변 저장 후 엘리시움이 취소 가능한 60초 카운트다운을 거쳐 자동 실행하므로 관련 명령어를 직접 실행하지 마세요. 전원 제어 명령어는 시스템상 차단되어 있으니 평소처럼 작업을 완수하고 정상적으로 최종 보고를 진행하세요.
+";
+/// Same, when the switch is off: the request will not be carried out.
+pub const LEAD_POWER_OFF_SYSTEM: &str = "
+[전원] 사용자가 PC 종료, 재부팅 또는 로그오프를 요청했으나 관련 명령어는 시스템상 차단되어 있으니 직접 실행하지 마세요. 현재 작업 완료 시 종료 허용 스위치가 꺼져 있으므로, PC를 자동으로 제어하려면 설정이나 에이전트 보드 상단에서 해당 스위치를 켜야 한다고 이번 답변에서 한 번 안내하세요.
+";
+
+/// Does the user ask to shut down, restart or log off the PC? This is a coding app, so words that are also
+/// features ("로그아웃 기능", "graceful shutdown", "윈도우 종료 버튼") need a PC word ("컴퓨터", "PC") next to them.
+pub fn asks_power(text: &str) -> bool {
+    let t = text.to_lowercase().replace(char::is_whitespace, "");
+    const ALONE: [&str; 4] = ["재부팅", "리부팅", "로그오프", "reboot"];
+    const PC: [&str; 5] = ["컴퓨터", "pc", "피씨", "본체", "computer"];
+    const ACT: [&str; 12] = ["꺼", "끄", "종료", "재시작", "다시시작", "shutdown", "restart", "turnoff", "poweroff", "logoff", "logout", "로그아웃"];
+    ALONE.iter().any(|w| t.contains(w)) || (PC.iter().any(|w| t.contains(w)) && ACT.iter().any(|w| t.contains(w)))
+}
+
+/// Lead judging/chat calls: every PowerShell command except the ones in SYSTEM_DENY (see engines::args).
+pub const LEAD_JUDGE_SYSTEM: &str = "
+[명령 실행] PowerShell 도구를 통해 시스템 손상 우려가 없는 상태 확인, 빌드, 테스트, 스크립트 실행, 파일 변경 등의 명령을 실행하세요. 본 호출이 진행되는 동안에는 워커의 명령 검토가 대기되므로, 1분 이상 소요되는 빌드나 테스트는 JSON 응답의 work 필드에 전달하여 메인 폴더에서 수행하세요.
+";
+/// Commands that can damage the PC (disks, boot, system folders, machine registry, security, users, services) or this app.
+/// Denied for every Claude run that has PowerShell; Claude Code matches these case-insensitively (checked 2026-11-06).
+pub const SYSTEM_DENY: &str = r"PowerShell(*Format-Volume*),PowerShell(*format c:*),PowerShell(*format d:*),PowerShell(*format e:*),PowerShell(*diskpart*),PowerShell(*Clear-Disk*),PowerShell(*Initialize-Disk*),PowerShell(*Remove-Partition*),PowerShell(*Set-Partition*),PowerShell(*Resize-Partition*),PowerShell(*bcdedit*),PowerShell(*bootrec*),PowerShell(*mountvol*),PowerShell(*Remove-Item*C:\Windows*),PowerShell(*Remove-Item*$env:windir*),PowerShell(*Remove-Item*$env:SystemRoot*),PowerShell(*Remove-Item*System32*),PowerShell(*Remove-Item*Program Files*),PowerShell(*del *C:\Windows*),PowerShell(*rd *C:\Windows*),PowerShell(*rmdir *C:\Windows*),PowerShell(*Remove-Item*HKLM*),PowerShell(*Remove-ItemProperty*HKLM*),PowerShell(*Set-ItemProperty*HKLM*),PowerShell(*New-ItemProperty*HKLM*),PowerShell(*reg delete*),PowerShell(*reg add*HKLM*),PowerShell(*reg import*),PowerShell(*Set-ExecutionPolicy*),PowerShell(*Set-MpPreference*),PowerShell(*Add-MpPreference*),PowerShell(*netsh advfirewall*),PowerShell(*Set-NetFirewallProfile*),PowerShell(*takeown*),PowerShell(*icacls*),PowerShell(*cipher /w*),PowerShell(*sdelete*),PowerShell(*vssadmin*),PowerShell(*wbadmin*),PowerShell(*Disable-ComputerRestore*),PowerShell(*net user*),PowerShell(*net localgroup*),PowerShell(*Remove-LocalUser*),PowerShell(*Add-LocalGroupMember*),PowerShell(*sc delete*),PowerShell(*sc.exe delete*),PowerShell(*Remove-Service*),PowerShell(*Set-Service*),PowerShell(*Stop-Service*),PowerShell(*Unregister-ScheduledTask*),PowerShell(*schtasks*/delete*),PowerShell(*Remove-AppxPackage*),PowerShell(*Disable-WindowsOptionalFeature*),PowerShell(*Clear-EventLog*),PowerShell(*wevtutil cl*),PowerShell(*Clear-RecycleBin*),PowerShell(*Stop-Process*elysium*),PowerShell(*taskkill*elysium*),PowerShell(*Invoke-Expression*),PowerShell(*| iex*),PowerShell(*|iex*)";
+/// Claude Code blocks Edit/Write under `.claude/` even with acceptEdits; PowerShell writes are allowed (checked 2026-11-06, Claude Code 2.1.319).
+pub const CLAUDE_DIR_NOTE: &str = "
+[.claude 폴더] 프로젝트의 .claude 폴더 하위 파일(skills, settings)은 접근이 거부되어 Edit이나 Write 도구로 수정할 수 없으므로, 파일 변경 시 PowerShell 도구(예: (Get-Content -Raw path) -replace 'old','new' | Set-Content path -NoNewline)를 사용하세요. 권한 문제로 보고하거나 작업을 중단하지 마시고 반드시 해당 방식으로 직접 수정을 완료하세요.
+";
+
 /// 워커에게 알리는 명령 요청 방법(명령이 막힌 워커)
 pub const REQUEST_SYSTEM: &str = "\n[명령 요청] 당신은 명령을 직접 실행할 수 없습니다. 빌드·테스트 등 명령이 필요하면 답의 맨 끝에 아래 형식의 블록을 쓰고 차례를 끝내세요. Elysium이 총괄의 검토를 거쳐 백그라운드에서 실행하고, 끝나면 결과를 다음 차례로 돌려줍니다. 결과를 기다리지 말고 남은 다른 작업을 계속하세요(요청한 뒤 차례를 끝내지 않아도 됩니다).\n```elysium-request\n{\"requests\":[{\"command\":\"실행할 PowerShell 명령\",\"why\":\"왜 필요한지\",\"kind\":\"command\",\"timeout_sec\":600}]}\n```\n- 창이 뜨는 실행(게임·앱·브라우저 등)은 kind를 \"window\"로 쓰세요. 대기열에 등록되며, 자리가 없으면 몇 번째인지 알려 줍니다. 남은 다른 작업이 있으면 그 일을 하고, 없으면 차례를 끝내세요. 결과는 나중에 돌려줍니다.\n- 사람이 직접 창을 닫아야 끝나는 수동 확인 작업(예: runClient)은 요청하지 마세요. 스스로 끝나는 작업만 요청하세요.\n- 명령을 이어 붙이지 말고 한 줄에 하나만 쓰세요. 요청이 없으면 블록을 쓰지 마세요.\n";
 /// 명령 도구가 이미 있는 AI에게 알리는 대기열 사용법
 pub const QUEUE_SYSTEM: &str = "\n[창 테스트 대기열] 창이 뜨는 실행(게임·앱·브라우저 등)은 직접 실행하지 마세요. 답의 맨 끝에 아래 블록을 쓰고 차례를 끝내면 Elysium이 대기열에서 실행하고 결과를 돌려줍니다. 사람이 창을 닫아야 끝나는 수동 확인 작업(예: runClient)은 요청하지 마세요.\n```elysium-request\n{\"requests\":[{\"command\":\"실행할 PowerShell 명령\",\"why\":\"왜 필요한지\",\"kind\":\"window\",\"timeout_sec\":1800}]}\n```\n";
-/// 세션을 이어 쓸 수 없는 AI에게 알리는 말: 대기열 왕복이 안 되므로 창 테스트는 하지 않는다.
-pub const NO_WINDOW_SYSTEM: &str = "\n[창 테스트] 창이 뜨는 실행(게임·앱·브라우저 등)은 실행하지 마세요. 필요하면 답에 어떤 테스트가 필요한지 적으세요. 총괄이 대기열로 돌립니다.\n";
-/// 총괄이 메인 폴더에서 직접 일할 때: 요청 왕복이 없으므로 창이 뜨는 실행은 하지 않고 워커에게 맡긴다.
-pub const LEAD_WINDOW_SYSTEM: &str = "\n[창 테스트] 창이 뜨는 실행(게임·앱·브라우저·데스크톱 앱 개발 서버 등)은 직접 하지 마세요. 모든 창 띄우기는 창 테스트 대기열을 거쳐야 합니다. 필요하면 요약에 어떤 실행이 필요한지 적으세요.\n";
+/// Window tests asked by a run that cannot get results back: same block as REQUEST_SYSTEM, run after the run ends.
+const WINDOW_REQUEST_FORMAT: &str = "```elysium-request\n{\"requests\":[{\"command\":\"<PowerShell command>\",\"why\":\"<reason>\",\"kind\":\"window\",\"timeout_sec\":1800}]}\n```\n";
+/// 세션을 이어 쓸 수 없는 AI: 결과를 다음 차례로 받을 수 없으므로, 답이 끝난 뒤 Elysium이 돌리고 결과는 총괄에게 간다(leadrun::run_part_worker).
+const NO_WINDOW_SYSTEM: &str = "[창 테스트]
+게임, 앱, 브라우저 등 창을 여는 프로그램은 직접 실행하지 마세요.
+창 테스트가 필요하다면 답변 맨 마지막에 아래 블록을 작성하세요.
+답변 종료 후 Elysium이 창 테스트 큐에서 이를 실행하며, 결과는 총괄에게 전달되어 실패 수정 담당자를 결정합니다.
+사람이 직접 창을 닫아야 끝나는 수동 점검(예: runClient)은 요청하지 마시고, 명령어는 체이닝 없이 항목당 하나씩 작성하세요.
+
+작성 형식:";
+pub static NO_WINDOW_NOTE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!("\n{}\n{WINDOW_REQUEST_FORMAT}", NO_WINDOW_SYSTEM.trim()));
+/// 총괄이 메인 폴더에서 직접 일할 때: 창을 직접 띄우지 않고, 끝난 뒤 Elysium이 대기열에서 돌려 결과를 총괄에게 돌려준다.
+/// engines.rs looks for this text to block window commands, so LEAD_WINDOW_NOTE keeps it whole.
+pub const LEAD_WINDOW_SYSTEM: &str = "[창 테스트]
+모든 창 실행은 창 테스트 큐를 거쳐야 하므로 게임, 앱, 브라우저, 데스크톱 앱 개발 서버 등 창을 여는 프로그램은 직접 실행하지 마세요.
+창 테스트가 필요하다면 답변 맨 마지막에 아래 블록을 작성하세요.
+이번 실행이 종료된 후 Elysium이 큐에서 이를 구동하고 결과를 총괄에게 다시 반환합니다.
+사람이 직접 창을 닫아야만 끝나는 수동 점검(예: runClient)은 요청하지 마세요.
+
+작성 형식:";
+pub static LEAD_WINDOW_NOTE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!("\n{LEAD_WINDOW_SYSTEM}\n{WINDOW_REQUEST_FORMAT}"));
+
+/// Window tests asked at the end of a run that cannot wait for them: only window launches are taken, the rest
+/// the AI must run with its own tools. (window tests, other commands)
+pub fn window_requests(requests: Vec<WorkerRequest>) -> (Vec<WorkerRequest>, Vec<WorkerRequest>) {
+    requests.into_iter().partition(|r| r.kind == Kind::Window || opens_window(&r.command))
+}
 
 /// 창을 띄우는 것이 분명한 명령 조각(소문자). JEV·총괄 판단과 별개로 언제나 창 테스트 대기열로 보낸다.
 const WINDOW_WORDS: &[&str] = &[
@@ -40,10 +96,27 @@ pub fn opens_window(cmd: &str) -> bool {
     first.ends_with("gradlew") && tokens.iter().skip(1).any(|t| !t.starts_with('-') && t.rsplit(':').next().is_some_and(|task| task.ends_with("client") || task.starts_with("runclient")))
 }
 
-/// 그룹원에게 알리는 대화 방법
-pub const GROUP_SYSTEM: &str = "\n[워커 그룹] 당신은 다른 워커와 한 그룹으로 같은 작업 공간에서 함께 일합니다. 차례마다 답의 맨 끝에 아래 블록을 쓰세요. 다른 그룹원에게는 본문이 아니라 이 블록의 say만 전달되므로, say에는 다른 그룹원이 알아야 할 것만 3문장 이내로 쓰세요(코드·긴 목록·이미 한 말은 쓰지 않음).\n```elysium-group\n{\"say\":\"한 일, 필요한 것, 맡을 일\",\"claim\":[\"이번에 고칠 파일\"],\"done\":false}\n```\n- 다른 그룹원이 맡은 파일은 고치지 마세요. 파일을 고치기 전에 claim에 적으세요.\n- 그룹 전체 작업에서 당신 몫이 끝났으면 done을 true로 쓰세요.\n";
-/// 조직으로 일할 때 그룹장에게 더 알리는 말
-pub const LEADER_REPORT_SYSTEM: &str = "- 당신은 그룹장(그룹원 1)입니다. 블록에 \"report\":\"다른 팀장에게 전할 팀 상황(1~2문장)\"도 쓰세요. 다른 팀장의 보고를 받으면 그룹에 필요한 것만 say로 전하세요.\n";
+/// Marks the part of a reply that lists work the AI could not finish (see orchestrator::OWNERSHIP_SYSTEM).
+pub const LEFT_MARK: &str = "[남은 일]";
+/// Replies that mean "nothing left" after the mark.
+const NOTHING_LEFT: &[&str] = &["없음", "없습니다", "none", "-", "n/a"];
+const LEFT_CHARS: usize = 1500;
+
+/// Work the AI said it left unfinished: the text after the last LEFT_MARK, unless it says there is none.
+pub fn left_over(text: &str) -> Option<String> {
+    let at = text.rfind(LEFT_MARK)?;
+    let rest = text[at + LEFT_MARK.len()..].trim().trim_start_matches([':', '：']).trim();
+    let first = rest.lines().next().unwrap_or("").trim().trim_end_matches('.').to_lowercase();
+    if rest.is_empty() || (rest.lines().filter(|l| !l.trim().is_empty()).count() == 1 && NOTHING_LEFT.contains(&first.as_str())) {
+        return None;
+    }
+    Some(rest.chars().take(LEFT_CHARS).collect())
+}
+
+/// 팀원에게 알리는 대화 방법
+pub const GROUP_SYSTEM: &str = "\n[워커 팀] 당신은 다른 워커와 한 팀으로 같은 작업 공간에서 함께 일합니다. 차례마다 답의 맨 끝에 아래 블록을 쓰세요. 다른 팀원에게는 본문이 아니라 이 블록의 say만 전달되므로, say에는 다른 팀원이 알아야 할 것만 3문장 이내로 쓰세요(코드·긴 목록·이미 한 말은 쓰지 않음).\n```elysium-group\n{\"say\":\"한 일, 필요한 것, 맡을 일\",\"claim\":[\"이번에 고칠 파일\"],\"done\":false}\n```\n- 다른 팀원이 맡은 파일은 고치지 마세요. 파일을 고치기 전에 claim에 적으세요.\n- 팀 전체 작업에서 당신 몫이 끝났으면 done을 true로 쓰세요.\n";
+/// 조직으로 일할 때 팀장에게 더 알리는 말
+pub const LEADER_REPORT_SYSTEM: &str = "- 당신은 팀장(팀원 1)입니다. 블록에 \"report\":\"다른 팀장에게 전할 팀 상황(1~2문장)\"도 쓰세요. 다른 팀장의 보고를 받으면 팀에 필요한 것만 say로 전하세요.\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -122,12 +195,12 @@ pub struct GroupNote {
     pub claim: Vec<String>,
     #[serde(default)]
     pub done: bool,
-    /// 그룹장이 다른 팀장에게 전하는 팀 상황(조직으로 일할 때만)
+    /// 팀장이 다른 팀장에게 전하는 팀 상황(조직으로 일할 때만)
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub report: String,
 }
 
-/// 그룹 블록과 그것을 뺀 본문. 블록이 없거나 읽을 수 없으면 None.
+/// 팀 블록과 그것을 뺀 본문. 블록이 없거나 읽을 수 없으면 None.
 pub fn parse_group(text: &str) -> (Option<GroupNote>, String) {
     let (bodies, _, clean) = take_blocks(text, GROUP_FENCE);
     (bodies.iter().rev().find_map(|b| serde_json::from_str(b).ok()), clean)
@@ -396,9 +469,26 @@ pub fn actions_prompt(context: &str, event: &str) -> String {
         "{context}\n\n[일어난 일]\n{event}\n\n어떻게 할지 정하세요. 파일을 고치지 말고 아래 JSON 하나만 답하세요. 필요 없는 칸은 빼세요.\n\
          {{\"reply\":\"사용자에게 할 말\",\"messages\":[{{\"worker\":1,\"text\":\"이 워커에게 보낼 지시\"}}],\"stop\":[중지할 워커 번호],\"work\":\"총괄이 메인 폴더에서 직접 할 일\",\"ask_user\":{{\"question\":\"사용자에게 물을 말\",\"options\":[\"보기\"],\"workers\":[답을 기다려야 할 워커 번호]}}}}\n\
          - 사용자의 지시는 관련 워커에게 구체적으로 전달하세요. 계획에 변수가 생겼고 직접 정할 수 없을 때만 사용자에게 물으세요.\n\
-         - 워커에게 맡기기보다 직접 고치는 편이 빠르고 확실한 일(여러 워커의 결과를 잇는 수정, 공통 파일, 작은 버그)은 work에 적으세요. 이 답 다음에 당신이 메인 폴더에서 그 일을 직접 하게 됩니다.{WORKER_POWERS}"
+         - 워커에게 맡기기보다 직접 고치는 편이 빠르고 확실한 일(여러 워커의 결과를 잇는 수정, 공통 파일, 작은 버그)은 work에 적으세요. 이 답 다음에 당신이 메인 폴더에서 그 일을 직접 하게 됩니다.\n\
+         - {NO_IDLE_WAIT}\n\
+         - {NO_DROP}{WORKER_POWERS}"
     )
 }
+
+/// Keeps the lead from only acknowledging leftover or blocked work: someone must be assigned to it.
+const NO_DROP: &str = "작업자가 미완료 작업이나 실패를 보고했을 때 절대 reply만으로 끝내거나 나중으로 미루지 말고, 즉시 messages, spawn 또는 work를 통해 해당 작업을 배정하세요. 사용자에게 전달하는 것은 로그인, 결제, 육안 확인 등 사람만 할 수 있는 작업으로 제한하세요.";
+
+/// Sent again when the lead's answer was not the JSON asked for.
+pub const ACTIONS_AGAIN: &str = "[형식 오류] 이전 응답이 올바른 JSON 형식이 아니어서 처리되지 않았습니다. 다른 텍스트를 일절 포함하지 말고 지정된 형식의 단일 JSON 객체로 다시 응답하세요.";
+
+/// The lead lists what it hands to the worker reporting leftover work.
+pub const LEFT_EVENT: &str = "작업자 {title}이(가) 배정된 작업을 모두 마치지 못했다고 보고했습니다.
+미완료 작업:
+{left}
+작업이 누락되지 않도록 기존 작업자에게 속행 지시, 다른 작업자나 신규 작업자에게 전달, 또는 work로 직접 처리할지 지금 결정하세요(사람만 할 수 있는 일일 때만 사용자에게 요청).";
+
+/// Keeps the lead from answering a waiting worker with another "please wait" instead of doing the work.
+const NO_IDLE_WAIT: &str = "워커들이 총괄이 약속한 작업(병합, 수정, 검증 등)을 기다리고 있다면 추가 대기 메시지를 보내거나 계획을 반복하지 말고 지금 바로 work를 통해 직접 처리해야 하며, 담당 작업을 마친 워커에게는 메시지를 계속 보내지 마십시오.";
 
 /// 커밋 블록을 쓰는 법(검토·직접 작업·통합의 끝에 붙인다)
 pub const COMMIT_SYSTEM: &str = "\n[커밋] git 명령(commit·add·reset·checkout·stash·restore)은 쓰지 마세요. 커밋은 Elysium이 바뀐 파일만 골라 합니다. 답의 맨 끝에 아래 블록 하나를 쓰세요.\n```elysium-commit\n{\"commit\":true,\"message\":\"커밋 메시지 한 줄(저장소의 기존 커밋 형식을 따름)\",\"note\":\"고친 것이나 보류한 이유 한 줄\"}\n```\n- 미완성이라 지금 커밋하면 안 되면 commit을 false로 쓰세요. 변경은 메인 폴더에 남아 다음 검토나 통합에서 다시 봅니다.\n";
@@ -455,9 +545,81 @@ pub fn direct_work_prompt(context: &str, work: &str) -> String {
     format!("{context}\n\n[직접 작업] 총괄인 당신이 메인 작업 폴더(지금 폴더)에서 아래 일을 직접 하세요. 워커들은 각자의 작업 공간에서 계속 일하고 있으니, 그들이 맡은 파일은 꼭 필요할 때만 고치세요.\n\n{work}\n\n끝나면 한 일을 짧게 요약하고 elysium-commit 블록을 쓰세요.")
 }
 
+/// Retry of a direct-work run that failed: the folder may already hold part of the work.
+pub fn work_retry_prompt(context: &str, work: &str, error: &str) -> String {
+    let head = direct_work_prompt(context, work);
+    format!("{head}
+
+[다시 시도] 이전 작업 시도가 {error} 오류로 실패했습니다. 폴더에 일부 작업이 이미 완료되어 있을 수 있으니 처음부터 다시 시작하지 말고 현재 상태를 먼저 확인한 뒤 남은 작업만 이어서 진행하십시오.")
+}
+
+/// The lead fixes what made git reject a commit (hook output or similar), then Elysium commits again.
+pub fn commit_fix_prompt(context: &str, error: &str, files: &[String]) -> String {
+    let files = files.iter().map(|f| format!("- {f}\n")).collect::<String>();
+    format!("{context}
+
+[커밋 실패]
+오류 내용을 확인하고 훅에서 보고된 린트나 포맷 오류 등의 원인을 파일에서 직접 수정하십시오. git 명령어를 실행하거나 훅을 비활성화 또는 건너뛰지 마십시오. 작업이 완료되면 Elysium이 다시 커밋합니다.
+
+[git 오류]
+{error}
+
+[커밋할 파일]
+{files}
+
+수정한 내용을 한 줄로 요약하여 작성하고 elysium-commit 블록으로 마무리하십시오. 파일 수정으로 해결할 수 없는 원인이라면 commit을 false로 설정하고 note에 이유를 설명하십시오.")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn left_over_reads_the_last_mark_and_ignores_nothing_left() {
+        assert_eq!(left_over("고쳤습니다."), None);
+        assert_eq!(left_over("끝.\n[남은 일] 없음"), None);
+        assert_eq!(left_over("끝.\n[남은 일]: 없습니다."), None);
+        assert_eq!(left_over("끝.\n[남은 일]\n"), None);
+        assert_eq!(left_over("일부만 했습니다.\n[남은 일]\n- 빌드 확인(권한 없음)\n- README").as_deref(), Some("- 빌드 확인(권한 없음)\n- README"));
+        // An earlier mark that was resolved later in the same reply does not count.
+        assert_eq!(left_over("[남은 일] 테스트\n...\n[남은 일] 없음"), None);
+        // "없음" inside a real item list is still work left.
+        assert!(left_over("[남은 일]\n- 서명 키 없음\n- 배포").is_some());
+    }
+
+    #[test]
+    fn runs_that_cannot_wait_ask_window_tests_with_the_request_block() {
+        let req = |c: &str, kind: Kind| WorkerRequest { command: c.into(), why: String::new(), kind, timeout_sec: None };
+        let (tests, others) = window_requests(vec![req("./gradlew runGameTest", Kind::Window), req("npm run tauri dev", Kind::Command), req("cargo test", Kind::Command)]);
+        assert_eq!(tests.iter().map(|r| r.command.as_str()).collect::<Vec<_>>(), ["./gradlew runGameTest", "npm run tauri dev"]);
+        assert_eq!(others.len(), 1);
+        for note in [NO_WINDOW_NOTE.as_str(), LEAD_WINDOW_NOTE.as_str()] {
+            // The example in the note must be what parse_requests reads.
+            let asked = parse_requests(note);
+            assert!(asked.error.is_none() && asked.requests.len() == 1 && asked.requests[0].kind == Kind::Window, "{note}");
+        }
+        // engines.rs blocks window commands for runs whose system text holds LEAD_WINDOW_SYSTEM.
+        assert!(LEAD_WINDOW_NOTE.contains(LEAD_WINDOW_SYSTEM));
+    }
+
+    #[test]
+    fn lead_prompts_keep_their_tokens() {
+        assert!(LEFT_EVENT.contains("{title}") && LEFT_EVENT.contains("{left}"));
+        for f in ["reply", "messages", "spawn", "work"] {
+            assert!(NO_DROP.contains(f), "{f}");
+        }
+        assert!(!NO_DROP.contains('{') && !ACTIONS_AGAIN.contains('{'));
+    }
+
+    #[test]
+    fn power_requests_need_a_pc_word_or_an_unambiguous_verb() {
+        for yes in ["작업 다 끝나면 컴퓨터 꺼 줘", "끝나면 PC 재시작해줘", "완료 후 재부팅", "로그오프 해줘", "shut down the computer when done", "please reboot", "다 하면 컴퓨터 로그아웃"] {
+            assert!(asks_power(yes), "{yes}");
+        }
+        for no in ["작업 종료해", "컴파일 끝나면 종료", "워커 3 중지하고 다시 시작해", "서버 재시작해줘", "테스트 끝나면 알려줘", "restart the dev server", "로그아웃 기능 구현해줘", "graceful shutdown 처리 추가", "윈도우 종료 버튼 만들어줘", "전원 끄기 버튼 UI"] {
+            assert!(!asks_power(no), "{no}");
+        }
+    }
 
     #[test]
     fn commit_block_is_parsed_and_stripped() {

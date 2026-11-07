@@ -7,6 +7,33 @@ export type EngineId = CliId | ApiId;
 export type EngineChoice = "auto" | EngineId;
 export type ReviewMode = "auto" | "always" | "off" | "debate";
 
+/** One seat of a team built in the work setup panel. model: a name from workModels(). */
+export interface SetupSeat {
+  model: string;
+  effort: string | null;
+  count: number;
+}
+/** dept: departments above the team, "개발/프론트" for two levels. Empty when not grouped. */
+export interface SetupGroup {
+  dept: string;
+  members: SetupSeat[];
+}
+export interface SetupTeam {
+  lead: SetupSeat | null;
+  groups: SetupGroup[];
+}
+/** How one request runs, set before sending. null / 0 fields follow the settings and automatic choices. */
+export interface WorkSetup {
+  team: SetupTeam | null;
+  agents: number;
+  tier: "light" | "standard" | "deep" | null;
+  review: ReviewMode | null;
+  leadCommit: boolean | null;
+  roadmap: boolean | null;
+  jev: boolean | null;
+  maxTurns: number | null;
+}
+
 /** 엔진 이름. 예전 기록의 "gemini"(Gemini CLI)는 Antigravity로 보인다. */
 export const ENGINE_LABEL: Record<string, string> = {
   claude: "Claude Code",
@@ -28,10 +55,6 @@ export interface Settings {
   review: ReviewMode;
   jevEnabled: boolean;
   models: Record<string, string>;
-  /** 대화 요청마다 동시에 돌릴 에이전트 수(1이면 끔, 최대 16) */
-  agents: number;
-  /** true면 JEV가 요청을 보고 에이전트 수를 정한다 */
-  agentsAuto: boolean;
   /** 입력하는 동안 JEV가 모드·스킬을 추천한다 */
   jevSuggest: boolean;
   /** 창을 띄우는 실행(창 테스트)을 동시에 몇 개까지 돌릴지(앱 전체, 1~8) */
@@ -48,6 +71,41 @@ export interface Settings {
   prompts: SavedPrompt[];
   /** 작업이 끝났을 때 창이 앞에 없으면 작업 표시줄에서 알린다 */
   notifyDone: boolean;
+  /** Shut down / restart / log off after a task, when the user asked for it in that task */
+  powerOnDone: boolean;
+}
+
+/** Plan usage windows of the signed-in Claude Code account */
+export interface ClaudeLimits {
+  plan: string | null;
+  tier: string | null;
+  windows: { key: string; percent: number; resetsAt: string | null }[];
+  extraEnabled: boolean;
+  extraUsed: number | null;
+  extraLimit: number | null;
+  /** "login", "expired" or an error text */
+  error: string | null;
+  checkedAt: number;
+}
+
+/** Codex account limits from `codex app-server` (window length in minutes, reset in Unix seconds) */
+export interface CodexLimits {
+  plan: string | null;
+  groups: { name: string | null; windows: { minutes: number; percent: number; resetsAt: number | null }[] }[];
+  /** "missing" (not installed), "login" (not signed in) or an error text */
+  error: string | null;
+  checkedAt: number;
+}
+
+/** Antigravity quota from the desktop app's local server: models sharing one quota form a pool */
+export interface AgyLimits {
+  plan: string | null;
+  /** 5-hour ("5h") and weekly windows per quota group */
+  groups: { name: string; windows: { key: string; percent: number; resetsAt: string | null }[] }[];
+  pools: { models: string[]; percent: number; resetsAt: string | null }[];
+  /** "app_off" when the Antigravity app is not running, or an error text */
+  error: string | null;
+  checkedAt: number;
 }
 
 export type AnswerLang = "auto" | "ko" | "en" | "ja" | "zh";
@@ -294,8 +352,9 @@ export interface LeadDecision {
   key: string;
   command: string;
   why: string;
-  verdict: "once" | "deny" | "similar" | "all" | "ask_user";
-  by: "jev" | "lead" | "rule" | "all" | "self";
+  /** ran: an agent ran the command itself (no review needed) */
+  verdict: "once" | "deny" | "similar" | "all" | "ask_user" | "ran";
+  by: "jev" | "lead" | "rule" | "all" | "self" | "worker";
   pattern: string | null;
   window: boolean;
   reason: string;
@@ -425,14 +484,22 @@ export const api = {
   conversationSearch: (query: string) => invoke<SearchHit[]>("conversation_search", { query }),
   /** 창이 앞에 없으면 작업 표시줄 단추를 깜박여 알린다 */
   windowAttention: () => invoke<void>("window_attention"),
+  powerCancel: () => invoke<boolean>("power_cancel"),
+  limitsClaude: () => invoke<ClaudeLimits>("limits_claude"),
+  limitsAntigravity: () => invoke<AgyLimits>("limits_antigravity"),
+  limitsCodex: () => invoke<CodexLimits>("limits_codex"),
+  chatContinue: (conversationId: string, messageId: string) => invoke<{ conversationId: string; taskId: string; userMessageId: string }>("chat_continue", { conversationId, messageId }),
+  tasksRunning: () => invoke<string[]>("tasks_running"),
   /** 화면 전체 배율(0.8~1.4) */
   uiZoom: (scale: number) => invoke<void>("ui_zoom", { scale }),
   conversationDelete: (conversationId: string) => invoke<void>("conversation_delete", { conversationId }),
   conversationSetWorkspace: (conversationId: string, path: string | null) => invoke<void>("conversation_set_workspace", { conversationId, path }),
   pickFolder: () => invoke<string | null>("pick_folder"),
   /** work: 작업 모드(허락을 받은 뒤 파일 수정) · build: '만들기' — 승인 없이 폴더 안에서 끝까지 완성(작업 모드 포함) */
-  chatSend: (conversationId: string | null, text: string, engine: EngineChoice, work: boolean, build: boolean, workspace: string | null, council = false, attachments: string[] = []) =>
-    invoke<{ conversationId: string; taskId: string; userMessageId: string }>("chat_send", { conversationId, text, engine, work: !council && (work || build), build, workspace, council, attachments }),
+  chatSend: (conversationId: string | null, text: string, engine: EngineChoice, work: boolean, build: boolean, workspace: string | null, council = false, attachments: string[] = [], setup: WorkSetup | null = null) =>
+    invoke<{ conversationId: string; taskId: string; userMessageId: string }>("chat_send", { conversationId, text, engine, work: !council && (work || build), build, workspace, council, attachments, setup }),
+  /** Model names the work setup panel can offer */
+  workModels: () => invoke<string[]>("work_models"),
   attachmentPick: () => invoke<Attachment[]>("attachment_pick"),
   attachmentAddPaths: (paths: string[]) => invoke<Attachment[]>("attachment_add_paths", { paths }),
   attachmentAddBytes: (name: string, dataBase64: string) => invoke<Attachment>("attachment_add_bytes", { name, dataBase64 }),

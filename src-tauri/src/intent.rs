@@ -190,18 +190,38 @@ pub fn requested_models(text: &str, installed: &[EngineId], work: bool) -> Wante
 
 /// 이 언급을 맡을 수 있는 엔진들. 쓸 수 있는 엔진이 없으면 Err(모델 이름).
 fn pick_of(h: &Hit, installed: &[EngineId], work: bool) -> Result<ModelPick, String> {
-    let f = &FAMILIES[h.family];
+    pick_family(h.family, h.exact.clone(), installed, work)
+}
+
+/// Model names the work setup panel offers: families that some installed engine can run.
+pub fn model_choices(installed: &[EngineId]) -> Vec<&'static str> {
+    FAMILIES.iter().filter(|f| f.targets.iter().any(|(e, _)| installed.contains(e))).map(|f| f.name).collect()
+}
+
+/// A model picked by its family name in the work setup panel (same as writing "Claude Opus로" in the request).
+pub fn pick_named(name: &str, installed: &[EngineId], work: bool) -> Result<ModelPick, String> {
+    let fi = FAMILIES.iter().position(|f| f.name.eq_ignore_ascii_case(name.trim())).ok_or_else(|| name.trim().to_string())?;
+    pick_family(fi, None, installed, work)
+}
+
+/// "high" → the effort word the roster uses. Unknown words mean the default effort.
+pub fn effort_of(word: &str) -> Option<&'static str> {
+    EFFORTS.iter().copied().find(|e| e.eq_ignore_ascii_case(word.trim()))
+}
+
+fn pick_family(family: usize, exact: Option<String>, installed: &[EngineId], work: bool) -> Result<ModelPick, String> {
+    let f = &FAMILIES[family];
     let mut alts: Vec<(EngineId, Option<String>)> = f
         .targets
         .iter()
         .filter(|(e, _)| installed.contains(e))
-        .map(|&(e, m)| (e, h.exact.clone().or_else(|| (!m.is_empty()).then(|| m.to_string()))))
+        .map(|&(e, m)| (e, exact.clone().or_else(|| (!m.is_empty()).then(|| m.to_string()))))
         .collect();
     // 작업 모드는 API도 쓸 수 있지만, 같은 모델을 CLI로 쓸 수 있으면 CLI가 먼저다.
     if work {
         alts.sort_by_key(|(e, _)| e.is_api());
     }
-    let name = h.exact.clone().unwrap_or_else(|| f.name.to_string());
+    let name = exact.unwrap_or_else(|| f.name.to_string());
     match alts.first().cloned() {
         Some((engine, model)) => Ok(ModelPick { engine, model, name, alts }),
         None => Err(name),
@@ -824,6 +844,37 @@ pub fn parse_team_intent(answer: &str) -> Option<TeamIntent> {
     Some(TeamIntent { run_now: v["run_now"].as_bool()?, roster: v["roster"].as_str().unwrap_or("").to_string(), why: v["why"].as_str().unwrap_or("").trim().to_string() })
 }
 
+/// AI가 앞선 대화와 이번 요청을 읽고 동시에 돌릴 에이전트 수를 정하게 하는 말.
+/// recent: 앞선 대화 몇 차례(없으면 빈 글). at_least: JEV가 이미 그 이상으로 나눌 수 있다고 봤으면 그 수(아니면 1).
+pub fn agent_count_prompt(text: &str, recent: &str, at_least: usize) -> String {
+    let recent = if recent.trim().is_empty() { String::new() } else { format!("[앞선 대화]\n{}\n\n", recent.trim()) };
+    let floor = if at_least >= 2 { format!("- 이 요청은 서로 독립된 부분이 {at_least}개 이상으로 보입니다. {at_least} 이상으로 정하세요.\n") } else { String::new() };
+    format!(
+        "{recent}[이번 요청]\n{text}\n\n\
+         Elysium은 파일을 고치는 요청을 하위 작업으로 나눠 AI 에이전트 여러 개가 각자의 폴더 사본에서 동시에 처리한 뒤 합칩니다. \
+         요청을 수행하지 말고, 앞선 대화까지 읽어 이번 요청이 실제로 가리키는 일을 파악한 다음 그 일을 가장 효율적으로 끝낼 동시 에이전트 수만 정하세요.\n\
+         - 에이전트가 늘수록 폴더 사본·결과 통합·토큰 비용이 듭니다. 서로 다른 파일을 고치고 서로의 결과를 보지 않아도 되는 독립된 부분의 수만큼만 쓰세요.\n\
+         - 작은 수정, 하나로 이어지는 변경, 여럿이 같은 파일을 고쳐야 하는 일, 질문·설명은 1입니다.\n\
+         - 큰 기능 여러 개, 여러 모듈·화면에 걸친 대규모 작업처럼 독립된 부분이 많을 때만 크게 잡으세요(최대 {MAX_AGENTS}).\n\
+         {floor}\
+         파일을 열지 말고 도구도 쓰지 말고, 설명 없이 아래 JSON 하나만 답하세요. why는 요청과 같은 언어로 쓴 한 줄 이유입니다.\n\
+         {{\"agents\": 1, \"why\": \"\"}}"
+    )
+}
+
+/// 에이전트 수 답을 읽는다(1~MAX_AGENTS로 맞춘 수, 이유). JSON을 못 읽으면 처음 나온 수를 쓴다.
+pub fn parse_agent_count(answer: &str) -> Option<(usize, String)> {
+    let json = answer.find('{').zip(answer.rfind('}')).and_then(|(a, b)| answer.get(a..=b)).and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).or_else(|_| serde_json::from_str(&escape_controls_in_strings(raw))).ok());
+    let (n, why) = match json {
+        Some(v) => (v["agents"].as_u64().or_else(|| v["agents"].as_str().and_then(|s| s.trim().parse().ok()))?, v["why"].as_str().unwrap_or("").trim().to_string()),
+        None => {
+            let digits: String = answer.chars().skip_while(|c| !c.is_ascii_digit()).take_while(char::is_ascii_digit).collect();
+            (digits.parse().ok()?, String::new())
+        }
+    };
+    Some(((n as usize).clamp(1, MAX_AGENTS), why))
+}
+
 pub fn team_reading_prompt(text: &str) -> String {
     let instruction = "사용자 요청을 직접 수행하지 말고 요청에서 언급된 팀 구성 정보만 한 줄에 한 팀씩 아래 형식에 맞춰 정확히 추출하십시오. 모델명과 작업 강도는 사용자가 기재한 표현을 그대로 유지하고 팀장을 명시했을 때만 팀장 줄을 추가하며 팀을 본부·부서로 묶었으면 '이름 본부:' 줄을 먼저 쓰고 그 팀 줄을 두 칸 들여 쓰며 선택 사항으로 언급된 팀은 제외하고 임의로 지어내지 마십시오. 사용자가 지정한 팀 구성이 전혀 없다면 어떤 부가 설명도 없이 오직 없음 단어 하나만 출력하십시오.";
     format!("{instruction}\n\n총괄 - Claude Opus 5.5 high\n프론트엔드 본부:\n  1팀 - Claude Haiku 5.5 high, Gemini 3.8 Flash high\n  2팀 - Codex x2\n3팀 - Claude Sonnet 5.5 high\n\n[요청]\n{text}")
@@ -834,9 +885,9 @@ const MANY_WORDS: &[&str] = &[
     "여러 에이전트", "에이전트 여러", "에이전트들", "멀티 에이전트", "멀티에이전트", "multi-agent", "multi agent", "multiple agents", "parallel agents", "in parallel", "병렬로", "병렬 에이전트", "동시에 여러",
 ];
 const NUM_WORDS: &[(&str, usize)] = &[("다섯", 5), ("두", 2), ("둘", 2), ("세", 3), ("셋", 3), ("네", 4), ("넷", 4), ("two", 2), ("three", 3), ("four", 4), ("five", 5)];
-pub const MAX_AGENTS: usize = 16;
+pub const MAX_AGENTS: usize = 64;
 
-/// 요청 글이 에이전트 여러 개를 동시에 돌려 달라고 하면 그 수(2~16). 숫자 없이 "여러·병렬"이면 3.
+/// 요청 글이 에이전트 여러 개를 동시에 돌려 달라고 하면 그 수(2~64). 숫자 없이 "여러·병렬"이면 3.
 pub fn requested_agents(text: &str) -> Option<usize> {
     let low = text.to_ascii_lowercase();
     if let Some((n, _, _)) = agent_count(&low) {
@@ -1130,8 +1181,10 @@ mod tests {
     #[test]
     fn roster_refuses_a_model_it_cannot_run_or_too_many_seats() {
         assert_eq!(requested_roster(PAIR_LINES, &[Antigravity], true), Err(RosterError::Missing("Claude Haiku".into())));
-        let big = "1팀: Claude Haiku x9, Gemini flash\n2팀: Claude Haiku x9";
-        assert_eq!(requested_roster(big, ALL, true), Err(RosterError::TooMany(19)));
+        let big = "1팀: Claude Haiku x40, Gemini flash\n2팀: Claude Haiku x40";
+        assert_eq!(requested_roster(big, ALL, true), Err(RosterError::TooMany(81)), "최대 64개");
+        let fits = "1팀: Claude Haiku x30, Gemini flash\n2팀: Claude Haiku x30";
+        assert!(matches!(requested_roster(fits, ALL, true), Ok(Some(_))), "61개는 돈다");
     }
 
     const PLEXUS_REQUEST: &str ="당신은 본 프로젝트의 **총괄 분할자 및 관리자(Orchestrator & Lead Manager)**인 **Opus 5.5**입니다.\n아래 과제를 나눈 뒤, **4개의 Gemini 3.8 Flash (High) 하위 에이전트(Worker)**를 병렬 구동하여 작업을 지시·감독하십시오.\n- **병렬 실행 워커**: Gemini 3.8 Flash (High) × 4\n";
@@ -1154,7 +1207,7 @@ mod tests {
         let t = requested_team("워커: Gemini 3.8 Flash x 3 으로 고쳐", ALL, true).expect("x 3");
         assert_eq!((t.count, t.effort, t.lead.is_none()), (3, None, true));
         assert_eq!(requested_team("3개의 Gemini 에이전트로 나눠 줘", ALL, true).map(|t| t.count), Some(3));
-        assert_eq!(requested_team("gemini 워커 99개", ALL, true).map(|t| t.count), Some(MAX_AGENTS), "최대 16개");
+        assert_eq!(requested_team("gemini 워커 99개", ALL, true).map(|t| t.count), Some(MAX_AGENTS), "최대 64개");
     }
 
     #[test]
@@ -1279,6 +1332,19 @@ mod tests {
     }
 
     #[test]
+    fn reads_the_agent_count_answer() {
+        assert_eq!(parse_agent_count("{\"agents\": 6, \"why\": \"화면 6개가 독립적\"}"), Some((6, "화면 6개가 독립적".into())));
+        assert_eq!(parse_agent_count("```json\n{\"agents\": \"3\", \"why\": \"a\"}\n```").map(|x| x.0), Some(3), "문자열 수와 코드 블록");
+        assert_eq!(parse_agent_count("{\"agents\": 500}").map(|x| x.0), Some(MAX_AGENTS), "최대로 맞춘다");
+        assert_eq!(parse_agent_count("{\"agents\": 0}").map(|x| x.0), Some(1));
+        assert_eq!(parse_agent_count("에이전트 12개가 좋습니다").map(|x| x.0), Some(12), "JSON이 아니면 처음 나온 수");
+        assert_eq!(parse_agent_count("모르겠습니다"), None);
+        let p = agent_count_prompt("그거 다 고쳐 줘", "user: 로그인 화면과 결제 화면이 깨져", 4);
+        assert!(p.contains("[앞선 대화]") && p.contains("4 이상") && p.contains("최대 64"), "{p}");
+        assert!(!agent_count_prompt("고쳐", " ", 1).contains("[앞선 대화]"));
+    }
+
+    #[test]
     fn ignores_words_that_are_not_model_requests() {
         assert_eq!(one("haiku로 시를 써 줘", ALL), None, "하이쿠 형식의 시");
         assert_eq!(one("소네트 한 편 써 줘", ALL), None);
@@ -1304,7 +1370,7 @@ mod tests {
         assert_eq!(requested_agents("에이전트를 4개 돌려서"), Some(4));
         assert_eq!(requested_agents("세 개의 에이전트로"), Some(3));
         assert_eq!(requested_agents("use 2 agents"), Some(2));
-        assert_eq!(requested_agents("에이전트 99개"), Some(MAX_AGENTS), "최대 16개");
+        assert_eq!(requested_agents("에이전트 99개"), Some(MAX_AGENTS), "최대 64개");
         assert_eq!(requested_agents("여러 에이전트로 동시에 분석해"), Some(3));
         assert_eq!(requested_agents("병렬로 처리해 줘"), Some(3));
         assert_eq!(requested_agents("에이전트 1개만"), None);

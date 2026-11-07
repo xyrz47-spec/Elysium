@@ -1,4 +1,4 @@
-//! 총괄과 워커를 잇는 실행 흐름: 요청 검토, 명령 실행, 창 테스트 대기열, 사용자 질문, 워커 그룹.
+//! 총괄과 워커를 잇는 실행 흐름: 요청 검토, 명령 실행, 창 테스트 대기열, 사용자 질문, 워커 팀.
 
 use crate::audit;
 use crate::db::new_id;
@@ -35,7 +35,33 @@ const JEV_SCOPE: f64 = 0.7;
 const JEV_WINDOW: f64 = 0.5;
 const JEV_MANUAL: f64 = 0.6;
 const JEV_BLOCKED: f64 = 0.6;
-const REQUEST_CHARS: usize = 6000;
+const REQUEST_CHARS: usize = 4000;
+/// 총괄 맥락에 다시 붙이는 최근 명령 판단 수
+const DECISIONS_SHOWN: usize = 10;
+/// 총괄 맥락에 붙이는 최근 사용자·총괄 대화 수와 한 마디의 최대 글자 수
+const TALK_KEEP: usize = 6;
+const TALK_CHARS: usize = 400;
+/// Waits before retrying a commit that another git process blocked.
+const COMMIT_BUSY_WAITS: [Duration; 3] = [Duration::from_secs(3), Duration::from_secs(10), Duration::from_secs(30)];
+/// Waits before retrying a failed direct-work run.
+const WORK_RETRY_WAITS: [Duration; 2] = [Duration::from_secs(10), Duration::from_secs(60)];
+/// Failed direct work is handed back to the lead at most this many times in a row.
+const WORK_FAILURE_CONSULTS: u32 = 2;
+/// Drift consults a worker may trigger in a row without running anything (stops lead↔worker ping-pong).
+const MAX_NUDGES: u32 = 2;
+/// A worker turn that failed (not stopped) is continued this many times before the part is given up to the integrator.
+const WORKER_RETRIES: u32 = 1;
+const WORKER_RETRY_WAIT: Duration = Duration::from_secs(30);
+/// Lead log line for a worker retry; {worker} and {error} are filled in.
+const WORKER_RETRY_NOTE: &str = "{worker}의 턴이 오류({error})로 실패하여 30초 후 동일한 작업을 자동으로 이어서 진행합니다.";
+/// Sent to a worker whose previous turn failed.
+const WORKER_RETRY: &str = "[이어서 진행] 이전 턴이 오류로 중단되었습니다. 작업 공간에 일부 작업이 이미 반영되어 있을 수 있으니 현재 상태를 먼저 확인하고, 처음부터 다시 시작하지 말고 할당된 작업을 끝까지 이어서 진행하세요.";
+/// Written after LEFT_MARK when a worker runs out of turns.
+const TURN_CAP_LEFT: &str = "작업자가 최대 턴 수에 도달하여 할당된 작업을 완료하기 전에 중단되었으므로, 남은 작업을 이어서 완료해야 합니다.";
+/// Written after LEFT_MARK when a team runs out of rounds with members still working.
+const GROUP_CAP_LEFT: &str = "일부 팀원이 작업을 마치지 못한 상태에서 팀이 최대 라운드 수에 도달했으므로, 남은 작업을 이어서 완료해야 합니다.";
+/// Told to the remaining team members when one drops out with an error; {who} and {files} are filled in.
+const HANDOVER: &str = "{who}가 오류로 인해 팀에서 이탈했습니다. 해당 작업과 파일({files})이 방치되지 않도록 남은 팀원들이 나누어 맡아 계속 진행하고, 각자 가져갈 파일을 claim에 기록하세요.";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkerInfo {
@@ -153,6 +179,8 @@ pub struct TaskLead {
     pub policy: Mutex<Policy>,
     pub workers: Mutex<Vec<WorkerInfo>>,
     pub decisions: Mutex<Vec<Value>>,
+    /// Commands the agents ran themselves (shown with the lead's command reviews, saved with the answer).
+    pub ran: Mutex<Vec<Value>>,
     pub group_log: Mutex<Vec<Value>>,
     pub holds: Holds,
     /// 앞선 판단으로 생긴 규칙이 다음 요청에 바로 적용되도록 검토를 한 번에 하나씩 한다.
@@ -180,9 +208,41 @@ pub struct TaskLead {
     pub org: Mutex<Option<Arc<OrgBoard>>>,
     /// 팀장 보고 기록(끝나면 대화 기록에 남긴다)
     pub org_log: Mutex<Vec<Value>>,
+    /// 사용자와 총괄이 나눈 최근 말(총괄은 세션을 이어 쓰지 않으므로 맥락에 다시 붙인다)
+    talk: Mutex<Vec<(&'static str, String)>>,
+    /// Tokens and cost of the lead's own calls, saved with the answer.
+    pub spent: Mutex<Outcome>,
+    /// Turns each worker may take (the work setup panel can change it)
+    pub max_turns: std::sync::atomic::AtomicU32,
+    /// Direct-work runs that failed in a row; caps how often a failure is handed back to the lead.
+    work_failures: std::sync::atomic::AtomicU32,
+    /// Window tests the lead's own runs asked for, still running (integration waits for them: settle_tests).
+    tests: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Results of window tests asked by runs that could not get them back; the integrator gets them.
+    test_results: Mutex<Vec<String>>,
+    /// Failed tests of the lead's own runs handed back to it in a row (stops fix → test → fix loops).
+    test_consults: std::sync::atomic::AtomicU32,
 }
 
 impl TaskLead {
+    /// How the user's shutdown/restart/log off request will be handled, when there is one.
+    fn power_note(&self, allowed: bool) -> &'static str {
+        match crate::afterwork::requested(&self.task) {
+            Some(_) if allowed => lead::LEAD_POWER_SYSTEM,
+            Some(_) => lead::LEAD_POWER_OFF_SYSTEM,
+            None => "",
+        }
+    }
+
+    /// Adds one lead call's usage (text and session are not kept).
+    pub fn add_spent(&self, o: &Outcome) {
+        let mut s = self.spent.lock().unwrap_or_else(|p| p.into_inner());
+        s.cost_usd = add_opt(s.cost_usd, o.cost_usd);
+        s.input_tokens = add_opt(s.input_tokens, o.input_tokens);
+        s.output_tokens = add_opt(s.output_tokens, o.output_tokens);
+        s.latency_ms += o.latency_ms;
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(conv: &str, task: &str, mid: &str, request: &str, engine: EngineId, model: Option<String>, cwd: PathBuf, jev_key: Option<String>, cancel: CancellationToken, session: Option<String>) -> Self {
         TaskLead {
@@ -199,6 +259,7 @@ impl TaskLead {
             policy: Mutex::new(Policy::default()),
             workers: Mutex::new(vec![]),
             decisions: Mutex::new(vec![]),
+            ran: Mutex::new(vec![]),
             group_log: Mutex::new(vec![]),
             holds: Holds::default(),
             review: tokio::sync::Mutex::new(()),
@@ -214,6 +275,13 @@ impl TaskLead {
             removed: Mutex::new(BTreeSet::new()),
             org: Mutex::new(None),
             org_log: Mutex::new(vec![]),
+            talk: Mutex::new(vec![]),
+            spent: Mutex::new(Outcome::default()),
+            max_turns: std::sync::atomic::AtomicU32::new(MAX_TURNS),
+            work_failures: std::sync::atomic::AtomicU32::new(0),
+            tests: Mutex::new(vec![]),
+            test_results: Mutex::new(vec![]),
+            test_consults: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -221,14 +289,25 @@ impl TaskLead {
         self.workers.lock().unwrap_or_else(|p| p.into_inner()).get(number.checked_sub(1)?).map(|w| w.key.clone())
     }
 
-    /// 세션을 이어 쓸 수 없는 AI도 판단할 수 있게 호출마다 맥락을 다시 만든다.
+    /// 사용자·총괄의 말을 맥락용으로 남긴다(최근 몇 마디만).
+    fn remember(&self, who: &'static str, text: &str) {
+        let mut t = self.talk.lock().unwrap_or_else(|p| p.into_inner());
+        t.push((who, cut(text.trim(), TALK_CHARS)));
+        let over = t.len().saturating_sub(TALK_KEEP);
+        t.drain(..over);
+    }
+
+    /// 총괄은 세션을 이어 쓰지 않는다: 이어 쓰면 부를 때마다 앞선 모든 호출을 다시 읽어 입력 토큰이 제곱으로 는다.
+    /// 그래서 호출마다 필요한 맥락(요청·워커·최근 판단·최근 대화)만 새로 만든다.
     fn context(&self) -> String {
         let request: String = self.request.chars().take(REQUEST_CHARS).collect();
         let removed = self.removed.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let workers: String = self.workers.lock().unwrap_or_else(|p| p.into_inner()).iter().enumerate().map(|(i, w)| format!("{}. {}{}\n", i + 1, w.title, if removed.contains(&w.key) { REMOVED_MARK } else { "" })).collect();
         let decisions = self.decisions.lock().unwrap_or_else(|p| p.into_inner());
-        let recent: String = decisions.iter().rev().take(20).rev().map(|d| format!("- {} → {}\n", d["command"].as_str().unwrap_or(""), d["verdict"].as_str().unwrap_or(""))).collect();
-        format!("당신은 이 작업의 총괄입니다. 워커들에게 일을 나눠 맡겼습니다. 평소에는 판단만 하지만 [커밋 검토]와 [직접 작업]에서는 메인 작업 폴더의 파일을 직접 고칩니다.\n\n[사용자 요청]\n{request}\n\n[워커]\n{workers}\n[지금까지의 명령 판단]\n{recent}")
+        let recent: String = decisions.iter().rev().take(DECISIONS_SHOWN).rev().map(|d| format!("- {} → {}\n", cut(d["command"].as_str().unwrap_or(""), 160), d["verdict"].as_str().unwrap_or(""))).collect();
+        let talk: String = self.talk.lock().unwrap_or_else(|p| p.into_inner()).iter().map(|(who, t)| format!("- {who}: {t}\n")).collect();
+        let talk = if talk.is_empty() { String::new() } else { format!("\n[최근 사용자와 나눈 말]\n{talk}") };
+        format!("당신은 이 작업의 총괄입니다. 워커들에게 일을 나눠 맡겼습니다. 평소에는 판단만 하지만 [커밋 검토]와 [직접 작업]에서는 메인 작업 폴더의 파일을 직접 고칩니다.\n\n[사용자 요청]\n{request}\n\n[워커]\n{workers}\n[최근 명령 판단]\n{recent}{talk}")
     }
 }
 
@@ -386,13 +465,10 @@ async fn judge_blocked(ctx: &Ctx, role: &'static str, part: &str, reply: &str) -
 async fn lead_call(ctx: &Ctx, prompt: String, stop: &CancellationToken) -> Option<String> {
     let lead = &ctx.lead;
     let _turn = wait_or_stop(lead.calls.lock(), stop).await?;
-    let resume = if lead.engine.resumable() { lead.session.lock().unwrap_or_else(|p| p.into_inner()).clone() } else { None };
-    let spec = RunSpec { engine: lead.engine, prompt, system: String::new(), cwd: lead.cwd.clone(), work: false, resume, plugin_dirs: vec![], model: lead.model.clone(), effort: Some("medium".into()), max_tokens: Some(2000), extra_dirs: vec![], steer: None, attachments: vec![] };
-    let run = |spec: RunSpec| orchestrator::run_engine_as(&ctx.app, &ctx.st, &lead.conv, &lead.task, &lead.mid, "lead", spec, LEAD_TIMEOUT, stop, false, "lead");
-    let mut o = run(spec.clone()).await;
-    if !o.ok && spec.resume.is_some() && !stop.is_cancelled() {
-        o = run(RunSpec { resume: None, ..spec }).await;
-    }
+    // 새 세션으로 부른다(맥락은 prompt에 들어 있다). 앞부분이 같아 프롬프트 캐시는 그대로 쓴다.
+    let spec = RunSpec { engine: lead.engine, prompt, system: format!("{}{}", lead::LEAD_JUDGE_SYSTEM, lead.power_note(ctx.st.settings().power_on_done)), cwd: lead.cwd.clone(), work: false, resume: None, plugin_dirs: vec![], model: lead.model.clone(), effort: Some("medium".into()), max_tokens: Some(2000), extra_dirs: vec![], steer: None, attachments: vec![] };
+    let o = orchestrator::run_engine_as(&ctx.app, &ctx.st, &lead.conv, &lead.task, &lead.mid, "lead", spec, LEAD_TIMEOUT, stop, false, "lead").await;
+    lead.add_spent(&o);
     if let Some(s) = &o.session_id {
         *lead.session.lock().unwrap_or_else(|p| p.into_inner()) = Some(s.clone());
     }
@@ -415,9 +491,110 @@ pub fn note(ctx: &Ctx, kind: &str, text: impl Into<String>) {
 async fn lead_work_run(ctx: &Ctx, prompt: String, stop: &CancellationToken) -> Outcome {
     let lead = &ctx.lead;
     let commits = lead.repo.lock().unwrap_or_else(|p| p.into_inner()).is_some();
-    let system = format!("{}{}{}", lead.work_system.lock().unwrap_or_else(|p| p.into_inner()), lead::LEAD_WINDOW_SYSTEM, if commits { lead::COMMIT_SYSTEM } else { "" });
+    let system = format!("{}{}{}{}", lead.work_system.lock().unwrap_or_else(|p| p.into_inner()), lead::LEAD_WINDOW_NOTE.as_str(), if commits { lead::COMMIT_SYSTEM } else { "" }, lead.power_note(ctx.st.settings().power_on_done));
     let spec = RunSpec { engine: lead.engine, prompt, system, cwd: lead.cwd.clone(), work: true, resume: None, plugin_dirs: vec![], model: lead.model.clone(), effort: Some("medium".into()), max_tokens: None, extra_dirs: vec![], steer: None, attachments: vec![] };
-    orchestrator::run_engine_as(&ctx.app, &ctx.st, &lead.conv, &lead.task, &lead.mid, "lead", spec, LEAD_WORK_TIMEOUT, stop, false, "lead-work").await
+    let mut o = orchestrator::run_engine_as(&ctx.app, &ctx.st, &lead.conv, &lead.task, &lead.mid, "lead", spec, LEAD_WORK_TIMEOUT, stop, false, "lead-work").await;
+    lead.add_spent(&o);
+    // Window tests the lead asked for run after this run, without holding the main-folder lock the caller has.
+    let parsed = lead::parse_requests(&o.text);
+    if !parsed.requests.is_empty() {
+        o.text = parsed.clean;
+        if o.ok && !stop.is_cancelled() {
+            queue_lead_tests(ctx, parsed.requests);
+        }
+    }
+    o
+}
+
+/// Characters kept from one window test result.
+const TEST_RESULT_CHARS: usize = 3000;
+/// The lead's own failed tests are handed back to it at most this many times in a row.
+const TEST_CONSULTS: u32 = 2;
+/// Who asked, in the lead's event, for the lead's own runs.
+const LEAD_TESTS_WHO: &str = "메인 폴더 직접 작업";
+/// Sent to the lead when tests asked by a finished run failed; {who} and {results} are filled in.
+const TESTS_EVENT: &str = "{who}님이 요청한 창 테스트 결과입니다. 해당 실행은 이미 종료되어 메시지를 수신할 수 없습니다.
+{results}
+실패한 테스트를 누락하지 마세요. spawn으로 새 워커에 맡기거나 messages로 실행 중인 워커에 넘기거나 work로 직접 수정할지 지금 결정하세요.";
+/// Lead log line while the integration waits for window tests still running.
+const TESTS_WAIT: &str = "통합 전 결과 반영을 위해 실행 중인 창 테스트 완료를 대기 중입니다.";
+
+/// A window test that ran and failed (not refused or switched off by the user).
+pub fn test_failed(result: &str) -> bool {
+    result.starts_with("[명령 실패]") || result.starts_with("[창 테스트 오류]")
+}
+
+/// Runs the window tests asked at the end of a run that has already ended, through the queue, and waits for all of them.
+/// Other commands are refused: the AI has to run those with its own tools. Not reviewed, like window tests from
+/// workers that use the queue themselves (run_worker).
+pub async fn run_asked_tests(ctx: &Ctx, key: &str, cwd: &Path, requests: Vec<WorkerRequest>, stop: &CancellationToken) -> Vec<String> {
+    let (tests, others) = lead::window_requests(requests);
+    let mut out: Vec<String> = others.iter().map(|r| format!("[요청 거부] {}\n{}", r.command, own_tools_note())).collect();
+    let mut handles = vec![];
+    for req in tests {
+        if stop.is_cancelled() {
+            break;
+        }
+        record_ruling(ctx, key, &req, &Ruling { run: true, window: true, by: "self", verdict: Verdict::Once, pattern: None, reason: String::new() });
+        let (p, _) = spawn_window_test(ctx, key, cwd.to_path_buf(), req, stop).await;
+        handles.push(p.handle);
+    }
+    for h in handles {
+        out.push(h.await.unwrap_or_else(|e| format!("[창 테스트 오류] {e}")));
+    }
+    out.iter().map(|r| cut(r, TEST_RESULT_CHARS)).collect()
+}
+
+/// Keeps the results for the integrator and hands failures to the lead so someone fixes them.
+/// own: the tests came from the lead's own run (capped, so a failing fix does not loop forever).
+async fn report_tests(ctx: &Ctx, who: &str, results: &[String], own: bool, stop: &CancellationToken) {
+    let lead = &ctx.lead;
+    if results.is_empty() {
+        return;
+    }
+    lead.test_results.lock().unwrap_or_else(|p| p.into_inner()).extend(results.iter().map(|r| format!("[{who}] {r}")));
+    for r in results {
+        note(ctx, "test", format!("{who}: {}", cut(r.lines().next().unwrap_or(""), 160)));
+    }
+    let failed = results.iter().any(|r| test_failed(r));
+    if own && !failed {
+        lead.test_consults.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+    // While integrating, the integrator gets the results itself (settle_tests).
+    if !failed || stop.is_cancelled() || lead.integrating.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    if own && lead.test_consults.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= TEST_CONSULTS {
+        return;
+    }
+    consult_lead(ctx, TESTS_EVENT.replace("{who}", who).replace("{results}", &results.join("\n\n")), None, stop).await;
+}
+
+/// Runs the lead's window tests in the background and remembers the job so the integration waits for it.
+fn queue_lead_tests(ctx: &Ctx, requests: Vec<WorkerRequest>) {
+    let c = ctx.clone();
+    let job = tokio::spawn(async move {
+        let stop = c.lead.cancel.clone();
+        let cwd = c.lead.cwd.clone();
+        let results = run_asked_tests(&c, "lead", &cwd, requests, &stop).await;
+        report_tests(&c, LEAD_TESTS_WHO, &results, true, &stop).await;
+    });
+    ctx.lead.tests.lock().unwrap_or_else(|p| p.into_inner()).push(job);
+}
+
+/// Waits for the lead's window tests still running and takes every test result not yet given to an integrator.
+pub async fn settle_tests(ctx: &Ctx) -> Vec<String> {
+    loop {
+        let jobs = std::mem::take(&mut *ctx.lead.tests.lock().unwrap_or_else(|p| p.into_inner()));
+        if jobs.is_empty() {
+            break;
+        }
+        note(ctx, "test", TESTS_WAIT);
+        if wait_or_stop(futures_util::future::join_all(jobs), &ctx.lead.cancel).await.is_none() {
+            break;
+        }
+    }
+    std::mem::take(&mut *ctx.lead.test_results.lock().unwrap_or_else(|p| p.into_inner()))
 }
 
 /// 메인 폴더의 지금 상태(커밋 전 파일과 해시)
@@ -426,7 +603,17 @@ async fn dirty_now(repo: &gitops::Repo) -> BTreeMap<String, Option<[u8; 32]>> {
     tokio::task::spawn_blocking(move || r.dirty()).await.unwrap_or_default()
 }
 
+/// Sleeps unless the task stops first. false when stopped.
+async fn pause(d: Duration, stop: &CancellationToken) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(d) => true,
+        _ = stop.cancelled() => false,
+    }
+}
+
 /// before 이후 바뀐 파일과 앞서 커밋하지 못한 파일을 커밋 블록대로 커밋한다. 블록이 없으면 기본 메시지로 커밋한다.
+/// A failed commit is retried while git is locked, handed to the lead once when a hook or the change is rejected,
+/// and otherwise reported to the user with the paths kept for the next commit.
 async fn commit_changes(ctx: &Ctx, repo: &gitops::Repo, before: &BTreeMap<String, Option<[u8; 32]>>, plan: Option<lead::CommitPlan>, fallback: &str) {
     let lead = &ctx.lead;
     let after = dirty_now(repo).await;
@@ -442,21 +629,90 @@ async fn commit_changes(ctx: &Ctx, repo: &gitops::Repo, before: &BTreeMap<String
         return;
     }
     let message = if plan.message.is_empty() { fallback.to_string() } else { plan.message.clone() };
-    let (r, list, msg) = (repo.clone(), paths.iter().cloned().collect::<Vec<_>>(), message.clone());
-    match tokio::task::spawn_blocking(move || r.commit(&list, &msg)).await.unwrap_or_else(|e| Err(e.to_string())) {
-        Ok(Some(sha)) => {
-            lead.pending.lock().unwrap_or_else(|p| p.into_inner()).clear();
-            let files: Vec<String> = paths.into_iter().collect();
-            note(ctx, "commit", format!("{sha} {message}"));
-            audit::record(&ctx.st.db, "lead", "lead.commit", "ok", json!({ "task": lead.task, "sha": sha, "message": message, "files": files }));
-            emit(&ctx.app, "lead:commit", json!({ "taskId": lead.task, "sha": sha, "message": message, "files": files, "note": plan.note }));
-        }
-        Ok(None) => lead.pending.lock().unwrap_or_else(|p| p.into_inner()).clear(),
-        Err(e) => {
+    let (mut busy, mut fixed) = (0usize, false);
+    loop {
+        let (r, list, msg) = (repo.clone(), paths.iter().cloned().collect::<Vec<_>>(), message.clone());
+        let error = match tokio::task::spawn_blocking(move || r.commit(&list, &msg)).await.unwrap_or_else(|e| Err(e.to_string())) {
+            Ok(Some(sha)) => {
+                lead.pending.lock().unwrap_or_else(|p| p.into_inner()).clear();
+                let files: Vec<String> = paths.into_iter().collect();
+                note(ctx, "commit", format!("{sha} {message}"));
+                audit::record(&ctx.st.db, "lead", "lead.commit", "ok", json!({ "task": lead.task, "sha": sha, "message": message, "files": files }));
+                emit(&ctx.app, "lead:commit", json!({ "taskId": lead.task, "sha": sha, "message": message, "files": files, "note": plan.note }));
+                return;
+            }
+            Ok(None) => {
+                lead.pending.lock().unwrap_or_else(|p| p.into_inner()).clear();
+                return;
+            }
+            Err(e) => e,
+        };
+        let kind = gitops::commit_failure(&error);
+        if lead.cancel.is_cancelled() {
             lead.pending.lock().unwrap_or_else(|p| p.into_inner()).extend(paths);
-            note(ctx, "warn", format!("커밋 실패: {}", cut(&e, 300)));
+            return;
+        }
+        match kind {
+            gitops::CommitFailure::Busy if busy < COMMIT_BUSY_WAITS.len() => {
+                let wait = COMMIT_BUSY_WAITS[busy];
+                busy += 1;
+                note(ctx, "info", format!("Git 잠금 상태로 인해 {secs}초 후 커밋을 다시 시도합니다.", secs = wait.as_secs()));
+                if !pause(wait, &lead.cancel).await {
+                    lead.pending.lock().unwrap_or_else(|p| p.into_inner()).extend(paths);
+                    return;
+                }
+            }
+            gitops::CommitFailure::Fixable if !fixed => {
+                fixed = true;
+                note(ctx, "warn", format!("커밋이 거부되어 원인을 수정한 뒤 다시 시도합니다: {error}", error = cut(&error, 300)));
+                let list: Vec<String> = paths.iter().cloned().collect();
+                let o = lead_work_run(ctx, lead::commit_fix_prompt(&lead.context(), &cut(&error, 3000), &list), &lead.cancel).await;
+                let (fix, _) = lead::parse_commit(&o.text);
+                if lead.cancel.is_cancelled() {
+                    lead.pending.lock().unwrap_or_else(|p| p.into_inner()).extend(paths);
+                    return;
+                }
+                if !o.ok || fix.as_ref().is_some_and(|p| !p.commit) {
+                    let why = fix.map(|p| p.note).filter(|n| !n.trim().is_empty()).or(o.error).unwrap_or_default();
+                    let detail = if why.is_empty() { error } else { format!("{error}\n{why}") };
+                    commit_gave_up(ctx, paths, &detail, kind);
+                    return;
+                }
+                // Files the fix touched go into the same commit.
+                let now = dirty_now(repo).await;
+                paths.extend(gitops::changed_between(&after, &now));
+            }
+            _ => {
+                commit_gave_up(ctx, paths, &error, kind);
+                return;
+            }
         }
     }
+}
+
+/// Keeps the paths for the next commit and tells the user and the lead why the commit failed.
+fn commit_gave_up(ctx: &Ctx, paths: BTreeSet<String>, error: &str, kind: gitops::CommitFailure) {
+    let lead = &ctx.lead;
+    let files: Vec<String> = paths.iter().cloned().collect();
+    lead.pending.lock().unwrap_or_else(|p| p.into_inner()).extend(paths);
+    let error = cut(error, 600);
+    note(ctx, "warn", format!("커밋 실패: {}", cut(&error, 300)));
+    audit::record(&ctx.st.db, "lead", "lead.commit", "error", json!({ "task": lead.task, "error": error, "files": files }));
+    let said = match kind {
+        gitops::CommitFailure::NeedsUser => format!("Git 사용자 정보 또는 서명 설정(user.name, user.email, GPG) 문제로 커밋에 실패했습니다. 변경 사항은 메인 폴더에 그대로 유지되며, 설정을 수정해 주시면 다음 커밋에 함께 반영됩니다.
+{error}", error = error),
+        gitops::CommitFailure::Busy => format!("다른 Git 프로세스가 저장소를 계속 점유하고 있어 커밋 시도가 여러 차례 실패했습니다. 변경 사항은 메인 폴더에 안전하게 보관되니, 다른 Git 도구를 닫거나 남아 있는 index.lock 파일을 삭제해 주시면 다음 커밋에 반영하겠습니다.
+{error}", error = error),
+        gitops::CommitFailure::Fixable => format!("Git 커밋이 거부되어 원인 해결을 시도했으나 정상적으로 완료되지 않았습니다. 변경 사항은 메인 폴더에 유지되어 다음 커밋에 포함되니, 아래 오류 내용을 확인하시거나 새로운 지시를 전달해 주세요.
+{error}", error = error),
+    };
+    emit(&ctx.app, "lead:said", json!({ "taskId": lead.task, "text": said }));
+    lead.remember("총괄", &said);
+}
+
+/// lead_work as a boxed future: consult_lead spawns it and lead_work awaits consult_lead, so the type must be erased here.
+fn lead_work_owned(ctx: Ctx, work: String, stop: CancellationToken) -> futures_util::future::BoxFuture<'static, ()> {
+    Box::pin(async move { lead_work(&ctx, work, &stop).await })
 }
 
 /// 총괄이 메인 폴더에서 직접 일한다(사용자 지시나 총괄 자신의 판단). 끝나면 바뀐 파일을 커밋한다.
@@ -469,10 +725,23 @@ pub async fn lead_work(ctx: &Ctx, work: String, stop: &CancellationToken) {
         Some(r) => Some(dirty_now(r).await),
         None => None,
     };
-    let o = lead_work_run(ctx, lead::direct_work_prompt(&lead.context(), &work), stop).await;
+    let mut o = lead_work_run(ctx, lead::direct_work_prompt(&lead.context(), &work), stop).await;
+    // A failed run is retried: workers may be waiting on this work, and nothing else would pick it up.
+    for wait in WORK_RETRY_WAITS {
+        if o.ok || stop.is_cancelled() {
+            break;
+        }
+        let error = o.error.clone().unwrap_or_default();
+        note(ctx, "warn", format!("직접 작업 실패: {error} - {secs}초 후 자동으로 다시 시도합니다.", error = cut(&error, 200), secs = wait.as_secs()));
+        if !pause(wait, stop).await {
+            break;
+        }
+        o = lead_work_run(ctx, lead::work_retry_prompt(&lead.context(), &work, &cut(&error, 1000)), stop).await;
+    }
     let (plan, clean) = lead::parse_commit(&o.text);
     if !clean.trim().is_empty() {
         emit(&ctx.app, "lead:said", json!({ "taskId": lead.task, "text": cut(clean.trim(), 1500) }));
+        lead.remember("총괄", &clean);
     }
     if !o.ok {
         note(ctx, "warn", format!("직접 작업 실패: {}", o.error.as_deref().unwrap_or("-")));
@@ -481,6 +750,28 @@ pub async fn lead_work(ctx: &Ctx, work: String, stop: &CancellationToken) {
         if !stop.is_cancelled() {
             commit_changes(ctx, &repo, &before, plan, &format!("chore: {}", cut(&work, 60))).await;
         }
+    }
+    drop(_main);
+    if o.ok {
+        lead.work_failures.store(0, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    if stop.is_cancelled() {
+        return;
+    }
+    // Still failing: tell the user, and let the lead choose another way (a worker, smaller steps) a limited number of times.
+    let error = cut(o.error.as_deref().unwrap_or("-"), 600);
+    let failures = lead.work_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let said = format!("메인 폴더에서 진행한 직접 작업({work})이 자동 재시도 후에도 완료되지 못했습니다. 다른 방법으로 해결을 시도할 예정이며, 원하시는 처리 방향이 있다면 지시를 보내주세요.
+{error}", work = cut(&work, 120), error = error);
+    emit(&ctx.app, "lead:said", json!({ "taskId": lead.task, "text": said }));
+    lead.remember("총괄", &said);
+    if failures <= WORK_FAILURE_CONSULTS {
+        let event = format!("재시도 후에도 직접 작업 수행에 실패했습니다.
+작업: {work}
+오류: {error}
+해당 작업을 기다리도록 배정된 워커들이 여전히 대기 중이므로, 지금 다른 방식(워커에게 작업을 위임하거나 잘게 나누어 재시도)을 선택하고 대기 중인 워커들에게 전달하십시오.", work = cut(&work, 1500), error = error);
+        consult_lead(ctx, event, None, stop).await;
     }
 }
 
@@ -532,14 +823,28 @@ pub fn answer_question(app: &AppHandle, st: &AppState, id: &str, text: String, a
 pub async fn consult_lead(ctx: &Ctx, mut event: String, requester: Option<&str>, stop: &CancellationToken) {
     let lead = &ctx.lead;
     note(ctx, "consult", cut(&event, 200));
+    // An answer that is not the JSON asked for would drop the event, so it is asked once more.
+    let mut reformat = false;
     for _ in 0..3 {
-        let Some(text) = lead_call(ctx, lead::actions_prompt(&lead.context(), &event), stop).await else { return };
-        let Ok(a) = lead::parse_actions(&text) else {
-            emit(&ctx.app, "lead:said", json!({ "taskId": lead.task, "text": text }));
-            return;
+        let prompt = lead::actions_prompt(&lead.context(), &event);
+        let prompt = if reformat { format!("{prompt}\n\n{}", lead::ACTIONS_AGAIN) } else { prompt };
+        let Some(text) = lead_call(ctx, prompt, stop).await else { return };
+        let a = match lead::parse_actions(&text) {
+            Ok(a) => a,
+            Err(_) if !reformat => {
+                reformat = true;
+                continue;
+            }
+            Err(_) => {
+                emit(&ctx.app, "lead:said", json!({ "taskId": lead.task, "text": text }));
+                lead.remember("총괄", &text);
+                return;
+            }
         };
+        reformat = false;
         if let Some(r) = a.reply.as_deref().filter(|r| !r.trim().is_empty()) {
             emit(&ctx.app, "lead:said", json!({ "taskId": lead.task, "text": r }));
+            lead.remember("총괄", r);
         }
         for (n, m) in &a.messages {
             if let Some(k) = lead.worker_key(*n) {
@@ -563,7 +868,7 @@ pub async fn consult_lead(ctx: &Ctx, mut event: String, requester: Option<&str>,
         if let Some(w) = a.work.clone() {
             // 직접 작업은 오래 걸릴 수 있으니 따로 돌려 다른 판단을 막지 않는다.
             let (c, s) = (ctx.clone(), stop.clone());
-            tauri::async_runtime::spawn(async move { lead_work(&c, w, &s).await });
+            tauri::async_runtime::spawn(lead_work_owned(c, w, s));
         }
         let Some(asked) = a.ask_user else { return };
         let Some(answer) = ask_user(ctx, &asked, requester, stop).await else { return };
@@ -597,6 +902,27 @@ fn spawn_worker(ctx: &Ctx, s: &lead::Spawn) {
     }
 }
 
+/// Commands kept per task in the log (oldest dropped first).
+const RAN_KEEP: usize = 600;
+
+/// An agent ran a shell command itself: add it to the task's command log next to the lead's reviews.
+pub fn worker_ran(app: &tauri::AppHandle, st: &AppState, task: &str, key: &str, command: &str) {
+    let Some(lead) = st.leads.lock().unwrap_or_else(|p| p.into_inner()).get(task).cloned() else { return };
+    let entry = {
+        let mut ran = lead.ran.lock().unwrap_or_else(|p| p.into_inner());
+        // Some CLIs report the same running step more than once.
+        if ran.last().is_some_and(|l| l["key"] == key && l["command"] == command) {
+            return;
+        }
+        let e = json!({ "id": format!("ran-{}-{}", task, ran.len()), "taskId": task, "key": key, "command": command, "verdict": "ran", "by": "worker", "at": crate::db::now() });
+        ran.push(e.clone());
+        let over = ran.len().saturating_sub(RAN_KEEP);
+        ran.drain(..over);
+        e
+    };
+    emit(app, "lead:decision", entry);
+}
+
 /// 새 워커를 만들지 못했다고 총괄 기록에 남긴다.
 pub fn spawn_refused(ctx: &Ctx, title: &str) {
     note(ctx, "warn", format!("현재 워커가 실행 중이 아니므로 {t} 워커를 생성할 수 없습니다.", t = cut(title, 60)));
@@ -609,6 +935,8 @@ pub fn user_message(ctx: Ctx, text: String, about: Option<String>, direct: bool)
         None => format!("사용자의 전체 지시: {text}"),
     };
     emit(&ctx.app, "lead:user", json!({ "taskId": ctx.lead.task, "text": text, "about": about }));
+    ctx.lead.remember("사용자", &text);
+    crate::afterwork::note(&ctx.lead.task, &text);
     if direct && !ctx.lead.integrating.load(std::sync::atomic::Ordering::Relaxed) {
         let work = match about.as_deref().and_then(|k| worker_label(&ctx.lead, k)) {
             Some(w) => format!("{w}와 관련된 사용자 지시: {text}"),
@@ -861,7 +1189,7 @@ pub fn worker_note(engine: EngineId) -> &'static str {
     } else if engine.resumable() {
         lead::QUEUE_SYSTEM
     } else {
-        lead::NO_WINDOW_SYSTEM
+        lead::NO_WINDOW_NOTE.as_str()
     }
 }
 
@@ -875,7 +1203,7 @@ impl Crew {
     pub fn new(units: usize) -> Self {
         Crew { busy: tokio::sync::watch::channel(units).0 }
     }
-    /// 워커(또는 그룹·이어 쓸 수 없는 워커) 하나가 일을 멈췄다.
+    /// 워커(또는 팀·이어 쓸 수 없는 워커) 하나가 일을 멈췄다.
     pub fn rest(&self) {
         self.busy.send_modify(|n| *n = n.saturating_sub(1));
     }
@@ -922,7 +1250,19 @@ pub async fn run_part_worker(ctx: &Ctx, spec: RunSpec, key: &str, title: &str, b
         let lead = &ctx.lead;
         let slot = orchestrator::agent_slot(&lead.task, key);
         let stop = ctx.st.agent_stops.lock().unwrap_or_else(|p| p.into_inner()).get(&slot).cloned().unwrap_or_else(|| lead.cancel.clone());
-        let o = orchestrator::run_engine_as(&ctx.app, &ctx.st, &lead.conv, &lead.task, &lead.mid, "agent", spec, budget, &stop, false, key).await;
+        let cwd = spec.cwd.clone();
+        let mut o = orchestrator::run_engine_as(&ctx.app, &ctx.st, &lead.conv, &lead.task, &lead.mid, "agent", spec, budget, &stop, false, key).await;
+        // This engine cannot take results back, so the window tests it asked for run now (the stage waits for them)
+        // and their results go to the lead and the integrator.
+        let parsed = lead::parse_requests(&o.text);
+        if !parsed.requests.is_empty() {
+            o.text = parsed.clean;
+            if o.ok && !stop.is_cancelled() {
+                let results = run_asked_tests(ctx, key, &cwd, parsed.requests, &stop).await;
+                let who = worker_label(lead, key).unwrap_or_else(|| title.to_string());
+                report_tests(ctx, &who, &results, false, &stop).await;
+            }
+        }
         if let Some(c) = crew {
             if o.ok && !stop.is_cancelled() {
                 checkpoint(ctx, key, &o.text).await;
@@ -934,13 +1274,13 @@ pub async fn run_part_worker(ctx: &Ctx, spec: RunSpec, key: &str, title: &str, b
     }
 }
 
-/// 그룹 라운드 상한
+/// 팀 라운드 상한
 const MAX_ROUNDS: u32 = 12;
-/// 다른 그룹원에게 전하는 새 글 하나의 최대 글자 수
+/// 다른 팀원에게 전하는 새 글 하나의 최대 글자 수
 const GROUP_NOTE_CHARS: usize = 1200;
-/// 세션을 이어 쓸 수 없는 그룹원에게 다시 주는, 이미 본 글 하나의 최대 글자 수
+/// 세션을 이어 쓸 수 없는 팀원에게 다시 주는, 이미 본 글 하나의 최대 글자 수
 const GROUP_OLD_CHARS: usize = 240;
-/// 그룹장이 나눈 역할 분담의 최대 글자 수
+/// 팀장이 나눈 역할 분담의 최대 글자 수
 const GROUP_PLAN_CHARS: usize = 2000;
 /// 팀장 보고 하나의 최대 글자 수
 const ORG_POST_CHARS: usize = 500;
@@ -970,7 +1310,7 @@ fn next_round(members: &[MemberState], round: u32, cap: u32) -> RoundPlan {
     RoundPlan { run: if free.is_empty() { open } else { free }, finished: false }
 }
 
-/// 첫 라운드는 그룹장 혼자 역할을 나눈다(그룹원마다 역할만 제안하는 차례를 아낀다). 그룹장이 없으면 모두가 제안한다.
+/// 첫 라운드는 팀장 혼자 역할을 나눈다(팀원마다 역할만 제안하는 차례를 아낀다). 팀장이 없으면 모두가 제안한다.
 fn first_round(members: &[MemberState], round: u32, cap: u32) -> RoundPlan {
     if round == 0 && members.first().is_some_and(|m| m.alive) {
         RoundPlan { run: vec![0], finished: false }
@@ -979,7 +1319,7 @@ fn first_round(members: &[MemberState], round: u32, cap: u32) -> RoundPlan {
     }
 }
 
-/// 그룹 블록이 없거나 읽을 수 없으면 다시 쓰게 하고, 두 번 연속이면 끝낸 것으로 본다. (글, 이번에 놓쳤는지)
+/// 팀 블록이 없거나 읽을 수 없으면 다시 쓰게 하고, 두 번 연속이면 끝낸 것으로 본다. (글, 이번에 놓쳤는지)
 fn note_or_miss(note: Option<lead::GroupNote>, clean: String, misses: &mut u32) -> (lead::GroupNote, bool) {
     match note {
         Some(n) => {
@@ -999,7 +1339,7 @@ fn group_followup(others: &[(String, String)], held: bool) -> String {
     group_followup_with(others, held, false)
 }
 
-/// 멈춘 그룹원을 뺀다. 라운드 사이에 눌러도 다음 라운드부터 빠진다.
+/// 멈춘 팀원을 뺀다. 라운드 사이에 눌러도 다음 라운드부터 빠진다.
 fn drop_stopped(state: &mut [MemberState], stops: &[CancellationToken]) {
     for (m, s) in state.iter_mut().zip(stops) {
         if s.is_cancelled() {
@@ -1023,13 +1363,13 @@ fn update_notices(notices: &mut [bool], ran: &[usize], clashes: &[(usize, usize)
 fn group_followup_with(others: &[(String, String)], held: bool, missed: bool) -> String {
     let mut s = String::new();
     if !others.is_empty() {
-        s.push_str("[다른 그룹원의 글]\n");
+        s.push_str("[다른 팀원의 글]\n");
         for (who, text) in others {
             s.push_str(&format!("[{who}]\n{}\n\n", cut(text, GROUP_NOTE_CHARS)));
         }
     }
     if held {
-        s.push_str("당신이 맡겠다고 한 파일을 다른 그룹원도 맡았습니다. 이번 차례에는 파일을 고치지 말고 누가 맡을지 정리하세요.\n");
+        s.push_str("당신이 맡겠다고 한 파일을 다른 팀원도 맡았습니다. 이번 차례에는 파일을 고치지 말고 누가 맡을지 정리하세요.\n");
     } else {
         s.push_str("이어서 맡은 일을 하세요.\n");
     }
@@ -1040,7 +1380,7 @@ fn group_followup_with(others: &[(String, String)], held: bool, missed: bool) ->
     s
 }
 
-/// 그룹 기록 한 줄
+/// 팀 기록 한 줄
 struct Said {
     who: usize,
     round: u32,
@@ -1051,31 +1391,31 @@ fn said_label(names: &[String], s: &Said) -> String {
     format!("{} · {}라운드", names[s.who], s.round + 1)
 }
 
-/// 세션을 이어 쓰는 그룹원에게: 아직 보지 못한 다른 그룹원의 글만(이미 본 글을 다시 보내지 않는다)
+/// 세션을 이어 쓰는 팀원에게: 아직 보지 못한 다른 팀원의 글만(이미 본 글을 다시 보내지 않는다)
 fn unseen(log: &[Said], seen: usize, me: usize, names: &[String]) -> Vec<(String, String)> {
     log[seen.min(log.len())..].iter().filter(|s| s.who != me && !s.text.trim().is_empty()).map(|s| (said_label(names, s), s.text.clone())).collect()
 }
 
-/// 세션을 이어 쓸 수 없는 그룹원에게: 지난 기록 전체(자기 글도, 앞 차례를 기억하지 못하므로)를 주되 이미 본 글은 짧게 줄인다.
-/// 그룹장이 나눈 역할 분담(첫 글)은 줄이지 않는다.
+/// 세션을 이어 쓸 수 없는 팀원에게: 지난 기록 전체(자기 글도, 앞 차례를 기억하지 못하므로)를 주되 이미 본 글은 짧게 줄인다.
+/// 팀장이 나눈 역할 분담(첫 글)은 줄이지 않는다.
 fn recap(log: &[Said], seen: usize, names: &[String]) -> Vec<(String, String)> {
     log.iter().enumerate().filter(|(_, s)| !s.text.trim().is_empty()).map(|(k, s)| (said_label(names, s), if k < seen && k > 0 { cut(&s.text, GROUP_OLD_CHARS) } else { s.text.clone() })).collect()
 }
 
-/// 그룹장이 첫 차례에 받는 말
+/// 팀장이 첫 차례에 받는 말
 fn leader_plan_prompt(n: usize) -> String {
-    format!("당신은 그룹원 1이자 그룹장입니다. 이번 차례에는 파일을 고치지 말고, 그룹원 {n}명이 맡을 일과 파일을 겹치지 않게 나누세요. elysium-group 블록의 say에 '그룹원 1: …; 그룹원 2: …' 꼴로 짧게 쓰고, claim에는 당신이 맡을 파일만 쓰세요.")
+    format!("당신은 팀원 1이자 팀장입니다. 이번 차례에는 파일을 고치지 말고, 팀원 {n}명이 맡을 일과 파일을 겹치지 않게 나누세요. elysium-group 블록의 say에 '팀원 1: …; 팀원 2: …' 꼴로 짧게 쓰고, claim에는 당신이 맡을 파일만 쓰세요.")
 }
 
-/// 그룹원의 첫 차례: 그룹장이 나눈 역할이 있으면 그대로 시작하고, 없으면 역할을 제안한다.
+/// 팀원의 첫 차례: 팀장이 나눈 역할이 있으면 그대로 시작하고, 없으면 역할을 제안한다.
 fn member_start_prompt(original: &str, name: &str, plan: Option<&str>) -> String {
     match plan {
-        Some(p) => format!("{original}\n\n[그룹장의 역할 분담]\n{}\n\n당신은 {name}입니다. 분담대로 맡은 일을 하세요. 파일을 고치기 전에 claim에 적으세요.", cut(p, GROUP_PLAN_CHARS)),
-        None => format!("{original}\n\n당신은 {name}입니다. 이번 라운드는 파일을 고치지 말고 그룹에서 맡을 역할과 파일을 elysium-group 블록으로 제안하세요."),
+        Some(p) => format!("{original}\n\n[팀장의 역할 분담]\n{}\n\n당신은 {name}입니다. 분담대로 맡은 일을 하세요. 파일을 고치기 전에 claim에 적으세요.", cut(p, GROUP_PLAN_CHARS)),
+        None => format!("{original}\n\n당신은 {name}입니다. 이번 라운드는 파일을 고치지 말고 팀에서 맡을 역할과 파일을 elysium-group 블록으로 제안하세요."),
     }
 }
 
-/// 그룹장이 팀장 보고판에 올릴 글: 그룹장이 쓴 report, 없으면 이번 라운드 그룹원 글을 짧게 모은다.
+/// 팀장이 팀장 보고판에 올릴 글: 팀장이 쓴 report, 없으면 이번 라운드 팀원 글을 짧게 모은다.
 fn team_report(leader_report: &str, said: &[(String, String)]) -> String {
     if !leader_report.trim().is_empty() {
         return cut(leader_report.trim(), ORG_POST_CHARS);
@@ -1084,7 +1424,7 @@ fn team_report(leader_report: &str, said: &[(String, String)]) -> String {
     cut(&all, ORG_POST_CHARS)
 }
 
-/// 그룹이 끝난 뒤 통합 AI에게 넘길 요약: 그룹원마다 마지막 글과 맡은 파일(요약만 쓰게 하는 차례를 아낀다)
+/// 팀이 끝난 뒤 통합 AI에게 넘길 요약: 팀원마다 마지막 글과 맡은 파일(요약만 쓰게 하는 차례를 아낀다)
 fn group_digest(names: &[String], last: &[String], claims: &[BTreeSet<String>]) -> String {
     names
         .iter()
@@ -1098,14 +1438,14 @@ fn group_digest(names: &[String], last: &[String], claims: &[BTreeSet<String>]) 
         .join("\n")
 }
 
-/// 워커 여럿이 한 하위 작업을 대화하며 함께 한다. 첫 라운드는 그룹장이 역할을 나누고, 끝나면 그룹원의 마지막 글로 결과를 정리한다.
+/// 워커 여럿이 한 하위 작업을 대화하며 함께 한다. 첫 라운드는 팀장이 역할을 나누고, 끝나면 팀원의 마지막 글로 결과를 정리한다.
 pub async fn run_group(ctx: &Ctx, index: usize, title: &str, members: Vec<(String, RunSpec)>, budget: Duration) -> Outcome {
     let mut specs: Vec<RunSpec> = members.iter().map(|(_, s)| s.clone()).collect();
     let keys: Vec<String> = members.iter().map(|(k, _)| k.clone()).collect();
     let n = keys.len();
-    let names: Vec<String> = (0..n).map(|m| format!("그룹원 {}", m + 1)).collect();
+    let names: Vec<String> = (0..n).map(|m| format!("팀원 {}", m + 1)).collect();
     let mut state = vec![MemberState { alive: true, done: false, held: false }; n];
-    // 라운드 사이에도 멈추거나 메시지를 받도록 그룹이 끝날 때까지 등록해 둔다.
+    // 라운드 사이에도 멈추거나 메시지를 받도록 팀이 끝날 때까지 등록해 둔다.
     let slots: Vec<String> = keys.iter().map(|k| orchestrator::agent_slot(&ctx.lead.task, k)).collect();
     let registered: Vec<(CancellationToken, bool)> = slots.iter().map(|s| register_line(&ctx.st.agent_stops, &ctx.st.agent_inboxes, s, &ctx.lead.cancel)).collect();
     let stops: Vec<CancellationToken> = registered.iter().map(|(t, _)| t.clone()).collect();
@@ -1116,12 +1456,14 @@ pub async fn run_group(ctx: &Ctx, index: usize, title: &str, members: Vec<(Strin
     let mut merged = Outcome { ok: true, ..Default::default() };
     let originals: Vec<String> = specs.iter().map(|s| s.prompt.clone()).collect();
     let mut log: Vec<Said> = vec![];
-    // 그룹원마다 지금까지 받은 기록의 길이
+    // 팀원마다 지금까지 받은 기록의 길이
     let mut seen = vec![0usize; n];
     let mut started = vec![false; n];
     let mut last_say = vec![String::new(); n];
     let mut claims: Vec<BTreeSet<String>> = vec![BTreeSet::new(); n];
     let mut plan: Option<String> = None;
+    // Note for members who must take over a teammate's share (put in front of their next turn).
+    let mut handover: Vec<Option<String>> = vec![None; n];
     let board = org_board(ctx);
     let part = board.as_ref().and_then(|b| b.part_of(&keys[0]));
     let mut round = 0;
@@ -1142,12 +1484,15 @@ pub async fn run_group(ctx: &Ctx, index: usize, title: &str, members: Vec<(Strin
             } else {
                 format!("{}\n\n{}", originals[i], group_followup_with(&recap(&log, seen[i], &names), notices[i], missed[i]))
             };
-            // 조직: 그룹장은 다른 팀장의 새 보고를 함께 받는다.
+            // 조직: 팀장은 다른 팀장의 새 보고를 함께 받는다.
             if let (true, Some(b), Some(p)) = (i == leader && started[i], &board, part) {
                 let posts = b.take(p);
                 if !posts.is_empty() {
                     specs[i].prompt = format!("{}\n{}", board_prompt(&posts), specs[i].prompt);
                 }
+            }
+            if let Some(h) = handover[i].take() {
+                specs[i].prompt = format!("{h}\n\n{}", specs[i].prompt);
             }
             started[i] = true;
             seen[i] = log.len();
@@ -1158,12 +1503,17 @@ pub async fn run_group(ctx: &Ctx, index: usize, title: &str, members: Vec<(Strin
         });
         let outs = futures_util::future::join_all(runs).await;
         let mut said: Vec<(usize, lead::GroupNote)> = vec![];
+        // Members that failed (not stopped) before finishing: their share goes to the others.
+        let mut dropped: Vec<usize> = vec![];
         for (i, o) in outs {
             let (note, clean) = lead::parse_group(&o.text);
             if let Some(s) = &o.session_id {
                 specs[i].resume = Some(s.clone());
             }
             merged = merge_outcome(merged, &Outcome { text: String::new(), ok: true, error: None, ..o.clone() });
+            if !o.ok && !state[i].done && !stops[i].is_cancelled() && !ctx.lead.cancel.is_cancelled() {
+                dropped.push(i);
+            }
             state[i].alive = o.ok;
             let (note, miss) = note_or_miss(note, clean, &mut misses[i]);
             missed[i] = miss;
@@ -1181,7 +1531,7 @@ pub async fn run_group(ctx: &Ctx, index: usize, title: &str, members: Vec<(Strin
             log.push(Said { who: i, round, text: note.say.clone() });
             said.push((i, note));
         }
-        // 조직: 그룹장이 이번 라운드에 일했으면 팀 상황을 다른 팀장에게 올린다.
+        // 조직: 팀장이 이번 라운드에 일했으면 팀 상황을 다른 팀장에게 올린다.
         if let (Some(b), Some(p), Some((_, ln))) = (&board, part, said.iter().find(|(i, _)| *i == leader)) {
             let all: Vec<(String, String)> = said.iter().map(|(i, x)| (names[*i].clone(), x.say.clone())).collect();
             org_post(ctx, b, p, &team_report(&ln.report, &all));
@@ -1192,10 +1542,19 @@ pub async fn run_group(ctx: &Ctx, index: usize, title: &str, members: Vec<(Strin
         for (i, m) in state.iter_mut().enumerate() {
             m.held = held.contains(&i);
         }
+        if let Some(text) = handover_note(&dropped, &names, &claims) {
+            note(ctx, "warn", format!("'{title}': {}", cut(&text, 200)));
+            for (i, m) in state.iter_mut().enumerate() {
+                if m.alive {
+                    m.done = false;
+                    handover[i] = Some(text.clone());
+                }
+            }
+        }
         let joined: String = said.iter().map(|(i, n)| format!("{}: {}\n", names[*i], cut(&n.say, GROUP_NOTE_CHARS))).collect();
-        // 그룹장 혼자 역할을 나눈 첫 라운드는 막힐 일이 없어 묻지 않는다.
+        // 팀장 혼자 역할을 나눈 첫 라운드는 막힐 일이 없어 묻지 않는다.
         if !(round == 0 && now.run == [0]) && judge_blocked(ctx, "group", title, &joined).await.is_some_and(|p| p >= JEV_BLOCKED) {
-            consult_lead(ctx, format!("그룹 '{title}'이 막힌 것으로 보입니다. 최근 대화:\n{joined}"), None, &ctx.lead.cancel).await;
+            consult_lead(ctx, format!("팀 '{title}'이 막힌 것으로 보입니다. 최근 대화:\n{joined}"), None, &ctx.lead.cancel).await;
         }
         round += 1;
     }
@@ -1207,20 +1566,36 @@ pub async fn run_group(ctx: &Ctx, index: usize, title: &str, members: Vec<(Strin
     drop_stopped(&mut state, &stops);
     let Some(writer) = state.iter().position(|m| m.alive) else {
         merged.ok = false;
-        merged.error = Some("그룹원이 모두 실패했습니다".to_string());
+        merged.error = Some("팀원이 모두 실패했습니다".to_string());
         return merged;
     };
-    // 그룹원이 남긴 마지막 글로 정리한다. 아무도 글을 남기지 않았을 때만 한 번 더 묻는다.
+    // Members still working when the rounds ran out: the integrator must know this part is not done.
+    let unfinished = state.iter().any(|m| m.alive && !m.done);
+    let tail = if unfinished { format!("\n\n{} {GROUP_CAP_LEFT}", lead::LEFT_MARK) } else { String::new() };
+    // 팀원이 남긴 마지막 글로 정리한다. 아무도 글을 남기지 않았을 때만 한 번 더 묻는다.
     let digest = group_digest(&names, &last_say, &claims);
     if !digest.is_empty() {
-        merged.text = digest;
+        merged.text = format!("{digest}{tail}");
         return merged;
     }
     let mut spec = specs[writer].clone();
-    spec.prompt = "그룹 작업이 끝났습니다. 그룹 전체가 바꾼 파일과 다른 AI가 알아야 할 것을 짧게 요약하세요. 이번에는 elysium-group 블록을 쓰지 마세요.".to_string();
+    spec.prompt = "팀 작업이 끝났습니다. 팀 전체가 바꾼 파일과 다른 AI가 알아야 할 것을 짧게 요약하세요. 이번에는 elysium-group 블록을 쓰지 마세요.".to_string();
     let o = run_part_worker(ctx, spec, &keys[writer], title, budget, false, None).await;
     let (_, clean) = lead::parse_group(&o.text);
-    merge_outcome(merged, &Outcome { text: clean, ..o })
+    let mut out = merge_outcome(merged, &Outcome { text: clean, ..o });
+    out.text.push_str(&tail);
+    out
+}
+
+/// What the remaining members are told when teammates drop out with an error. None when nobody dropped out.
+fn handover_note(dropped: &[usize], names: &[String], claims: &[BTreeSet<String>]) -> Option<String> {
+    if dropped.is_empty() {
+        return None;
+    }
+    let who = dropped.iter().map(|i| names[*i].as_str()).collect::<Vec<_>>().join(", ");
+    let files: BTreeSet<&str> = dropped.iter().flat_map(|i| claims[*i].iter().map(String::as_str)).collect();
+    let files = if files.is_empty() { "-".to_string() } else { files.into_iter().collect::<Vec<_>>().join(", ") };
+    Some(HANDOVER.replace("{who}", &who).replace("{files}", &files))
 }
 
 /// 팀장 보고판: 같은 부서의 팀장끼리 짧은 보고를 주고받는다. 보고는 받는 쪽이 어차피 일하는 다음 차례 앞에 붙고,
@@ -1332,7 +1707,7 @@ pub struct WorkerOpts<'a> {
     pub budget: Duration,
     /// true면 명령 요청도 검토해 실행한다(명령이 막힌 워커). false면 창 테스트 요청만 받는다.
     pub reviewed: bool,
-    /// 차례가 끝날 때 JEV에게 막혔는지 묻는다. 그룹은 라운드마다 따로 묻는다.
+    /// 차례가 끝날 때 JEV에게 막혔는지 묻는다. 팀은 라운드마다 따로 묻는다.
     pub check_drift: bool,
     /// 있으면 차례를 끝낸 뒤에도 단계가 끝날 때까지 메시지를 기다린다.
     pub crew: Option<&'a Crew>,
@@ -1345,7 +1720,7 @@ struct WorkerLine<'a> {
     owned: bool,
 }
 
-/// 멈춤 토큰과 메시지 칸을 등록한다. 그룹이 먼저 잡아 두었으면 그것을 같이 쓴다. (토큰, 이 호출이 등록했는지)
+/// 멈춤 토큰과 메시지 칸을 등록한다. 팀이 먼저 잡아 두었으면 그것을 같이 쓴다. (토큰, 이 호출이 등록했는지)
 fn register_line(stops: &Mutex<HashMap<String, CancellationToken>>, inboxes: &Mutex<HashMap<String, Vec<String>>>, slot: &str, parent: &CancellationToken) -> (CancellationToken, bool) {
     let mut s = stops.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(t) = s.get(slot) {
@@ -1395,8 +1770,12 @@ pub async fn run_worker(ctx: &Ctx, mut spec: RunSpec, opts: WorkerOpts<'_>) -> O
     let mut merged = Outcome::default();
     let mut pending: Vec<PendingTest> = vec![];
     let mut resting = false;
+    let mut nudges = 0u32;
     let wait_note = |note: &str| emit(&ctx.app, "task:agent-wait", json!({ "taskId": lead.task, "key": opts.key, "note": note }));
-    for turn in 0..MAX_TURNS {
+    let max_turns = lead.max_turns.load(std::sync::atomic::Ordering::Relaxed).max(1);
+    let original = spec.prompt.clone();
+    let mut retries = 0u32;
+    for turn in 0..max_turns {
         if lead.holds.held(opts.key) {
             wait_note("question");
             lead.holds.wait(opts.key, &stop).await;
@@ -1410,7 +1789,22 @@ pub async fn run_worker(ctx: &Ctx, mut spec: RunSpec, opts: WorkerOpts<'_>) -> O
         }
         let o = orchestrator::run_engine_as(&ctx.app, st, &lead.conv, &lead.task, &lead.mid, opts.role, spec.clone(), opts.budget, &stop, opts.stream, opts.key).await;
         let parsed = lead::parse_requests(&o.text);
+        if !parsed.requests.is_empty() {
+            nudges = 0;
+        }
         merged = merge_outcome(merged, &Outcome { text: parsed.clean.clone(), ..o.clone() });
+        // A failed turn (rate limit, crash, network) would otherwise drop the whole part: continue it once more.
+        if !o.ok && !stop.is_cancelled() && retries < WORKER_RETRIES && turn + 1 < max_turns {
+            retries += 1;
+            let label = worker_label(lead, opts.key).unwrap_or_else(|| opts.title.to_string());
+            note(ctx, "warn", WORKER_RETRY_NOTE.replace("{worker}", &label).replace("{error}", &cut(o.error.as_deref().unwrap_or("-"), 200)));
+            wait_note("retry");
+            if pause(WORKER_RETRY_WAIT, &stop).await {
+                spec.resume = o.session_id.clone().or_else(|| merged.session_id.clone()).or(spec.resume.take());
+                spec.prompt = if spec.resume.is_some() { WORKER_RETRY.to_string() } else { format!("{original}\n\n{WORKER_RETRY}") };
+                continue;
+            }
+        }
         if stop.is_cancelled() || !o.ok {
             if stop.is_cancelled() {
                 merged.ok = false;
@@ -1470,9 +1864,19 @@ pub async fn run_worker(ctx: &Ctx, mut spec: RunSpec, opts: WorkerOpts<'_>) -> O
         }
         if results.is_empty() {
             // 막혔다면 총괄이 메시지를 보내거나 사용자에게 묻고, 그러면 한 차례 더 돈다.
-            if opts.check_drift && judge_blocked(ctx, "drift", opts.title, &parsed.clean).await.is_some_and(|p| p >= JEV_BLOCKED) {
-                wait_note("review");
-                consult_lead(ctx, format!("워커 '{}'가 막혔거나 계획에서 벗어난 것으로 보입니다. 워커의 마지막 글:\n{}", opts.title, cut(&parsed.clean, 4000)), Some(opts.key), &stop).await;
+            // A worker that only answers "waiting" would pull the lead into a loop of wait messages, so it gets a few consults, then rests.
+            // Work the worker says it left is always handed to the lead, with or without JEV.
+            if opts.check_drift && nudges < MAX_NUDGES {
+                let event = match lead::left_over(&parsed.clean) {
+                    Some(left) => Some(lead::LEFT_EVENT.replace("{title}", opts.title).replace("{left}", &left)),
+                    None if judge_blocked(ctx, "drift", opts.title, &parsed.clean).await.is_some_and(|p| p >= JEV_BLOCKED) => Some(format!("워커 '{}'가 막혔거나 계획에서 벗어난 것으로 보입니다. 워커의 마지막 글:\n{}", opts.title, cut(&parsed.clean, 4000))),
+                    None => None,
+                };
+                if let Some(event) = event {
+                    nudges += 1;
+                    wait_note("review");
+                    consult_lead(ctx, event, Some(opts.key), &stop).await;
+                }
             }
             let mut mail = has_mail(st, &slot);
             // 끝낸 뒤에 총괄·사용자가 보낸 지시도 받도록, 같은 단계의 다른 워커가 일하는 동안 기다린다.
@@ -1495,8 +1899,9 @@ pub async fn run_worker(ctx: &Ctx, mut spec: RunSpec, opts: WorkerOpts<'_>) -> O
             }
             results.push("위 메시지를 반영해 이어 가세요.".to_string());
         }
-        if turn + 1 == MAX_TURNS {
-            merged.text.push_str("\n\n(차례 수 상한에 닿아 여기서 멈췄습니다.)");
+        if turn + 1 == max_turns {
+            // Marked as left over so the integrator finishes it instead of taking it as done.
+            merged.text.push_str(&format!("\n\n{} {TURN_CAP_LEFT}", lead::LEFT_MARK));
             break;
         }
         spec.resume = merged.session_id.clone().or(spec.resume.take());
@@ -1579,7 +1984,7 @@ impl StageGate {
     }
 }
 
-/// 워커(또는 그룹)가 바꾼 파일을 메인 폴더에 반영하고, 저장소면 총괄이 검토·보정해 커밋한다.
+/// 워커(또는 팀)가 바꾼 파일을 메인 폴더에 반영하고, 저장소면 총괄이 검토·보정해 커밋한다.
 /// 메인 폴더 파일이 워커가 본 판과 다르면 덮지 않고 충돌로 넘긴다(총괄이 검토에서 합치거나 통합 AI가 합친다).
 pub async fn checkpoint(ctx: &Ctx, key: &str, summary: &str) {
     let lead = &ctx.lead;
@@ -1655,6 +2060,37 @@ pub async fn checkpoint(ctx: &Ctx, key: &str, summary: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handover_names_dropped_members_and_their_files() {
+        let names: Vec<String> = (1..=3).map(|i| format!("팀원 {i}")).collect();
+        let claims = vec![BTreeSet::from(["a.rs".to_string()]), BTreeSet::from(["b.rs".to_string(), "c.rs".to_string()]), BTreeSet::new()];
+        assert_eq!(handover_note(&[], &names, &claims), None);
+        let t = handover_note(&[1], &names, &claims).unwrap();
+        assert!(t.contains("팀원 2") && t.contains("b.rs, c.rs") && !t.contains("a.rs") && !t.contains('{'), "{t}");
+        let t = handover_note(&[2], &names, &claims).unwrap();
+        assert!(t.contains("팀원 3") && t.contains('-'), "{t}");
+    }
+
+    #[test]
+    fn only_tests_that_ran_and_failed_need_a_fix() {
+        assert!(test_failed("[명령 실패] gradlew runGameTest\nexit 1"));
+        assert!(test_failed("[창 테스트 오류] join"));
+        assert!(!test_failed("[명령 성공] gradlew runGameTest"));
+        assert!(!test_failed("[창 테스트 취소] x\n사용자가 이 테스트를 껐습니다"));
+        assert!(!test_failed("[요청 거부] cargo build"));
+        assert!(TESTS_EVENT.contains("{who}") && TESTS_EVENT.contains("{results}"));
+    }
+
+    #[test]
+    fn worker_texts_keep_their_tokens() {
+        assert!(WORKER_RETRY_NOTE.contains("{worker}") && WORKER_RETRY_NOTE.contains("{error}"));
+        assert!(HANDOVER.contains("{who}") && HANDOVER.contains("{files}") && HANDOVER.contains("claim"));
+        // Appended after LEFT_MARK: must read as real leftover work.
+        for t in [TURN_CAP_LEFT, GROUP_CAP_LEFT] {
+            assert!(lead::left_over(&format!("요약\n\n{} {t}", lead::LEFT_MARK)).is_some(), "{t}");
+        }
+    }
 
     #[test]
     fn results_prompt_lists_each_command() {
@@ -1774,19 +2210,34 @@ mod tests {
     }
 
     #[test]
+    fn lead_context_is_rebuilt_small_and_keeps_recent_talk() {
+        let lead = lead_for_test();
+        for i in 0..30 {
+            lead.decisions.lock().unwrap().push(json!({ "command": format!("cmd-{i} {}", "x".repeat(400)), "verdict": "once" }));
+        }
+        for i in 0..9 {
+            lead.remember("사용자", &format!("말 {i} {}", "가".repeat(600)));
+        }
+        let c = lead.context();
+        assert!(c.contains("cmd-29") && !c.contains("cmd-19 "), "최근 판단만");
+        assert!(c.contains("말 8") && !c.contains("말 2 "), "최근 대화만");
+        assert!(c.chars().count() < REQUEST_CHARS + 6000, "{}", c.chars().count());
+    }
+
+    #[test]
     fn leader_plans_alone_in_the_first_round() {
         let all = [m(true, false, false), m(true, false, false), m(true, false, false)];
-        assert_eq!(first_round(&all, 0, 12).run, vec![0], "첫 라운드는 그룹장만");
+        assert_eq!(first_round(&all, 0, 12).run, vec![0], "첫 라운드는 팀장만");
         assert_eq!(first_round(&all, 1, 12).run, vec![0, 1, 2]);
         let no_leader = [m(false, false, false), m(true, false, false)];
-        assert_eq!(first_round(&no_leader, 0, 12).run, vec![1], "그룹장이 없으면 남은 그룹원이 제안한다");
-        assert!(member_start_prompt("일", "그룹원 2", Some("그룹원 2: b.rs")).contains("b.rs"));
-        assert!(member_start_prompt("일", "그룹원 2", None).contains("제안"));
+        assert_eq!(first_round(&no_leader, 0, 12).run, vec![1], "팀장이 없으면 남은 팀원이 제안한다");
+        assert!(member_start_prompt("일", "팀원 2", Some("팀원 2: b.rs")).contains("b.rs"));
+        assert!(member_start_prompt("일", "팀원 2", None).contains("제안"));
     }
 
     #[test]
     fn members_get_only_what_they_have_not_seen() {
-        let names: Vec<String> = (1..=3).map(|i| format!("그룹원 {i}")).collect();
+        let names: Vec<String> = (1..=3).map(|i| format!("팀원 {i}")).collect();
         let log = vec![Said { who: 0, round: 0, text: "분담".into() }, Said { who: 1, round: 1, text: "a 끝".into() }, Said { who: 2, round: 1, text: String::new() }, Said { who: 0, round: 1, text: "b 시작".into() }];
         assert_eq!(unseen(&log, 1, 1, &names).iter().map(|x| x.1.as_str()).collect::<Vec<_>>(), vec!["b 시작"], "자기 글·빈 글·이미 본 글은 뺀다");
         let plan = Said { who: 0, round: 0, text: "분".repeat(GROUP_OLD_CHARS + 100) };
@@ -1800,10 +2251,10 @@ mod tests {
 
     #[test]
     fn group_ends_with_a_digest_instead_of_another_turn() {
-        let names: Vec<String> = vec!["그룹원 1".into(), "그룹원 2".into()];
+        let names: Vec<String> = vec!["팀원 1".into(), "팀원 2".into()];
         let claims = vec![BTreeSet::from(["a.rs".to_string()]), BTreeSet::new()];
         let d = group_digest(&names, &["a 완료".into(), String::new()], &claims);
-        assert_eq!(d, "- 그룹원 1 (파일: a.rs): a 완료");
+        assert_eq!(d, "- 팀원 1 (파일: a.rs): a 완료");
         assert!(group_digest(&names, &[String::new(), String::new()], &claims).is_empty());
     }
 
@@ -1818,7 +2269,7 @@ mod tests {
         assert!(b.take(1).is_empty(), "한 번 받은 보고는 다시 주지 않는다");
         assert!(b.take(0).is_empty(), "자기 보고는 받지 않는다");
         assert!(board_prompt(&[("화면".into(), "x".into())]).contains("- 화면: x"));
-        assert_eq!(team_report("", &[("그룹원 1".into(), "a".into()), ("그룹원 2".into(), String::new())]), "그룹원 1: a");
+        assert_eq!(team_report("", &[("팀원 1".into(), "a".into()), ("팀원 2".into(), String::new())]), "팀원 1: a");
         assert_eq!(team_report("요약", &[]), "요약");
     }
 
@@ -1859,7 +2310,7 @@ mod tests {
         let (group_stop, group_owned) = register_line(&stops, &inboxes, "t/k", &parent);
         assert!(group_owned);
         let (member_stop, owned) = register_line(&stops, &inboxes, "t/k", &parent);
-        assert!(!owned, "그룹이 잡아 둔 등록은 워커가 지우지 않는다");
+        assert!(!owned, "팀이 잡아 둔 등록은 워커가 지우지 않는다");
         member_stop.cancel();
         assert!(group_stop.is_cancelled(), "같은 토큰이어야 라운드 사이에도 멈춘다");
     }
@@ -1899,7 +2350,7 @@ mod tests {
             scope.token.clone()
         };
         assert!(token.is_cancelled());
-        assert!(!stop.is_cancelled(), "그룹이 다시 쓰는 워커 토큰은 멀쩡하다");
+        assert!(!stop.is_cancelled(), "팀이 다시 쓰는 워커 토큰은 멀쩡하다");
     }
 
     #[test]
@@ -1927,8 +2378,8 @@ mod tests {
     #[test]
     fn group_followup_carries_others_and_cuts_long_notes() {
         let long = "가".repeat(GROUP_NOTE_CHARS + 50);
-        let p = group_followup(&[("그룹원 2".into(), long)], false);
-        assert!(p.contains("그룹원 2"));
+        let p = group_followup(&[("팀원 2".into(), long)], false);
+        assert!(p.contains("팀원 2"));
         assert_eq!(p.matches('가').count(), GROUP_NOTE_CHARS);
         assert!(group_followup(&[], true).contains("정리"));
     }
@@ -1938,7 +2389,7 @@ mod tests {
         assert!(needs_review(EngineId::Antigravity) && !needs_review(EngineId::Claude));
         assert_eq!(worker_note(EngineId::Antigravity), lead::REQUEST_SYSTEM);
         assert_eq!(worker_note(EngineId::Claude), lead::QUEUE_SYSTEM);
-        assert_eq!(worker_note(EngineId::Codex), lead::NO_WINDOW_SYSTEM);
+        assert_eq!(worker_note(EngineId::Codex), lead::NO_WINDOW_NOTE.as_str());
     }
 
     #[test]

@@ -27,6 +27,10 @@ mod settings;
 mod skills;
 mod store;
 mod teamwork;
+mod terminal;
+mod afterwork;
+mod limits;
+mod resume;
 mod testqueue;
 
 use orchestrator::AppState;
@@ -73,8 +77,12 @@ pub fn run() {
                 agent_inboxes: Mutex::new(HashMap::new()),
                 questions: leadrun::QuestionBoard::default(),
                 bg: bgjobs::Jobs::default(),
+                agent_runs: Mutex::new(HashMap::new()),
             });
+            // Tasks the last run did not finish become "stopped" answers that can be continued.
+            resume::recover(&state);
             app.manage(state.clone());
+            app.manage(terminal::Terminals::default());
             let handle = app.handle().clone();
             state.tests.set_on_change(move |v| orchestrator::emit(&handle, "queue:changed", serde_json::to_value(v).unwrap_or_default()));
             // 지난 실행에서 끝내지 못한 병렬 작업 사본을 지운다(시작할 때는 도는 작업이 없다).
@@ -91,14 +99,27 @@ pub fn run() {
                     }
                 });
             }
-            // 설치된 CLI는 시작할 때 한 번 찾는다(설정에서 다시 찾을 수 있음).
+            // 설치된 CLI: 먼저 실행 파일이 있는지만 보고 바로 쓸 수 있게 하고(수 ms), 버전·모델 목록은 뒤에서 동시에 확인해 화면에 알린다.
+            *state.engines.write().unwrap_or_else(|p| p.into_inner()) = tauri::async_runtime::block_on(engines::detect_quick(&models));
+            let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let found = engines::detect(&models).await;
                 *state.engines.write().unwrap_or_else(|p| p.into_inner()) = found;
+                orchestrator::emit(&handle, "engines:changed", serde_json::json!({}));
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            afterwork::power_cancel,
+            limits::limits_claude,
+            limits::limits_antigravity,
+            limits::limits_codex,
+            resume::chat_continue,
+            commands::tasks_running,
+            terminal::term_open,
+            terminal::term_write,
+            terminal::term_resize,
+            terminal::term_close,
             commands::app_info,
             commands::settings_get,
             commands::settings_update,
@@ -146,6 +167,7 @@ pub fn run() {
             commands::bg_read,
             commands::bg_stop,
             commands::side_ask,
+            commands::work_models,
             commands::cancel_all,
             commands::approval_list,
             commands::approval_decide,

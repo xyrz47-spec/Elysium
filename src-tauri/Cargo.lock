@@ -679,6 +679,12 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "cfg_aliases"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd16c4719339c4530435d38e511904438d07cce7950afa3718a84ac36c10e89e"
+
+[[package]]
+name = "cfg_aliases"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
@@ -1320,6 +1326,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "downcast-rs"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
+
+[[package]]
 name = "dpi"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1390,7 +1402,7 @@ checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 
 [[package]]
 name = "elysium"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "axum",
  "axum-server",
@@ -1400,6 +1412,7 @@ dependencies = [
  "iroh",
  "keyring",
  "local-ip-address",
+ "portable-pty",
  "qrcode",
  "rand 0.8.8",
  "rcgen",
@@ -1432,7 +1445,7 @@ dependencies = [
  "rustc_version",
  "toml 1.1.8+spec-1.1.0",
  "vswhom",
- "winreg",
+ "winreg 0.56.0",
 ]
 
 [[package]]
@@ -1579,6 +1592,17 @@ checksum = "38e2275cc4e4fc009b0669731a1e5ab7ebf11f469eaede2bab9309a5b4d6057f"
 dependencies = [
  "memoffset",
  "rustc_version",
+]
+
+[[package]]
+name = "filedescriptor"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e40758ed24c9b2eeb76c35fb0aebc66c626084edd827e07e1552279814c6682d"
+dependencies = [
+ "libc",
+ "thiserror 1.0.69",
+ "winapi",
 ]
 
 [[package]]
@@ -2584,7 +2608,7 @@ dependencies = [
  "backon",
  "blake3",
  "bytes",
- "cfg_aliases",
+ "cfg_aliases 0.2.2",
  "ctutils",
  "data-encoding",
  "derive_more",
@@ -2651,7 +2675,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7481d0792dde1035a2b06ec06ed3cf6d01fcb1a494e6931b489e32073382048d"
 dependencies = [
  "arc-swap",
- "cfg_aliases",
+ "cfg_aliases 0.2.2",
  "derive_more",
  "iroh-base",
  "n0-dns-resolver",
@@ -2702,7 +2726,7 @@ checksum = "7e5589e7c1475700686603a970275687f760df853bc6525c7eb1347aa31d7230"
 dependencies = [
  "blake3",
  "bytes",
- "cfg_aliases",
+ "cfg_aliases 0.2.2",
  "data-encoding",
  "derive_more",
  "getrandom 0.4.3",
@@ -3281,7 +3305,7 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2ab99dfb861450e68853d34ae665243a88b8c493d01ba957321a1e9b2312bbe"
 dependencies = [
- "cfg_aliases",
+ "cfg_aliases 0.2.2",
  "derive_more",
  "futures-buffered",
  "futures-lite",
@@ -3505,7 +3529,7 @@ checksum = "39da9cad5f23aa43401f09497d3b280e51b5feba115d9ffbf38ca35d6ff95e96"
 dependencies = [
  "atomic-waker",
  "bytes",
- "cfg_aliases",
+ "cfg_aliases 0.2.2",
  "derive_more",
  "ipnet",
  "js-sys",
@@ -3542,13 +3566,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
+name = "nix"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab2156c4fce2f8df6c499cc1c763e4394b7482525bf2a9701c9d79d215f519e4"
+dependencies = [
+ "bitflags 2.13.2",
+ "cfg-if",
+ "cfg_aliases 0.1.1",
+ "libc",
+]
+
+[[package]]
 name = "noq"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6249a065adc1edbc1704a95436f38dd60476064dbc3b7c47cf279e02d1590eb5"
 dependencies = [
  "bytes",
- "cfg_aliases",
+ "cfg_aliases 0.2.2",
  "derive_more",
  "noq-proto",
  "noq-udp",
@@ -3596,7 +3632,7 @@ version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d0160422832eea1cc11c34be04ee6d5a046452b0b46cfb14695d55a1f24c954"
 dependencies = [
- "cfg_aliases",
+ "cfg_aliases 0.2.2",
  "libc",
  "socket2",
  "tracing",
@@ -4237,6 +4273,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "portable-pty"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4a596a2b3d2752d94f51fac2d4a96737b8705dddd311a32b9af47211f08671e"
+dependencies = [
+ "anyhow",
+ "bitflags 1.3.2",
+ "downcast-rs",
+ "filedescriptor",
+ "lazy_static",
+ "libc",
+ "log",
+ "nix",
+ "serial2",
+ "shared_library",
+ "shell-words",
+ "winapi",
+ "winreg 0.10.1",
+]
+
+[[package]]
 name = "portmapper"
 version = "0.19.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4403,7 +4460,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4051e23e9185c255a7e33ef59cdbca87a22d359052eecd22fc6b901fb37d9d11"
 dependencies = [
  "bytes",
- "cfg_aliases",
+ "cfg_aliases 0.2.2",
  "pin-project-lite",
  "quinn-proto",
  "quinn-udp",
@@ -4444,7 +4501,7 @@ version = "0.5.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af66907df18639dcf4db56ca65490cabc4b27a97dbadd96f2926cca73298f016"
 dependencies = [
- "cfg_aliases",
+ "cfg_aliases 0.2.2",
  "libc",
  "once_cell",
  "socket2",
@@ -5231,6 +5288,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serial2"
+version = "0.2.39"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c924c7ef58d1fb741cfecb65b9b38a9e049841edd1e419544089f0cbb5a127e7"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "serialize-to-javascript"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5308,6 +5376,22 @@ checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
 ]
+
+[[package]]
+name = "shared_library"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a9e7e0f2bfae24d8a5b5a66c5b257a83c7412304311512a0c054cd5e619da11"
+dependencies = [
+ "lazy_static",
+ "libc",
+]
+
+[[package]]
+name = "shell-words"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
 
 [[package]]
 name = "shlex"
@@ -7275,6 +7359,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "winreg"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "80d0f4e272c85def139476380b12f9ac60926689dd2e01d4923222f40580869d"
+dependencies = [
+ "winapi",
 ]
 
 [[package]]

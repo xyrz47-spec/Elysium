@@ -14,6 +14,8 @@ const MAX_TURNS: usize = 60;
 const WORK_MAX_TOKENS: u32 = 16000;
 const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", ".venv", "venv", "__pycache__", ".next"];
 const MAX_OUT: usize = 30_000;
+/// 명령 출력은 더 짧게: 결과가 대화에 남아 이후 모든 차례에서 다시 읽힌다(빌드 오류는 대개 끝에 있어 뒤를 더 남긴다).
+pub const CMD_OUT: usize = 12_000;
 
 /// (이름, 설명, 입력 스키마)
 fn tools() -> Vec<(&'static str, &'static str, Value)> {
@@ -113,12 +115,18 @@ fn s<'a>(v: &'a Value, k: &str) -> Result<&'a str, String> {
 }
 
 fn clip(t: &str) -> String {
-    if t.chars().count() <= MAX_OUT {
+    clip_to(t, MAX_OUT)
+}
+
+/// 앞쪽 3분의 1과 뒤쪽 3분의 2를 남긴다(오류와 요약은 대개 끝에 있다).
+fn clip_to(t: &str, max: usize) -> String {
+    let n = t.chars().count();
+    if n <= max {
         return t.to_string();
     }
-    let head: String = t.chars().take(MAX_OUT / 2).collect();
-    let tail: String = t.chars().rev().take(MAX_OUT / 2).collect::<Vec<_>>().into_iter().rev().collect();
-    format!("{head}\n… (중간 생략) …\n{tail}")
+    let head: String = t.chars().take(max / 3).collect();
+    let tail: String = t.chars().skip(n - (max - max / 3)).collect();
+    format!("{head}\n… (중간 {}자 생략) …\n{tail}", n - max)
 }
 
 /// 폴더를 돌며 파일 경로를 모은다(무거운 폴더는 건너뛴다).
@@ -202,7 +210,7 @@ pub(crate) async fn powershell(root: &Path, command: &str, secs: u64) -> Result<
                 text.push_str(&err);
             }
             let code = o.status.code().unwrap_or(-1);
-            let body = format!("종료 코드 {code}\n{}", clip(text.trim()));
+            let body = format!("종료 코드 {code}\n{}", clip_to(text.trim(), CMD_OUT));
             if o.status.success() {
                 Ok(body)
             } else {
@@ -266,7 +274,7 @@ pub(crate) async fn powershell_live(root: &Path, command: &str, secs: u64, on_li
     match waited {
         Ok(Ok(status)) => {
             let code = status.code().unwrap_or(-1);
-            let body = format!("종료 코드 {code}\n{}", clip(body.trim()));
+            let body = format!("종료 코드 {code}\n{}", clip_to(body.trim(), CMD_OUT));
             if status.success() {
                 Ok(body)
             } else {
@@ -274,7 +282,7 @@ pub(crate) async fn powershell_live(root: &Path, command: &str, secs: u64, on_li
             }
         }
         Ok(Err(e)) => Err(format!("PowerShell 실행 실패: {e}")),
-        Err(_) => Err(format!("{secs}초 안에 끝나지 않아 멈췄습니다\n{}", clip(body.trim()))),
+        Err(_) => Err(format!("{secs}초 안에 끝나지 않아 멈췄습니다\n{}", clip_to(body.trim(), CMD_OUT))),
     }
 }
 
@@ -596,6 +604,15 @@ pub async fn run(http: &reqwest::Client, spec: &RunSpec, a: &Api, key: &str, mod
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn command_output_keeps_more_of_the_end() {
+        let t: String = (0..20_000).map(|i| if i % 100 == 99 { '\n' } else { 'a' }).collect::<String>() + "error: 끝";
+        let c = clip_to(&t, CMD_OUT);
+        assert!(c.chars().count() < CMD_OUT + 40 && c.ends_with("error: 끝"), "{}", c.chars().count());
+        assert_eq!(clip_to("짧음", CMD_OUT), "짧음");
+    }
+
     use super::*;
 
     fn sandbox(root: &Path) -> Sandbox {

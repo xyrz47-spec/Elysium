@@ -94,17 +94,6 @@ body {
 .worker-win .worker-out { contain: content; }
 .worker-chunk { display: block; }
 .tools-inner { position: relative; }
-.tools-inner::before {
-  content: "";
-  position: absolute;
-  left: 24px;
-  right: 24px;
-  top: 0;
-  height: 1px;
-  background: var(--aurora-line);
-  opacity: 0.7;
-  pointer-events: none;
-}
 /* 로고는 돌지 않는다. 처리 중에는 별빛이 천천히 숨쉬듯 밝아진다. */
 .dock-logo, .dock-logo.busy, .dock-logo img, .dock-logo.busy img { animation: none; }
 .dock-logo.busy img { animation: logo-glow 2.8s ease-in-out infinite; }
@@ -229,19 +218,24 @@ body {
 .lead-decisions.compact li { flex-wrap: nowrap; }
 .lead-decisions.compact code { font-size: 11px; }
 
-/* ---------- 워커 카드: 일하는 동안 위쪽에 오로라 띠가 흐른다 ---------- */
-.lead-worker { position: relative; overflow: hidden; border-color: var(--panel-edge); }
+/* ---------- 워커 카드: 일하는 동안 위쪽에서 오라가 은은하게 번지고 천천히 숨 쉰다 ---------- */
+.lead-worker { position: relative; overflow: hidden; border-color: var(--panel-edge); isolation: isolate; }
+/* 빛은 글자 뒤(z-index -1)에 깔린다. 위 가장자리는 밝고 아래로 갈수록 사라진다. */
 .lead-worker.run::after {
   content: "";
   position: absolute;
   left: 0;
   right: 0;
   top: 0;
-  height: 2px;
-  background: linear-gradient(90deg, transparent, #78cbb8, #9eead9, #e6fffa, #78cbb8, transparent);
-  background-size: 200% 100%;
-  animation: sheen 2.6s linear infinite;
+  height: 72px;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(60% 46px at 50% 0, rgba(var(--hl-rgb), 0.26), rgba(var(--hl-rgb), 0) 100%),
+    radial-gradient(110% 72px at 50% 0, rgba(var(--accent-rgb), 0.14), rgba(var(--accent-rgb), 0) 100%);
+  animation: aura-breathe 4.8s ease-in-out infinite;
 }
+@keyframes aura-breathe { 0%, 100% { opacity: 0.6; } 50% { opacity: 1; } }
 .lead-worker.ok { border-color: rgba(var(--hl-rgb), 0.25); }
 .lead-worker.fail { border-color: rgba(var(--err-rgb), 0.3); }
 .lead-worker.ok .agent-dot, .lead-member.ok .agent-dot { clip-path: polygon(50% 0, 61% 39%, 100% 50%, 61% 61%, 50% 100%, 39% 61%, 0 50%, 39% 39%); width: 10px; height: 10px; border-radius: 0; background: var(--hl); }
@@ -351,7 +345,11 @@ body {
 .agent-state.st-fail { color: var(--err); background: rgba(var(--err-rgb), 0.12); }
 
 .lead-worker.st-working { border-color: rgba(var(--st-run-rgb), 0.38); }
-.lead-worker.st-working::after { background: linear-gradient(90deg, transparent, rgba(var(--st-run-rgb), 0.9), #d6ecff, rgba(var(--st-run-rgb), 0.9), transparent); background-size: 200% 100%; }
+.lead-worker.st-working::after {
+  background:
+    radial-gradient(60% 46px at 50% 0, rgba(var(--st-run-rgb), 0.3), rgba(var(--st-run-rgb), 0) 100%),
+    radial-gradient(110% 72px at 50% 0, rgba(var(--st-run-rgb), 0.14), rgba(var(--st-run-rgb), 0) 100%);
+}
 .lead-worker.st-waiting { border-color: rgba(var(--st-wait-rgb), 0.3); }
 .lead-worker.st-waiting::after, .lead-worker.st-idle::after { display: none; }
 .lead-worker.st-waiting b { color: var(--muted); }
@@ -509,6 +507,8 @@ button.live-tail:hover, button.live-tail:focus-visible { border-color: rgba(var(
 /* ---- 대화 폭: 넓게(표·코드가 많은 답) ---- */
 :root[data-chat-width="wide"] { --col: min(1400px, calc(100% - 56px)); }
 :root[data-chat-width="wide"] .app.tools-open { --col: min(1400px, calc(100vw - 168px - var(--tools-w, 560px) - 12px - 52px)); }
+:root[data-chat-width="full"] { --col: calc(100% - 40px); }
+:root[data-chat-width="full"] .app.tools-open { --col: calc(100vw - 168px - var(--tools-w, 560px) - 12px - 40px); }
 
 /* ---- 세션 머리: 긴 제목은 말줄임, 작은 상태 구와 글자가 겹치지 않게 ---- */
 .head-title-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -567,3 +567,707 @@ button.live-tail:hover, button.live-tail:focus-visible { border-color: rgba(var(
 .composer-bar .folder-chip { flex: 0 1 auto; min-width: 72px; }
 .composer-bar .folder-chip .pill { min-width: 0; max-width: 100%; }
 .composer-bar .folder-chip .pill-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---------- 워커 카드: 리퀴드 글라스 + 스테인드 글라스 오라(2026-11-05) ----------
+   판: 옅은 유리 위에 모서리마다 색유리 조각(청록·파랑·보라·금빛)이 경계 또렷하게 비친다.
+   테: 다른 유리 판과 같은 모서리 반사선(::before). 상태에 따라 반사선 색이 바뀐다.
+   오라(::after): 작업 중일 때 위에서 여러 색 빛이 번지고 천천히 숨 쉰다. 글자 뒤에 깔린다. */
+:root, :root[data-theme="dark"] { --pane-a: 0.075; --pane-seam: rgba(255, 255, 255, 0.045); --pane-violet: 132, 118, 206; }
+:root[data-theme="light"] { --pane-a: 0.09; --pane-seam: rgba(255, 255, 255, 0.6); --pane-violet: 118, 104, 190; }
+.lead-worker {
+  border: 0;
+  border-radius: 16px;
+  padding: 11px 12px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0) 42%),
+    var(--liquid-strong),
+    var(--lg-ctl, var(--surface));
+  box-shadow: var(--lg-edge), 0 6px 18px rgba(var(--shade-rgb), 0.16);
+}
+.lead-worker::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  border-radius: inherit;
+  padding: 1px;
+  pointer-events: none;
+  background: var(--lg-rim);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
+}
+.lead-worker.st-working::before { background: radial-gradient(160px 80px at 0 0, rgba(var(--st-run-rgb), 0.9), rgba(var(--st-run-rgb), 0) 72%), radial-gradient(160px 80px at 100% 100%, rgba(var(--pane-violet), 0.6), rgba(var(--pane-violet), 0) 72%), linear-gradient(rgba(var(--st-run-rgb), 0.2), rgba(var(--st-run-rgb), 0.2)); }
+.lead-worker.ok::before { background: radial-gradient(160px 80px at 0 0, rgba(var(--hl-rgb), 0.7), rgba(var(--hl-rgb), 0) 72%), linear-gradient(rgba(var(--hl-rgb), 0.16), rgba(var(--hl-rgb), 0.16)); }
+.lead-worker.fail::before { background: radial-gradient(160px 80px at 0 0, rgba(var(--err-rgb), 0.8), rgba(var(--err-rgb), 0) 72%), linear-gradient(rgba(var(--err-rgb), 0.22), rgba(var(--err-rgb), 0.22)); }
+.lead-worker.group::before { background: radial-gradient(200px 90px at 0 0, rgba(var(--accent-rgb), 0.75), rgba(var(--accent-rgb), 0) 72%), radial-gradient(200px 90px at 100% 100%, rgba(var(--gold-rgb), 0.45), rgba(var(--gold-rgb), 0) 72%), linear-gradient(rgba(var(--accent-rgb), 0.16), rgba(var(--accent-rgb), 0.16)); }
+/* 오라: 위쪽 가운데 파랑, 왼쪽 청록, 오른쪽 보라가 겹쳐 색유리에 빛이 비친 듯 번진다 */
+.lead-worker.run::after, .lead-worker.st-working::after {
+  height: 100%;
+  background:
+    radial-gradient(55% 60px at 50% 0, rgba(var(--st-run-rgb), 0.32), rgba(var(--st-run-rgb), 0) 100%),
+    radial-gradient(40% 70px at 12% 0, rgba(var(--hl-rgb), 0.22), rgba(var(--hl-rgb), 0) 100%),
+    radial-gradient(40% 70px at 88% 0, rgba(var(--pane-violet), 0.24), rgba(var(--pane-violet), 0) 100%),
+    radial-gradient(70% 50px at 50% 100%, rgba(var(--st-run-rgb), 0.08), rgba(var(--st-run-rgb), 0) 100%);
+}
+.lead-worker .worker-clock, .lead-worker .agent-role, .lead-worker .card-fold { background: rgba(var(--shade-rgb), 0.14); border-color: transparent; }
+:root[data-theme="light"] .lead-worker .worker-clock, :root[data-theme="light"] .lead-worker .agent-role, :root[data-theme="light"] .lead-worker .card-fold { background: rgba(255, 255, 255, 0.6); }
+.lead-worker .card-fold:hover { background: var(--hover-veil); }
+.lead-worker .live-tail { background: rgba(var(--shade-rgb), 0.18); }
+
+/* ---------- 지금 하는 일: 유리 판에 살짝 들어간 홈(2026-11-05) ----------
+   테두리 상자(입력칸처럼 보이던 것) 대신 옅은 그늘 + 위쪽 안쪽 그림자. 총괄 카드의 점선 상자도 같은 모양. */
+.worker-now, .lead-now {
+  gap: 8px;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 10px;
+  background: rgba(var(--shade-rgb), 0.16);
+  box-shadow: inset 0 1px 2px rgba(var(--shade-rgb), 0.22), inset 0 -1px 0 rgba(255, 255, 255, 0.05);
+  font-size: 12.5px;
+  color: var(--ink);
+}
+:root[data-theme="light"] .worker-now, :root[data-theme="light"] .lead-now { background: rgba(20, 32, 48, 0.05); box-shadow: inset 0 1px 2px rgba(20, 32, 48, 0.08), inset 0 -1px 0 rgba(255, 255, 255, 0.8); }
+.worker-now.big { padding: 9px 12px; font-size: 13px; }
+.lead-worker .worker-now, .lead-worker .worker-now.wait, .lead-card .worker-now { border: 0; }
+.lead-worker .worker-now { background: linear-gradient(90deg, rgba(var(--st-run-rgb), 0.12), rgba(var(--st-run-rgb), 0) 70%), rgba(var(--shade-rgb), 0.14); }
+.lead-worker .worker-now.wait { background: rgba(var(--shade-rgb), 0.12); }
+.lead-card .worker-now { background: linear-gradient(90deg, rgba(var(--gold-rgb), 0.1), rgba(var(--gold-rgb), 0) 70%), rgba(var(--shade-rgb), 0.14); }
+:root[data-theme="light"] .lead-worker .worker-now { background: linear-gradient(90deg, rgba(var(--st-run-rgb), 0.1), rgba(var(--st-run-rgb), 0) 70%), rgba(255, 255, 255, 0.5); }
+:root[data-theme="light"] .lead-worker .worker-now.wait { background: rgba(255, 255, 255, 0.45); }
+:root[data-theme="light"] .lead-card .worker-now { background: linear-gradient(90deg, rgba(var(--gold-rgb), 0.1), rgba(var(--gold-rgb), 0) 70%), rgba(255, 255, 255, 0.5); }
+.lead-now-star { opacity: 0.8; }
+/* 글: 한글 문구는 본문 글꼴, 도구 이름 뒤의 경로·명령만 고정폭 */
+.worker-now-text, .worker-now.wait .worker-now-text { font-family: var(--font); color: var(--ink); }
+.worker-now.wait .worker-now-text { color: var(--muted); }
+.worker-now .tag.tool + .worker-now-text { font-family: var(--mono); font-size: 0.94em; }
+.tag.tool { padding: 1px 7px; border-radius: 6px; font-size: 11px; letter-spacing: 0.01em; }
+
+/* ---------- 글꼴 정리(2026-11-05) ----------
+   1) 고정폭 글꼴은 코드·경로·숫자에만. 한글이 섞인 상태 문구를 고정폭으로 쓰면 띄어쓰기가 넓게 벌어진다.
+   2) 제목 굵기는 800 → 700(한 단계 가볍게), 위계는 크기로.
+   3) 가장 작은 글자는 11px. */
+body { text-rendering: optimizeLegibility; font-kerning: normal; font-synthesis: none; }
+.live-acts div, .act, .agent-act, .worker-timeline-text, .brief-now, .lead-tl-time { font-family: var(--font); letter-spacing: 0; }
+.lead-tl-time, .agent-time, .worker-clock, .token-meter, .progress-pct { font-variant-numeric: tabular-nums; }
+.md h1, .md h2, .md h3, .md h4, .welcome h1, .modal-head h2, .modal.confirm h2, .modal h3, .tools-title, .worker-title h1,
+.approval-head, .ustats b, .tool-stats b, .calc-head h4, .calc-res-usd, .rail-label, .menu-title, .confirm-icon { font-weight: 700; }
+.md h1 { letter-spacing: -0.02em; }
+.welcome h1 { letter-spacing: -0.025em; }
+.ribbon-node span, .kind-tag, .calc-res-breakdown, .council-bar em, .council-state, .council-round, .agent-block h5,
+.agent-files code, .part-files code, .lead-worker .lead-line .worker-clock, .token-meter.compact, .price-chip small,
+.lead-tl-time, .tag.tl, .worker-tab-count, .lead-member .tag, .rail-label, .live-tail { font-size: 11px; }
+.agent-role, .agent-state, .agent-sub, .agent-act, .agent-err, .lead-said b, .lead-commits h5, .lead-sub > summary, .lead-queue-sub { font-size: 11.5px; }
+.live-tail { line-height: 1.6; }
+/* 실시간 출력 미리보기는 대부분 한글 문장: 워커 창(마크다운)과 같이 본문 글꼴로 */
+.live-tail { font-family: var(--font); font-size: 11.5px; letter-spacing: 0; }
+/* 답 아래 "과정 보기 4,000 토큰": 숫자는 같은 폭, 글은 본문 글꼴 */
+.details-line span, .step-head span { font-family: var(--font); font-variant-numeric: tabular-nums; letter-spacing: 0; }
+
+/* ---------- 오른쪽 탭 전체: 옅은 스테인드 글라스(2026-11-06) ----------
+   모서리에만 작은 색유리 조각을 깐다. 배경 층이라 글자를 가리지 않고, 워커 카드보다 한 단계 더 옅다.
+   --stained-*는 :root에서 테마 색으로 풀리므로 다크·화이트 모두 따라간다. */
+:root, :root[data-theme="dark"] { --stain: 0.05; --stain-seam: rgba(255, 255, 255, 0.035); }
+:root[data-theme="light"] { --stain: 0.065; --stain-seam: rgba(255, 255, 255, 0.5); }
+:root {
+  /* 작은 상자용: 네 모서리 조각 */
+  --stained-card:
+    linear-gradient(128deg, rgba(var(--accent-rgb), var(--stain)) 0 34px, var(--stain-seam) 34px 35px, transparent 35px),
+    linear-gradient(232deg, rgba(var(--st-run-rgb), calc(var(--stain) * 0.9)) 0 28px, var(--stain-seam) 28px 29px, transparent 29px),
+    linear-gradient(48deg, rgba(var(--pane-violet), calc(var(--stain) * 0.8)) 0 26px, var(--stain-seam) 26px 27px, transparent 27px),
+    linear-gradient(312deg, rgba(var(--gold-rgb), calc(var(--stain) * 0.7)) 0 22px, var(--stain-seam) 22px 23px, transparent 23px);
+  /* 패널용: 위 두 모서리와 아래 두 모서리에 큰 조각, 안쪽에 한 겹 더 */
+  --stained-panel:
+    linear-gradient(130deg, rgba(var(--accent-rgb), var(--stain)) 0 96px, var(--stain-seam) 96px 97px, rgba(var(--hl-rgb), calc(var(--stain) * 0.5)) 97px 150px, var(--stain-seam) 150px 151px, transparent 151px),
+    linear-gradient(230deg, rgba(var(--pane-violet), calc(var(--stain) * 0.85)) 0 80px, var(--stain-seam) 80px 81px, transparent 81px),
+    linear-gradient(50deg, rgba(var(--st-run-rgb), calc(var(--stain) * 0.8)) 0 110px, var(--stain-seam) 110px 111px, transparent 111px),
+    linear-gradient(310deg, rgba(var(--gold-rgb), calc(var(--stain) * 0.75)) 0 72px, var(--stain-seam) 72px 73px, rgba(var(--accent-rgb), calc(var(--stain) * 0.4)) 73px 120px, var(--stain-seam) 120px 121px, transparent 121px);
+  /* 아이콘 막대용: 위·아래 끝에 작은 조각 */
+  --stained-dock:
+    linear-gradient(150deg, rgba(var(--accent-rgb), var(--stain)) 0 34px, var(--stain-seam) 34px 35px, transparent 35px),
+    linear-gradient(330deg, rgba(var(--pane-violet), calc(var(--stain) * 0.85)) 0 30px, var(--stain-seam) 30px 31px, transparent 31px);
+}
+.tools-inner { background: var(--stained-panel), var(--glass-sheen), var(--glass-side); }
+.tools-dock { background: var(--stained-dock), var(--glass-sheen), var(--glass); }
+.tools-inner .agent-task { background: var(--stained-card), var(--lg-ctl); }
+.tools-inner .lead-card { background: var(--stained-card), linear-gradient(160deg, rgba(var(--gold-rgb), 0.07), rgba(var(--accent-rgb), 0.04) 45%, transparent 80%), var(--surface-2); }
+.tools-inner .lead-log { background: var(--stained-card), var(--surface-2); }
+.tools-inner .progress-box { background: var(--stained-card), linear-gradient(160deg, rgba(var(--accent-rgb), 0.07), transparent 70%), var(--surface-2); }
+.tools-inner .tool-stats div, .tools-inner .tool-mem, .tools-inner .side-box, .tools-inner .layout-edit, .tools-inner .lead-queue > li { background: var(--stained-card), var(--lg-ctl); }
+
+/* ---------- 앱 전체: 옅은 스테인드 글라스(2026-11-06) ----------
+   오른쪽 탭과 같은 색유리 조각을 모든 판의 모서리에 깐다. 구·하늘·리퀴드 글라스는 그대로이고, 조각은 배경 층이라 글을 가리지 않는다.
+   카드 안의 작은 상자(중첩)에는 넣지 않는다: 겹겹이 쌓이면 어지럽다. */
+:root {
+  /* 큰 카드(대화 카드·입력창)용: 작은 상자보다 조금 큰 모서리 조각 */
+  --stained-wide:
+    linear-gradient(130deg, rgba(var(--accent-rgb), var(--stain)) 0 64px, var(--stain-seam) 64px 65px, rgba(var(--hl-rgb), calc(var(--stain) * 0.45)) 65px 100px, var(--stain-seam) 100px 101px, transparent 101px),
+    linear-gradient(230deg, rgba(var(--pane-violet), calc(var(--stain) * 0.85)) 0 52px, var(--stain-seam) 52px 53px, transparent 53px),
+    linear-gradient(50deg, rgba(var(--st-run-rgb), calc(var(--stain) * 0.8)) 0 48px, var(--stain-seam) 48px 49px, transparent 49px),
+    linear-gradient(310deg, rgba(var(--gold-rgb), calc(var(--stain) * 0.7)) 0 40px, var(--stain-seam) 40px 41px, transparent 41px);
+}
+/* 왼쪽 도크·세션 패널 */
+.dock { background: var(--stained-dock), var(--glass-sheen), var(--glass); }
+.panel-inner { background: var(--stained-panel), var(--glass-sheen), var(--glass-side); }
+/* 대화 카드·진행 중 카드·허락 요청·회의 창 */
+.card, .approval, .council-win { background: var(--stained-wide), var(--content); }
+.card.live { background: var(--stained-wide), var(--glass-sheen), var(--glass); }
+/* 입력창 */
+.composer, .composer.work { background: var(--stained-wide), var(--glass-sheen), var(--glass); }
+/* 첫 화면 카드 */
+.welcome-cards button { background: var(--stained-card), var(--glass-sheen), var(--glass); }
+.welcome-cards button:hover { background: var(--stained-card), linear-gradient(var(--card-hover), var(--card-hover)), var(--glass-sheen), var(--glass); }
+/* 뜨는 창: 설정·사용량·스킬 창은 큰 조각, 메뉴·기억 창·알림은 작은 조각 */
+.modal { background: var(--stained-panel), var(--glass-sheen), var(--glass-modal); }
+.menu, .slash-menu, .mem-pop, .toast { background: var(--stained-card), var(--glass-sheen), var(--glass-modal); }
+/* 우클릭 메뉴는 흐림 없이 불투명한 판이라 색만 더한다 */
+.ctx-menu { background: var(--stained-card), var(--pop, var(--card)); }
+/* 창 안의 칸: CLI·API 칸, 스킬 목록, 사용량 숫자 칸, 계산기 */
+.modal .engine, .modal .api-row, .modal .item, .modal .ustats div, .modal .pricing-calc-box, .modal .pair-box { background-image: var(--stained-card); }
+/* 따로 띄운 워커 창 */
+.worker-inner, .worker-win .worker-inner { background: var(--stained-panel), var(--glass-sheen), var(--glass-2, var(--rail)); }
+.worker-win .worker-inner { background: var(--stained-panel), var(--glass-sheen), var(--rail); }
+.worker-card { background: var(--stained-card), var(--glass-sheen), var(--glass-ctl, var(--surface)); }
+/* 패널이 열려 있으면 그쪽 아이콘 막대의 툴팁이 패널 내용을 덮는다: 열려 있는 동안은 띄우지 않는다 */
+.app.panel-open .dock:not(.tools-dock) .dock-btn[data-tip]::after, .app.tools-open .tools-dock .dock-btn[data-tip]::after { display: none; }
+
+/* ---------- 앱 전체: 유리병에 담긴 액체 스테인드 글라스(2026-11-06) ----------
+   각진 색유리 조각 대신, 판 아래쪽에 색 액체(청록·보라·파랑)가 고여 서로 섞이고 위로 갈수록 맑아진다. 위쪽에는 금빛이 살짝 비친다.
+   병 벽: 왼쪽 벽에 세로 반사광, 오른쪽 벽에 옅은 그늘. 움직이지 않고, 배경 층이라 글을 가리지 않는다.
+   앞의 --stained-* 이름은 그대로 두고 값만 액체로 바꿔, 이미 쓰는 모든 판이 함께 바뀐다. */
+:root, :root[data-theme="dark"] { --liq: 0.2; --bottle-hi: rgba(255, 255, 255, 0.06); --bottle-lo: rgba(0, 0, 0, 0.16); --surf: rgba(var(--hl-rgb), 0.07); }
+:root[data-theme="light"] { --liq: 0.24; --bottle-hi: rgba(255, 255, 255, 0.7); --bottle-lo: rgba(20, 32, 48, 0.05); --surf: rgba(255, 255, 255, 0.55); }
+:root {
+  /* 병: 위쪽 어깨의 둥근 반사광, 왼쪽 벽 세로 반사광, 오른쪽 벽 그늘 */
+  --bottle:
+    radial-gradient(48% 26px at 50% 0, var(--bottle-hi), transparent 100%),
+    linear-gradient(90deg, transparent 0 6px, var(--bottle-hi) 12px, transparent 30px),
+    linear-gradient(270deg, var(--bottle-lo), transparent 22px);
+  /* 액체 표면: 색이 고인 곳과 맑은 위쪽 사이에 옅은 수면 */
+  --surface-line: radial-gradient(90% 18% at 50% 64%, var(--surf), transparent 100%);
+  --liquid:
+    var(--bottle),
+    var(--surface-line),
+    radial-gradient(70% 55% at 12% 108%, rgba(var(--accent-rgb), var(--liq)), rgba(var(--accent-rgb), 0) 72%),
+    radial-gradient(62% 50% at 52% 112%, rgba(var(--pane-violet), calc(var(--liq) * 0.85)), rgba(var(--pane-violet), 0) 72%),
+    radial-gradient(58% 48% at 94% 104%, rgba(var(--st-run-rgb), calc(var(--liq) * 0.8)), rgba(var(--st-run-rgb), 0) 72%),
+    radial-gradient(45% 30% at 82% -6%, rgba(var(--gold-rgb), calc(var(--liq) * 0.45)), rgba(var(--gold-rgb), 0) 72%);
+  --liquid-strong:
+    var(--bottle),
+    var(--surface-line),
+    radial-gradient(75% 65% at 10% 110%, rgba(var(--accent-rgb), calc(var(--liq) * 1.5)), rgba(var(--accent-rgb), 0) 72%),
+    radial-gradient(65% 60% at 55% 115%, rgba(var(--pane-violet), calc(var(--liq) * 1.3)), rgba(var(--pane-violet), 0) 72%),
+    radial-gradient(60% 55% at 95% 105%, rgba(var(--st-run-rgb), calc(var(--liq) * 1.2)), rgba(var(--st-run-rgb), 0) 72%),
+    radial-gradient(50% 35% at 85% -8%, rgba(var(--gold-rgb), calc(var(--liq) * 0.6)), rgba(var(--gold-rgb), 0) 72%);
+  --stained-card: var(--liquid);
+  --stained-wide: var(--liquid);
+  --stained-panel: var(--liquid);
+  --stained-dock: var(--liquid);
+}
+
+/* ---------- 조금 더 불투명하게 + 처음의 각진 색유리 조각을 옅게(2026-11-06) ----------
+   1) 유리 판의 바탕을 한 단계 진하게: 뒤의 구·하늘은 여전히 비치지만 글이 더 또렷하다.
+   2) 액체 위에 처음 스테인드 글라스의 각진 모서리 조각(경계선 포함)을 아주 옅게 겹친다. */
+:root, :root[data-theme="dark"] {
+  --glass: rgba(22, 24, 29, 0.22);
+  --glass-2: rgba(30, 33, 40, 0.42);
+  --glass-side: rgba(18, 20, 26, 0.48);
+  --glass-modal: rgba(18, 20, 26, 0.6);
+  --content: rgba(24, 27, 33, 0.7);
+  --lg-ctl: rgba(255, 255, 255, 0.07);
+  --pane-edge: 0.06;
+  --pane-line: rgba(255, 255, 255, 0.05);
+}
+:root[data-theme="light"] {
+  --glass: rgba(255, 255, 255, 0.42);
+  --glass-2: rgba(255, 255, 255, 0.5);
+  --glass-side: rgba(255, 255, 255, 0.58);
+  --glass-modal: rgba(255, 255, 255, 0.68);
+  --content: rgba(255, 255, 255, 0.7);
+  --lg-ctl: rgba(255, 255, 255, 0.62);
+  --pane-edge: 0.08;
+  --pane-line: rgba(255, 255, 255, 0.7);
+}
+:root {
+  /* 각진 모서리 조각: 왼쪽 위 두 겹, 오른쪽 위, 왼쪽 아래, 오른쪽 아래 */
+  --panes:
+    linear-gradient(130deg, rgba(var(--accent-rgb), var(--pane-edge)) 0 44px, var(--pane-line) 44px 45px, rgba(var(--hl-rgb), calc(var(--pane-edge) * 0.5)) 45px 70px, var(--pane-line) 70px 71px, transparent 71px),
+    linear-gradient(230deg, rgba(var(--pane-violet), calc(var(--pane-edge) * 0.9)) 0 36px, var(--pane-line) 36px 37px, transparent 37px),
+    linear-gradient(50deg, rgba(var(--st-run-rgb), calc(var(--pane-edge) * 0.85)) 0 32px, var(--pane-line) 32px 33px, transparent 33px),
+    linear-gradient(310deg, rgba(var(--gold-rgb), calc(var(--pane-edge) * 0.75)) 0 28px, var(--pane-line) 28px 29px, transparent 29px);
+  --liquid:
+    var(--bottle),
+    var(--surface-line),
+    var(--panes),
+    radial-gradient(70% 55% at 12% 108%, rgba(var(--accent-rgb), var(--liq)), rgba(var(--accent-rgb), 0) 72%),
+    radial-gradient(62% 50% at 52% 112%, rgba(var(--pane-violet), calc(var(--liq) * 0.85)), rgba(var(--pane-violet), 0) 72%),
+    radial-gradient(58% 48% at 94% 104%, rgba(var(--st-run-rgb), calc(var(--liq) * 0.8)), rgba(var(--st-run-rgb), 0) 72%),
+    radial-gradient(45% 30% at 82% -6%, rgba(var(--gold-rgb), calc(var(--liq) * 0.45)), rgba(var(--gold-rgb), 0) 72%);
+  --liquid-strong:
+    var(--bottle),
+    var(--surface-line),
+    var(--panes),
+    radial-gradient(75% 65% at 10% 110%, rgba(var(--accent-rgb), calc(var(--liq) * 1.5)), rgba(var(--accent-rgb), 0) 72%),
+    radial-gradient(65% 60% at 55% 115%, rgba(var(--pane-violet), calc(var(--liq) * 1.3)), rgba(var(--pane-violet), 0) 72%),
+    radial-gradient(60% 55% at 95% 105%, rgba(var(--st-run-rgb), calc(var(--liq) * 1.2)), rgba(var(--st-run-rgb), 0) 72%),
+    radial-gradient(50% 35% at 85% -8%, rgba(var(--gold-rgb), calc(var(--liq) * 0.6)), rgba(var(--gold-rgb), 0) 72%);
+  --stained-card: var(--liquid);
+  --stained-wide: var(--liquid);
+  --stained-panel: var(--liquid);
+  --stained-dock: var(--liquid);
+}
+
+/* ---------- 각진 색유리 조각은 구분이 필요한 곳에만(2026-11-06) ----------
+   일반 판은 액체만 남긴다. 상태·역할을 한눈에 가려야 하는 판에만 모서리 조각을 깔고, 조각 색 하나로 뜻을 알린다
+   (작업 중 파랑, 대기 회색, 완료 민트, 실패 빨강, 총괄·허락 금빛, 진행 중 청록).
+   --pane-set은 판마다 자신의 --pc로 풀려야 해서 :root가 아니라 그 판들에 선언한다. */
+:root, :root[data-theme="dark"] { --pane-k: 0.13; --pane-seam-k: rgba(255, 255, 255, 0.07); }
+:root[data-theme="light"] { --pane-k: 0.16; --pane-seam-k: rgba(255, 255, 255, 0.75); }
+:root {
+  --liquid:
+    var(--bottle),
+    var(--surface-line),
+    radial-gradient(70% 55% at 12% 108%, rgba(var(--accent-rgb), var(--liq)), rgba(var(--accent-rgb), 0) 72%),
+    radial-gradient(62% 50% at 52% 112%, rgba(var(--pane-violet), calc(var(--liq) * 0.85)), rgba(var(--pane-violet), 0) 72%),
+    radial-gradient(58% 48% at 94% 104%, rgba(var(--st-run-rgb), calc(var(--liq) * 0.8)), rgba(var(--st-run-rgb), 0) 72%),
+    radial-gradient(45% 30% at 82% -6%, rgba(var(--gold-rgb), calc(var(--liq) * 0.45)), rgba(var(--gold-rgb), 0) 72%);
+  --liquid-strong:
+    var(--bottle),
+    var(--surface-line),
+    radial-gradient(75% 65% at 10% 110%, rgba(var(--accent-rgb), calc(var(--liq) * 1.5)), rgba(var(--accent-rgb), 0) 72%),
+    radial-gradient(65% 60% at 55% 115%, rgba(var(--pane-violet), calc(var(--liq) * 1.3)), rgba(var(--pane-violet), 0) 72%),
+    radial-gradient(60% 55% at 95% 105%, rgba(var(--st-run-rgb), calc(var(--liq) * 1.2)), rgba(var(--st-run-rgb), 0) 72%),
+    radial-gradient(50% 35% at 85% -8%, rgba(var(--gold-rgb), calc(var(--liq) * 0.6)), rgba(var(--gold-rgb), 0) 72%);
+  --stained-card: var(--liquid);
+  --stained-wide: var(--liquid);
+  --stained-panel: var(--liquid);
+  --stained-dock: var(--liquid);
+}
+.lead-worker, .lead-card, .approval, .card.live, .card.failed, .lead-q {
+  --pc: var(--accent-rgb);
+  --pane-set:
+    linear-gradient(130deg, rgba(var(--pc), var(--pane-k)) 0 44px, var(--pane-seam-k) 44px 45px, rgba(var(--pc), calc(var(--pane-k) * 0.55)) 45px 70px, var(--pane-seam-k) 70px 71px, transparent 71px),
+    linear-gradient(230deg, rgba(var(--pc), calc(var(--pane-k) * 0.8)) 0 36px, var(--pane-seam-k) 36px 37px, transparent 37px),
+    linear-gradient(50deg, rgba(var(--pc), calc(var(--pane-k) * 0.65)) 0 32px, var(--pane-seam-k) 32px 33px, transparent 33px),
+    linear-gradient(310deg, rgba(var(--pc), calc(var(--pane-k) * 0.5)) 0 28px, var(--pane-seam-k) 28px 29px, transparent 29px);
+}
+/* 조각 색 = 뜻 */
+.lead-worker.st-working { --pc: var(--st-run-rgb); }
+.lead-worker.st-waiting { --pc: var(--st-wait-rgb); }
+.lead-worker.st-idle, .lead-worker.ok { --pc: var(--hl-rgb); }
+.lead-worker.fail, .card.failed { --pc: var(--err-rgb); }
+.lead-card, .approval { --pc: var(--gold-rgb); }
+/* 판 */
+.lead-worker { background: linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0) 42%), var(--pane-set), var(--liquid-strong), var(--lg-ctl, var(--surface)); }
+.lead-card, .tools-inner .lead-card { background: var(--pane-set), var(--liquid), linear-gradient(160deg, rgba(var(--gold-rgb), 0.07), rgba(var(--accent-rgb), 0.04) 45%, transparent 80%), var(--surface-2); }
+.approval { background: var(--pane-set), var(--liquid), var(--content); }
+.card.live { background: var(--pane-set), var(--liquid), var(--glass-sheen), var(--glass); }
+.card.failed { background: var(--pane-set), var(--liquid), var(--content); }
+.lead-q { background: var(--pane-set), rgba(var(--accent-rgb), 0.1); }
+
+/* ---------- 설정: 4개 묶음 탭(한 번에 한 묶음) ---------- */
+.set-groups { display: flex; gap: 4px; margin-top: 12px; padding: 4px; border-radius: 999px; background: var(--lg-ctl); box-shadow: var(--lg-ctl-edge); width: fit-content; }
+.set-groups button { padding: 6px 16px; border: 0; border-radius: 999px; background: transparent; color: var(--muted); font-size: 13px; font-weight: 600; white-space: nowrap; cursor: pointer; transition: background 0.16s ease, color 0.16s ease; }
+.set-groups button:hover { color: var(--ink); background: var(--hover-veil); }
+.set-groups button.on { color: var(--ink); background: var(--lg-ctl-hi); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 2px 8px rgba(var(--shade-rgb), 0.18); }
+.set-groups button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.settings-modal .set-top { padding-bottom: 14px; }
+/* 한 묶음만 보이므로 창 높이가 묶음마다 크게 바뀌지 않게 최소 높이를 둔다 */
+.settings-modal .modal-scroll { min-height: min(560px, calc(100vh - 120px)); }
+/* 묶음을 바꿔도 창 크기가 그대로(위아래로 튀지 않게), 항목은 순번 지연 없이 바로 나타난다 */
+.settings-modal { height: min(860px, calc(100vh - 60px)); }
+.settings-modal .modal-scroll { min-height: 0; }
+.settings-modal section[id^="set-"] { animation-delay: 0s; animation-duration: 0.25s; }
+
+/* 설정 머리: 스크롤 밖에 두고 바탕을 비워, 창 판(유리·액체·반사광)이 머리까지 그대로 이어진다 */
+.settings-modal .set-top { position: static; flex: none; margin: 0; padding: 20px 24px 14px; background: transparent; -webkit-backdrop-filter: none; backdrop-filter: none; border-bottom: 1px solid var(--line); }
+:root[data-theme="light"] .settings-modal .set-top { background: transparent; }
+.settings-modal .modal-scroll { padding-top: 4px; }
+
+/* ---------- 굴절 전면 손질(2026-11-06) ----------
+   뒤(별·구·오로라)가 비쳐야 휘는 것이 보인다: 서리(blur)를 크게 줄이고 판을 조금 맑게, 렌즈는 넓고 세게(glass.tsx).
+   대화 카드도 같은 굴절을 받는다. */
+:root, :root[data-theme="dark"], :root[data-theme="light"] { --chrome-blur: 1.5px; --side-blur: 4px; --content-blur: 3px; --modal-blur: 6px; }
+:root, :root[data-theme="dark"] {
+  --glass: rgba(22, 24, 29, 0.14);
+  --glass-2: rgba(30, 33, 40, 0.32);
+  --glass-side: rgba(18, 20, 26, 0.38);
+  --glass-modal: rgba(18, 20, 26, 0.5);
+  --content: rgba(24, 27, 33, 0.5);
+}
+:root[data-theme="light"] {
+  --glass: rgba(255, 255, 255, 0.3);
+  --glass-2: rgba(255, 255, 255, 0.42);
+  --glass-side: rgba(255, 255, 255, 0.48);
+  --glass-modal: rgba(255, 255, 255, 0.58);
+  --content: rgba(255, 255, 255, 0.56);
+}
+.thread-inner > .card { -webkit-backdrop-filter: blur(var(--content-blur)) var(--lg-filter, ) saturate(var(--lg-sat)) brightness(var(--lg-bright)); backdrop-filter: blur(var(--content-blur)) var(--lg-filter, ) saturate(var(--lg-sat)) brightness(var(--lg-bright)); }
+/* 유리 두께: 렌즈 가장자리에 맺히는 밝은 안쪽 선과 아래쪽 그늘 */
+.dock, .composer, .panel-inner, .tools-inner, .modal, .thread-inner > .card, .welcome-cards button { box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.16), inset 0 -1px 0 rgba(0, 0, 0, 0.22), inset 0 0 0 1px rgba(255, 255, 255, 0.04), var(--lg-drop); }
+:root[data-theme="light"] .dock, :root[data-theme="light"] .composer, :root[data-theme="light"] .panel-inner, :root[data-theme="light"] .tools-inner, :root[data-theme="light"] .modal, :root[data-theme="light"] .thread-inner > .card, :root[data-theme="light"] .welcome-cards button { box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.95), inset 0 -1px 0 rgba(20, 32, 48, 0.08), inset 0 0 0 1px rgba(255, 255, 255, 0.35), var(--lg-drop); }
+
+/* ---------- 비슷한 판이 여러 개 늘어선 곳: 처음 스테인드 글라스의 여러 색 조각을 옅게 ----------
+   세션 목록, 첫 화면 카드, 대화 카드, 숫자 타일, CLI·API 칸, 스킬 목록, 단가표, 진행 요약의 워커 칩 등. */
+:root, :root[data-theme="dark"] { --pl: 0.075; --pl-seam: rgba(255, 255, 255, 0.05); }
+:root[data-theme="light"] { --pl: 0.1; --pl-seam: rgba(255, 255, 255, 0.65); }
+:root {
+  --panes-lite:
+    linear-gradient(130deg, rgba(var(--accent-rgb), var(--pl)) 0 30px, var(--pl-seam) 30px 31px, rgba(var(--hl-rgb), calc(var(--pl) * 0.55)) 31px 48px, var(--pl-seam) 48px 49px, transparent 49px),
+    linear-gradient(230deg, rgba(var(--pane-violet), calc(var(--pl) * 0.9)) 0 24px, var(--pl-seam) 24px 25px, transparent 25px),
+    linear-gradient(50deg, rgba(var(--st-run-rgb), calc(var(--pl) * 0.85)) 0 22px, var(--pl-seam) 22px 23px, transparent 23px),
+    linear-gradient(310deg, rgba(var(--gold-rgb), calc(var(--pl) * 0.75)) 0 18px, var(--pl-seam) 18px 19px, transparent 19px);
+}
+.panel-inner .session, .tool-stats div, .ustats div, .price-row, .brief-workers li, .attach-card, .device-list li, .guide-card,
+.modal .item, .modal .engine, .modal .api-row, .council-win, .tools-inner .agent-task, .worker-member, .worker-feed > li, .worker-stat { background-image: var(--panes-lite) !important; }
+.welcome-cards button { background: var(--panes-lite), var(--stained-card), var(--glass-sheen), var(--glass); }
+.welcome-cards button:hover { background: var(--panes-lite), var(--stained-card), linear-gradient(var(--card-hover), var(--card-hover)), var(--glass-sheen), var(--glass); }
+.card { background: var(--panes-lite), var(--stained-wide), var(--content); }
+.card.live { background: var(--pane-set), var(--liquid), var(--glass-sheen), var(--glass); }
+.card.failed { background: var(--pane-set), var(--liquid), var(--content); }
+/* 뜨는 창은 글이 많다: 뒤의 글자가 겹쳐 보이지 않을 만큼만 조금 더 진하게(굴절은 그대로) */
+:root, :root[data-theme="dark"] { --glass-modal: rgba(18, 20, 26, 0.6); }
+:root[data-theme="light"] { --glass-modal: rgba(255, 255, 255, 0.66); }
+
+/* ---------- 토글 슬라이드: 밖으로 튀어나가지 않게(2026-11-06) ----------
+   고른 칸 뒤의 판(.seg-thumb)과 스위치 손잡이는 넘치지 않고 미끄러져 멈춘다. 앱 전체의 스프링도 튐을 약 4%로 줄인다. */
+:root { --spring: cubic-bezier(0.3, 1.12, 0.5, 1); --glide: cubic-bezier(0.22, 0.8, 0.28, 1); }
+.seg.ready .seg-thumb { transition: transform 0.3s var(--glide), width 0.3s var(--glide), background 0.2s, box-shadow 0.2s; }
+.switch::after { transition: transform 0.25s var(--glide); }
+.seg { overflow: hidden; }
+
+/* ---------- PowerShell 탭 ---------- */
+.tool-body.term { display: flex; flex-direction: column; gap: 8px; min-height: 0; flex: 1 1 auto; overflow: hidden; }
+.term-bar { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.term-state { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--off); }
+.term-state.on { background: var(--hl); box-shadow: 0 0 0 3px rgba(var(--hl-rgb), 0.18); }
+.term-cwd { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 11.5px; color: var(--dim); }
+.term-box { flex: 1 1 auto; min-height: 200px; padding: 10px 6px 8px 12px; border-radius: 14px; background: linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0) 30%), rgba(4, 8, 12, 0.86); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), inset 0 0 0 1px rgba(var(--accent-rgb), 0.16), inset 0 -18px 30px -24px rgba(var(--accent-rgb), 0.35); overflow: hidden; }
+:root[data-theme="light"] .term-box { background: linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0) 30%), #10171c; }
+.term-box .xterm { height: 100%; }
+.term-box .xterm-viewport { background: transparent !important; scrollbar-width: thin; }
+.term-box .xterm-screen { text-shadow: none; }
+
+/* ---------- 배경: 별이 잘 보이는 밤하늘(2026-11-06) ----------
+   별은 Starfield 캔버스(세 겹, 천천히 흐르고 은은하게 반짝, 가끔 유성), 성운은 여기서 한 번만 그린다. */
+.starfield { position: fixed; inset: 0; z-index: 0; width: 100%; height: 100%; pointer-events: none; }
+:root, :root[data-theme="dark"] {
+  --sky:
+    radial-gradient(55% 45% at 80% 14%, rgba(112, 92, 196, 0.17), rgba(112, 92, 196, 0) 70%),
+    radial-gradient(50% 42% at 14% 84%, rgba(56, 170, 150, 0.15), rgba(56, 170, 150, 0) 70%),
+    radial-gradient(38% 30% at 52% 46%, rgba(70, 110, 196, 0.08), rgba(70, 110, 196, 0) 70%),
+    radial-gradient(28% 22% at 30% 22%, rgba(196, 120, 160, 0.05), rgba(196, 120, 160, 0) 70%),
+    linear-gradient(180deg, #02040a 0%, #04070f 45%, #060d14 100%);
+  --vignette: radial-gradient(130% 120% at 50% 42%, transparent 60%, rgba(0, 0, 4, 0.5) 100%);
+}
+/* 별은 캔버스가 그린다: 예전 CSS 별 점(330×260 타일) 층을 걷어내 성운이 타일로 반복되지 않게 */
+body { background-color: var(--bg); background-image: var(--vignette), var(--sky); background-size: 100% 100%; background-repeat: no-repeat; background-attachment: fixed; }
+
+/* ---------- 에이전트 판: 거르기·찾기·상태 지도·그룹(2026-11-06) ----------
+   많아도 한눈에: 번호 타일 지도로 전체 상태를 보고, 한 줄 행으로 누가 무엇을 하는지 본다. 그룹은 사용자가 끌어다 묶는 폴더다. */
+.aboard { grid-column: 1 / -1; display: grid; gap: 8px; min-width: 0; }
+.aboard-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+.aboard-filters { display: flex; flex-wrap: wrap; gap: 4px; }
+.achip { height: 24px; padding: 0 9px; border-radius: 999px; border: 1px solid var(--line); background: var(--surface); color: var(--muted); font-size: 11.5px; font-weight: 600; white-space: nowrap; transition: background 0.15s, color 0.15s, border-color 0.15s; }
+.achip:hover { color: var(--ink); border-color: rgba(var(--accent-rgb), 0.4); }
+.achip.b-run { color: var(--st-run-ink); }
+.achip.b-done { color: var(--accent-ink); }
+.achip.b-fail { color: var(--err); }
+.achip.on { color: var(--ink); background: rgba(var(--accent-rgb), 0.14); border-color: rgba(var(--accent-rgb), 0.5); }
+.achip.b-run.on { background: rgba(var(--st-run-rgb), 0.16); border-color: rgba(var(--st-run-rgb), 0.5); }
+.achip.b-fail.on { background: rgba(var(--err-rgb), 0.12); border-color: rgba(var(--err-rgb), 0.45); }
+.aboard-tools { display: flex; align-items: center; gap: 6px; flex: 1 1 220px; min-width: 0; }
+.aboard-search { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 4px 0 9px; border-radius: 9px; border: 1px solid var(--line); background: var(--surface); color: var(--dim); }
+.aboard-search:focus-within { border-color: var(--accent-2); }
+.aboard-search input[type="text"] { flex: 1; min-width: 0; height: 26px; padding: 0; border: 0; background: transparent; box-shadow: none; font-size: 12px; }
+.aboard-search .icon { width: 22px; height: 22px; }
+.aboard-tools .btn { flex: none; }
+
+/* 상태 지도: 에이전트마다 번호 타일 하나. 색이 상태, 아래 테두리가 그룹 색이다. */
+.amap { display: flex; flex-wrap: wrap; gap: 3px; padding: 6px; border-radius: 10px; background: rgba(var(--shade-rgb), 0.1); border: 1px solid var(--line); }
+.amap-tile { width: 22px; height: 20px; padding: 0; border: 0; border-radius: 5px; background: var(--off); color: rgba(255, 255, 255, 0.92); font: 700 9.5px/20px var(--mono); text-align: center; cursor: pointer; touch-action: none; transition: transform 0.12s, opacity 0.15s, box-shadow 0.15s; }
+.amap-tile:hover { transform: translateY(-1px) scale(1.08); box-shadow: 0 3px 8px rgba(var(--shade-rgb), 0.3); }
+.amap-tile.st-working { background: var(--st-run); animation: tile-pulse 1.8s ease-in-out infinite; }
+.amap-tile.st-waiting { background: var(--st-wait); }
+.amap-tile.st-idle { background: rgba(var(--hl-rgb), 0.55); }
+.amap-tile.st-ok { background: var(--hl); color: rgba(0, 0, 0, 0.62); }
+.amap-tile.st-fail { background: var(--err); }
+.amap-tile.in { box-shadow: inset 0 -3px 0 hsl(var(--hue) 75% 62%); }
+.amap-tile.dim { opacity: 0.25; }
+@keyframes tile-pulse { 0%, 100% { filter: brightness(1); } 50% { filter: brightness(1.22); } }
+@media (prefers-reduced-motion: reduce) { .amap-tile.st-working { animation: none; } }
+
+/* 그룹(폴더) */
+.afolder { display: grid; gap: 8px; padding: 8px 10px 10px; border-radius: 14px; border: 1px solid hsl(var(--hue) 60% 60% / 0.35); border-left: 3px solid hsl(var(--hue) 70% 60%); background: hsl(var(--hue) 60% 55% / 0.06); transition: border-color 0.15s, background 0.15s, box-shadow 0.15s; }
+.afolder:not(.open) { padding-bottom: 8px; }
+.afolder.over, .adrop.over { background: hsl(var(--hue, 210) 70% 55% / 0.16); box-shadow: 0 0 0 2px hsl(var(--hue, 210) 70% 60% / 0.55); }
+.afolder-head { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.afolder-head .icon { width: 24px; height: 24px; flex: none; color: var(--dim); }
+.afolder-toggle { display: flex; align-items: center; gap: 6px; min-width: 0; padding: 2px 6px; margin-left: -2px; border: 0; border-radius: 8px; background: transparent; color: hsl(var(--hue) 70% 66%); }
+:root[data-theme="light"] .afolder-toggle { color: hsl(var(--hue) 60% 38%); }
+.afolder-toggle:hover { background: var(--hover-veil); }
+.afolder-toggle b { font-size: 13px; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+input[type="text"].afolder-name { width: 160px; height: 26px; padding: 0 8px; font-size: 13px; }
+.afolder-head .agent-count { background: hsl(var(--hue) 65% 52%); }
+.afolder-empty { padding: 10px; border-radius: 10px; border: 1px dashed hsl(var(--hue) 60% 60% / 0.45); color: var(--dim); font-size: 12px; text-align: center; }
+.aboard-drops { display: flex; gap: 6px; }
+.adrop { flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px; height: 38px; border-radius: 12px; border: 1.5px dashed rgba(var(--accent-rgb), 0.5); color: var(--muted); font-size: 12px; font-weight: 600; transition: background 0.15s, box-shadow 0.15s; }
+.aboard-rest { display: grid; gap: 8px; min-width: 0; }
+.adrag-ghost { position: fixed; z-index: 1000; pointer-events: none; display: inline-flex; align-items: center; gap: 6px; max-width: 260px; padding: 5px 10px; border-radius: 10px; background: var(--card); border: 1px solid rgba(var(--accent-rgb), 0.5); box-shadow: var(--shadow-lg); color: var(--ink); font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+body.agent-dragging, body.agent-dragging * { cursor: grabbing !important; user-select: none; }
+
+/* 끌기 손잡이(번호표)와 그룹 메뉴 */
+.aline-grip { flex: none; display: inline-flex; align-items: center; justify-content: center; min-width: 22px; height: 20px; padding: 0 4px; border-radius: 6px; background: rgba(var(--shade-rgb), 0.16); color: var(--muted); font: 700 10px/1 var(--mono); cursor: grab; touch-action: none; user-select: none; }
+.aline-grip:hover { color: var(--ink); background: rgba(var(--accent-rgb), 0.18); }
+.agent-row > .aline-grip { margin-top: 1px; }
+.gmenu-btn { width: 24px; height: 24px; flex: none; color: var(--dim); opacity: 0.55; }
+.gmenu-btn.on { opacity: 1; color: hsl(var(--hue, 210) 70% 62%); }
+.lead-worker:hover .gmenu-btn, .agent-run:hover .gmenu-btn, .lead-worker:focus-within .gmenu-btn, .gmenu-btn[aria-expanded="true"] { opacity: 1; }
+.gmenu-list { position: fixed; z-index: 1000; display: grid; width: 200px; max-height: 320px; overflow-y: auto; padding: 4px; border-radius: 12px; background: var(--card); border: 1px solid var(--line); box-shadow: var(--shadow-lg); }
+.gmenu-list button { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 7px 9px; border: 0; border-radius: 8px; background: transparent; color: var(--ink); font-size: 12.5px; text-align: left; }
+.gmenu-list button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gmenu-list button:hover, .gmenu-list button:focus-visible { background: var(--hover-veil); }
+.gmenu-list button.on { background: hsl(var(--hue) 65% 55% / 0.16); font-weight: 700; }
+.gmenu-list svg { flex: none; width: 14px; height: 14px; color: var(--dim); }
+.gdot { flex: none; width: 9px; height: 9px; border-radius: 3px; background: hsl(var(--hue) 70% 60%); }
+
+/* 한 줄 워커 행: 이름·상태·시간 / AI·지금 하는 일·토큰 */
+.lead-worker.aline { gap: 4px; padding: 7px 9px; border-radius: 12px; }
+.lead-worker.aline.compact:not(.group) { grid-template-rows: auto auto; }
+.lead-worker.aline > .lead-line:first-child { gap: 6px; }
+.lead-worker.aline .agent-dot { margin-top: 0; }
+.aline-name { flex: 0 1 auto; min-width: 0; display: flex; padding: 0; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }
+.aline-name b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.aline-name:hover b { text-decoration: underline; text-decoration-color: rgba(var(--accent-rgb), 0.5); text-underline-offset: 3px; }
+.lead-worker.aline .agent-state { max-width: 42%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lead-line.aline-sub { flex-wrap: nowrap; gap: 6px; }
+.aline-sub .agent-role { flex: 0 1 auto; max-width: 38%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.aline-now { flex: 1; min-width: 0; }
+.aline-now > * { min-height: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lead-worker.aline .aline-now .worker-now { padding: 2px 8px; font-size: 11.5px; border-radius: 7px; }
+.lead-worker.aline .aline-now .worker-now .tag.tool { padding: 0 5px; font-size: 10px; }
+.lead-worker.flash, .agent-run.flash { animation: flash 1.4s ease-out; }
+
+/* 팀 카드 안의 팀원 행: 팀 카드 위에 겹치지 않게 옅게 */
+.team-members { display: grid; gap: 4px; }
+.team-members > .lead-worker { box-shadow: none; background: rgba(var(--shade-rgb), 0.1); }
+.team-members > .lead-worker::before { opacity: 0.6; }
+
+/* ---------- Agent cards: calmer glass (2026-11-06) ----------
+   Drop the stained-glass corner shards and the multi-colour aura. Status shows as one soft tint + a thin rim. */
+.lead-worker, .lead-card, .approval, .card.live, .card.failed, .lead-q {
+  --pane-set: radial-gradient(140% 90px at 0 0, rgba(var(--pc), calc(var(--pane-k) * 0.45)), rgba(var(--pc), 0) 70%);
+}
+.lead-worker { background: linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0) 40%), var(--pane-set), var(--lg-ctl, var(--surface)); }
+.lead-worker.st-working::before { background: linear-gradient(rgba(var(--st-run-rgb), 0.32), rgba(var(--st-run-rgb), 0.12)); }
+.lead-worker.ok::before { background: linear-gradient(rgba(var(--hl-rgb), 0.26), rgba(var(--hl-rgb), 0.1)); }
+.lead-worker.fail::before { background: linear-gradient(rgba(var(--err-rgb), 0.36), rgba(var(--err-rgb), 0.14)); }
+.lead-worker.group::before { background: linear-gradient(rgba(var(--accent-rgb), 0.26), rgba(var(--accent-rgb), 0.1)); }
+.lead-worker.run::after, .lead-worker.st-working::after {
+  height: 56px;
+  background: linear-gradient(180deg, rgba(var(--st-run-rgb), 0.1), rgba(var(--st-run-rgb), 0));
+  animation: none;
+}
+
+/* ---------- Layout fixes (2026-11-06) ---------- */
+/* Opening one card must not stretch its row neighbours into empty boxes. */
+.lead-workers, .aboard-rest { align-items: start; }
+/* The worker-window stats grid must not leak into the card's stats line (texts ran together). */
+.lead-line.worker-stats { display: flex; }
+/* Name line / AI + tokens / what it is doing now: the "now" line gets its own row so it never squeezes to one letter. */
+.lead-line.aline-sub { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 6px; }
+.aline-sub .agent-role { max-width: none; justify-self: start; }
+.aline-sub .token-meter { flex: none; justify-self: end; }
+.aline-sub .aline-now { grid-column: 1 / -1; grid-row: 2; }
+.lead-worker.aline.compact:not(.group) { grid-template-rows: auto auto; }
+/* Worker window: the tab bar scrolls sideways, so it must not be squashed vertically by the column. */
+.worker-inner > .worker-tabs, .worker-inner > .worker-head, .worker-inner > .worker-foot { flex: none; }
+.worker-tabs button { white-space: nowrap; }
+
+/* ---------- Agents as the main view ---------- */
+.view-switch { flex: none; }
+.agents-main { overflow-y: auto; min-height: 0; }
+.agents-main > .tool-body { width: var(--col); margin: 0 auto; padding: 4px 0 28px; overflow: visible; animation: none; }
+.agents-main .agent-task { padding: 14px 16px; }
+.agents-main .lead-workers { grid-template-columns: repeat(auto-fill, minmax(min(300px, 100%), 1fr)); gap: 10px; }
+
+/* ---------- Background commands: foldable ---------- */
+.bg-fold { display: flex; align-items: center; gap: 6px; width: 100%; padding: 0; border: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.bg-fold .fold-chev { transform: rotate(-45deg); }
+.bg-fold[aria-expanded="true"] .fold-chev { transform: rotate(45deg); }
+
+/* ---------- Low-spec mode ----------
+   No glass refraction or blur (the costliest part of every frame), no decorative motion, no animated backgrounds. */
+:root[data-perf="low"] *, :root[data-perf="low"] *::before, :root[data-perf="low"] *::after {
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+  animation-duration: 0s !important;
+  animation-delay: 0s !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0s !important;
+}
+:root[data-perf="low"] .orb-field { display: none; }
+:root[data-perf="low"] .dock, :root[data-perf="low"] .composer, :root[data-perf="low"] .panel-inner, :root[data-perf="low"] .tools-inner,
+:root[data-perf="low"] .modal, :root[data-perf="low"] .menu, :root[data-perf="low"] .slash-menu, :root[data-perf="low"] .mem-pop,
+:root[data-perf="low"] .worker-inner, :root[data-perf="low"] .toast { background: var(--glass-modal); }
+:root[data-perf="low"] .card, :root[data-perf="low"] .agent-task { box-shadow: none; }
+:root[data-perf="low"] .lead-worker { box-shadow: none; }
+
+.dock-count.inline { position: static; display: inline-block; margin-left: 6px; vertical-align: 1px; }
+.load-earlier { display: block; margin: 0 auto 8px; font-size: 12px; }
+.worker-timeline li.more, .worker-feed li.more { list-style: none; text-align: center; }
+.worker-timeline li.more::before, .worker-timeline li.more > i { display: none; }
+
+/* ---------- Many agents: names and current activity stay readable (2026-11-06) ---------- */
+/* Cards: the name may use two lines; the "now" line is a little larger. */
+.aline-name { align-items: center; gap: 6px; }
+.aline-name b { white-space: normal; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; line-height: 1.3; }
+.aline-name .tag { flex: none; }
+.lead-worker.aline .aline-now .worker-now { font-size: 12px; padding: 3px 9px; }
+.aboard-layout { flex: none; }
+
+/* List: one row per agent. Fixed columns so rows line up: # · name · what it is doing · state · time · AI · tokens. */
+.aboard { container-type: inline-size; }
+.aboard.layout-list .lead-workers, .aboard.layout-list .org-root, .aboard.layout-list .org-dept-body { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+.aboard.layout-list .lead-worker.aline.compact {
+  display: grid;
+  grid-template-columns: 28px 8px minmax(140px, 24%) minmax(0, 1fr) 92px 64px minmax(0, 12%) 170px 24px 24px;
+  grid-template-areas: "grip dot name now state clock role tok menu fold";
+  align-items: center;
+  column-gap: 8px;
+  padding: 5px 10px;
+  border-radius: 10px;
+  min-height: 36px;
+}
+.aboard.layout-list .lead-worker.aline.compact > .lead-line, .aboard.layout-list .lead-worker.aline.compact > .aline-sub { display: contents; }
+.aboard.layout-list .lead-worker.aline.compact .spacer { display: none; }
+.aboard.layout-list .lead-worker.aline.compact .aline-grip { grid-area: grip; }
+.aboard.layout-list .lead-worker.aline.compact .agent-dot { grid-area: dot; }
+.aboard.layout-list .lead-worker.aline.compact .aline-name { grid-area: name; min-width: 0; }
+.aboard.layout-list .lead-worker.aline.compact .aline-name b { -webkit-line-clamp: 1; line-clamp: 1; }
+.aboard.layout-list .lead-worker.aline.compact .aline-now { grid-area: now; min-width: 0; }
+.aboard.layout-list .lead-worker.aline.compact .agent-state { grid-area: state; max-width: none; justify-self: start; }
+.aboard.layout-list .lead-worker.aline.compact .worker-clock { grid-area: clock; justify-self: end; }
+.aboard.layout-list .lead-worker.aline.compact .agent-role { grid-area: role; min-width: 0; max-width: none; justify-self: stretch; }
+.aboard.layout-list .lead-worker.aline.compact .token-meter { grid-area: tok; justify-self: end; max-width: 100%; overflow: hidden; }
+.aboard.layout-list .lead-worker.aline.compact .gmenu-btn { grid-area: menu; }
+.aboard.layout-list .lead-worker.aline.compact .card-fold { grid-area: fold; }
+.aboard.layout-list .lead-worker.aline.compact::after { display: none; }
+.aboard.layout-list .lead-worker.group { padding: 8px 10px; }
+.aboard.layout-list .team-members { gap: 3px; }
+/* Narrower boards drop the AI and token columns first, then the clock: name and activity keep the room. */
+@container (max-width: 900px) {
+  .aboard.layout-list .lead-worker.aline.compact { grid-template-columns: 28px 8px minmax(120px, 30%) minmax(0, 1fr) 88px 60px 24px 24px; grid-template-areas: "grip dot name now state clock menu fold"; }
+  .aboard.layout-list .lead-worker.aline.compact .agent-role, .aboard.layout-list .lead-worker.aline.compact .token-meter { display: none; }
+}
+@container (max-width: 600px) {
+  .aboard.layout-list .lead-worker.aline.compact { grid-template-columns: 28px 8px minmax(96px, 36%) minmax(0, 1fr) 24px; grid-template-areas: "grip dot name now fold"; }
+  .aboard.layout-list .lead-worker.aline.compact .agent-state, .aboard.layout-list .lead-worker.aline.compact .worker-clock, .aboard.layout-list .lead-worker.aline.compact .gmenu-btn { display: none; }
+}
+
+/* ---------- Several terminals: tabs + side-by-side view ---------- */
+.term-tabs { display: flex; align-items: center; gap: 4px; min-width: 0; flex-wrap: wrap; flex: none; }
+.term-tab { display: inline-flex; align-items: center; border-radius: 999px; background: var(--lg-ctl, var(--surface)); box-shadow: var(--lg-ctl-edge, none); }
+.term-tab > button[role="tab"] { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 4px 0 11px; border: 0; background: transparent; color: var(--muted); font-size: 12px; font-weight: 600; white-space: nowrap; cursor: pointer; }
+.term-tab.on > button[role="tab"] { color: var(--ink); }
+.term-tab.on { background: var(--lg-ctl-hi, var(--card)); box-shadow: inset 0 0 0 1px rgba(var(--accent-rgb), 0.35); }
+.term-tab-x { width: 22px; height: 22px; margin-right: 3px; color: var(--dim); }
+.term-tab-x svg { width: 12px; height: 12px; }
+.term-add { height: 28px; }
+.term-split { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: var(--muted); white-space: nowrap; cursor: pointer; }
+.term-grid { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+.term-grid.split { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(360px, 100%), 1fr)); grid-auto-rows: minmax(200px, 1fr); gap: 8px; overflow-y: auto; }
+.term-pane { display: flex; flex-direction: column; gap: 6px; min-height: 0; min-width: 0; flex: 1 1 auto; }
+.term-grid.split .term-pane { padding: 6px; border-radius: 16px; box-shadow: inset 0 0 0 1px var(--line); }
+.term-grid.split .term-pane.on { box-shadow: inset 0 0 0 1px rgba(var(--accent-rgb), 0.45); }
+.term-grid.split .term-box { min-height: 140px; }
+.term-grid.split .term-bar .btn.sm { height: 26px; padding: 0 9px; font-size: 11.5px; }
+.term-name { flex: none; font-size: 12px; }
+
+/* ---------- Lead chat: folded to the latest exchange ---------- */
+.lead-talk { display: grid; gap: 6px; min-width: 0; }
+.lead-talk-head { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.lead-talk-title { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; font-weight: 700; color: var(--muted); letter-spacing: 0.03em; }
+.lead-talk-head .link { font-size: 12px; }
+/* A long latest reply stays short; scroll inside it to read the rest. */
+.lead-talk-latest .lead-said li .md { max-height: 14em; overflow-y: auto; scrollbar-width: thin; }
+.lead-talk.open .lead-said { max-height: 420px; overflow-y: auto; scrollbar-width: thin; }
+
+/* ---------- Shutdown after a task ---------- */
+.power-toggle { display: inline-flex; align-items: center; gap: 7px; margin-left: auto; font-size: 12px; font-weight: 600; color: var(--muted); white-space: nowrap; cursor: pointer; }
+.power-banner { position: fixed; z-index: 1200; left: 50%; top: 18px; transform: translateX(-50%); display: flex; align-items: center; gap: 14px; padding: 12px 16px; border-radius: 16px; background: var(--glass-modal, var(--card)); box-shadow: var(--shadow-lg), inset 0 0 0 1px rgba(var(--err-rgb), 0.5); color: var(--ink); font-size: 14px; }
+
+/* ---------- Usage limits tab ---------- */
+.limit-refresh { margin-left: auto; }
+.limit-row { display: grid; gap: 5px; }
+.limit-head { display: flex; align-items: baseline; gap: 8px; font-size: 12.5px; }
+.limit-pct { margin-left: auto; font-variant-numeric: tabular-nums; font-weight: 700; }
+.limit-bar { height: 8px; border-radius: 999px; background: rgba(var(--shade-rgb), 0.2); overflow: hidden; }
+.limit-bar > i { display: block; height: 100%; width: var(--w); border-radius: inherit; background: var(--hl); transition: width 0.4s var(--ease); }
+.limit-row.mid .limit-bar > i { background: var(--st-wait, #e7c98b); }
+.limit-row.high .limit-bar > i { background: var(--err); }
+.limit-row.high .limit-pct { color: var(--err); }
+.limit-extra { display: flex; align-items: baseline; gap: 8px; font-size: 12.5px; }
+.limit-extra b { margin-left: auto; font-variant-numeric: tabular-nums; }
+
+/* ---------- Command log: reviews + commands agents ran ---------- */
+.tag.verdict.ran { color: var(--muted); background: rgba(var(--shade-rgb), 0.18); border-color: transparent; }
+.cmd-filter { align-self: start; }
+.cmd-who { flex: none; max-width: 30%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---------- Low-spec mode: flat, solid colours ----------
+   No starfield, particles or colour blobs behind the window; panels, cards and controls are plain fills.
+   Gradients, shadows and glows are dropped everywhere (they are drawn every frame and cost GPU time). */
+:root[data-perf="low"] { --low-bg: #0d1014; --low-panel: #161a1f; --low-ctl: #1f242a; --low-ctl-hi: #2a3038; --low-line: rgba(255, 255, 255, 0.1); }
+:root[data-perf="low"][data-theme="light"] { --low-bg: #eceff2; --low-panel: #ffffff; --low-ctl: #f2f4f6; --low-ctl-hi: #e2e7ec; --low-line: rgba(20, 24, 30, 0.13); }
+:root[data-perf="low"] {
+  --surface: var(--low-ctl); --surface-2: var(--low-ctl); --card: var(--low-ctl-hi); --rail: var(--low-panel); --content: var(--low-panel);
+  --glass: var(--low-panel); --glass-2: var(--low-panel); --glass-ctl: var(--low-ctl); --glass-ctl-hi: var(--low-ctl-hi); --glass-side: var(--low-panel); --glass-modal: var(--low-panel);
+  --lg-ctl: var(--low-ctl); --lg-ctl-hi: var(--low-ctl-hi); --pop: var(--low-panel); --pop-card: var(--low-ctl-hi); --pop-surface: var(--low-ctl); --pop-surface-2: var(--low-ctl); --pop-line: var(--low-line);
+}
+:root[data-perf="low"] body, :root[data-perf="low"] .app { background: var(--low-bg) !important; }
+:root[data-perf="low"] .starfield, :root[data-perf="low"] .orb-field, :root[data-perf="low"] .app::before, :root[data-perf="low"] .app::after { display: none !important; }
+:root[data-perf="low"] *, :root[data-perf="low"] *::before, :root[data-perf="low"] *::after { background-image: none !important; box-shadow: none !important; text-shadow: none !important; }
+/* Panels and cards */
+:root[data-perf="low"] :is(.dock, .composer, .panel-inner, .tools-inner, .modal, .menu, .slash-menu, .mem-pop, .toast, .worker-inner, .card, .agent-task, .lead-card, .lead-log, .lead-q, .approval, .welcome-cards button, .log-drawer, .gmenu-list, .power-banner, .dock-btn[data-tip]::after) {
+  background-color: var(--low-panel) !important; border: 1px solid var(--low-line) !important;
+}
+:root[data-perf="low"] :is(.lead-worker, .afolder, .org-dept, .term-pane) { background-color: var(--low-ctl) !important; border: 1px solid var(--low-line) !important; }
+:root[data-perf="low"] .lead-worker::before, :root[data-perf="low"] .lead-worker::after { display: none !important; }
+:root[data-perf="low"] .lead-worker.st-working { border-color: rgba(var(--st-run-rgb), 0.55) !important; }
+:root[data-perf="low"] .lead-worker.fail { border-color: rgba(var(--err-rgb), 0.55) !important; }
+/* Controls */
+:root[data-perf="low"] :is(.btn:not(.danger):not(.primary), .pill, .seg, .tabs, .head-folder, .tool-search, .tag, .term-tab, .worker-now, .lead-now, input[type="text"], input[type="password"], textarea, .select) { background-color: var(--low-ctl) !important; }
+:root[data-perf="low"] .seg-thumb { background-color: var(--low-ctl-hi) !important; }
+:root[data-perf="low"] .term-box { background-color: #0a0d10 !important; }
+/* Things that are drawn with a gradient get a plain colour instead */
+:root[data-perf="low"] :is(.logo-word, .panel-word, .welcome h1 em) { color: var(--accent) !important; -webkit-text-fill-color: currentColor; }
+:root[data-perf="low"] .dock-logo { background-color: var(--accent) !important; }
+:root[data-perf="low"] .dock-logo i { background-color: var(--low-panel) !important; }
+
+/* ---------- Jump to the latest message ---------- */
+.thread-wrap { position: relative; min-height: 0; display: flex; flex-direction: column; }
+.thread-wrap > .thread { flex: 1 1 auto; min-height: 0; }
+.to-bottom { position: absolute; right: 22px; bottom: 14px; z-index: 4; width: 40px; height: 40px; display: grid; place-items: center; border: 0; border-radius: 50%; background: rgba(120, 126, 134, 0.42); color: #fff; cursor: pointer; transition: background 0.18s, transform 0.18s; animation: fade 0.2s ease both; }
+.to-bottom:hover { background: rgba(120, 126, 134, 0.62); transform: translateY(-1px); }
+.to-bottom:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.to-bottom svg { width: 18px; height: 18px; }
+:root[data-theme="light"] .to-bottom { background: rgba(90, 96, 104, 0.38); }
+
+.limit-group { display: grid; gap: 8px; padding: 8px 10px; border-radius: 12px; background: rgba(var(--shade-rgb), 0.1); }
+.limit-group h5 { margin: 0; font-size: 12.5px; }
+
+.limit-top { display: flex; justify-content: flex-end; margin-bottom: -6px; }
+.limit-fold { display: inline-flex; align-items: center; gap: 6px; padding: 0; border: 0; background: transparent; color: inherit; font: inherit; cursor: pointer; }
+.limit-fold svg { width: 14px; height: 14px; }
+.limit-note { margin-left: auto; font-size: 11px; font-weight: 500; color: var(--dim); white-space: nowrap; }
+.limit-plain { display: grid; gap: 8px; }
+
+/* Low-spec: things whose only fill was a gradient get a solid colour (switches, main buttons, bars, dots) */
+:root[data-perf="low"] .switch { background-color: var(--off) !important; }
+:root[data-perf="low"] .switch:checked { background-color: var(--accent) !important; }
+:root[data-perf="low"] .switch::after { background-color: #ffffff !important; }
+:root[data-perf="low"] :is(.btn.primary, .new-session, .send, .build-btn, .item-icon, .dock-btn.primary, .worker-compose .icon) { background-color: var(--accent) !important; color: var(--on-grad) !important; }
+:root[data-perf="low"] :is(.session.on::before, .ribbon-dot, .lead-star, .lead-now-star, .tool-sec > h4::before, .worker-card h5::before) { background-color: var(--accent) !important; }
+:root[data-perf="low"] .progress-bar i.run { background-color: var(--st-run) !important; }
+:root[data-perf="low"] .agent-progress i { width: var(--w); background-color: var(--accent) !important; }

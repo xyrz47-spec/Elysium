@@ -485,7 +485,7 @@ async fn send(State(ctx): State<Ctx>, Authed(d): Authed, Json(req): Json<SendReq
     };
     audit::record(&ctx.st.db, "remote", "remote.send", "ok", json!({ "device": d.name, "work": req.work }));
     // 폰에서 보낸 작업은 '만들기'가 아니라 PC·폰의 허락을 받는 작업 모드로 돈다.
-    let r = orchestrator::send(&ctx.app, &ctx.st, req.conversation_id, req.text, choice, req.work, false, None, false, req.attachments).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
+    let r = orchestrator::send(&ctx.app, &ctx.st, req.conversation_id, req.text, choice, req.work, false, None, false, req.attachments, Default::default()).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
     Ok(Json(r))
 }
 
@@ -499,6 +499,16 @@ async fn cancel(State(ctx): State<Ctx>, Authed(d): Authed, Path(id): Path<String
     };
     audit::record(&ctx.st.db, "remote", "remote.cancel", if ok { "ok" } else { "missing" }, json!({ "device": d.name }));
     Ok(Json(json!({ "cancelled": ok })))
+}
+
+/// Running tasks of one conversation (for side questions).
+pub fn conv_snapshots(conv: &str) -> Vec<crate::livesnap::TaskSnap> {
+    snap().lock().unwrap_or_else(|p| p.into_inner()).list().into_iter().filter(|t| t.conversation_id == conv).collect()
+}
+
+/// One running task's snapshot (for the interruption checkpoint).
+pub fn task_snapshot(task: &str) -> Option<crate::livesnap::TaskSnap> {
+    snap().lock().unwrap_or_else(|p| p.into_inner()).list().into_iter().find(|t| t.task_id == task)
 }
 
 /// 지금 돌고 있는 작업과 그 에이전트(상태·지금 하는 일·토큰·출력 끝부분). 끝난 차례나 메시지를 기다리는 워커도 들어 있다.

@@ -1107,6 +1107,12 @@ body { background-image: var(--vignette), var(--horizon), var(--sky); background
 .side-a { padding: 2px 4px; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
 .side-by { font-size: 11px; color: var(--dim); margin-bottom: 2px; }
 .side-act { font-size: 12px; color: var(--dim); }
+.side-asks { margin: 2px 0 8px; display: grid; gap: 2px; }
+.side-ask > summary { display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 12px; list-style: none; }
+.side-ask > summary::-webkit-details-marker { display: none; }
+.side-ask-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.side-ask.ask .tag { opacity: .7; }
+.side-ask[open] { padding-bottom: 4px; border-bottom: 1px solid var(--line); }
 .side-box { display: flex; align-items: flex-end; gap: 6px; padding: 8px 8px 8px 12px; border-radius: 14px; background: var(--lg-ctl); box-shadow: var(--lg-ctl-edge); }
 .side-box textarea { flex: 1; min-width: 0; resize: none; border: 0; outline: none; background: transparent; font-size: 13px; line-height: 1.5; }
 .side-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 28px; padding: 4px 4px 0; font-size: 11px; color: var(--dim); }
@@ -1145,6 +1151,38 @@ body { background-image: var(--vignette), var(--horizon), var(--sky); background
 .attach-actions button:hover { background: var(--line-2); color: var(--ink); }
 
 /* JEV 입력 추천 */
+/* Work setup panel above the message box: who works on the request and how */
+.setup-btn { position: relative; }
+.setup-btn.on { color: var(--accent-ink); border-color: var(--accent-ink); }
+.setup-dot { font-size: 10.5px; padding: 0 6px; border-radius: 999px; background: var(--surface); color: var(--accent-ink); }
+.ws-panel { margin: 0 0 8px; padding: 12px 14px; border-radius: 18px; border: 1px solid var(--line); background: var(--card); box-shadow: var(--shadow-lg); max-height: 52vh; overflow-y: auto; animation: rise 0.25s var(--ease) backwards; }
+.ws-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.ws-head b { font-size: 13.5px; }
+.ws-note { font-size: 11.5px; color: var(--dim); }
+.ws-body { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 18px; }
+.ws-col { display: grid; gap: 8px; align-content: start; min-width: 0; }
+.ws-col h5 { margin: 0; font-size: 12px; color: var(--muted); font-weight: 600; }
+.ws-help { margin: 0; font-size: 11.5px; color: var(--dim); line-height: 1.5; }
+.ws-help.warn { color: var(--warn-ink); }
+.ws-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 12.5px; }
+.ws-row > span { color: var(--muted); }
+.ws-row input[type="number"] { width: 84px; }
+.ws-seg { font-size: 11.5px; }
+.ws-panel select, .ws-panel input { font-size: 12px; padding: 4px 8px; border-radius: 9px; min-width: 0; }
+.ws-team { display: grid; gap: 8px; }
+.ws-lead, .ws-seat { display: flex; align-items: center; gap: 6px; }
+.ws-lead select:first-of-type, .ws-seat select:first-of-type { flex: 1; }
+.ws-seat input[type="number"] { width: 56px; }
+.ws-tag { font-size: 11.5px; font-weight: 600; color: var(--accent-ink); min-width: 32px; }
+.ws-group { display: grid; gap: 6px; padding: 8px 10px; border-radius: 12px; border: 1px solid var(--line); background: var(--surface-2); }
+.ws-group-head { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.ws-group-head input { flex: 1; }
+.ws-group > .btn { justify-self: start; }
+.ws-team-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11.5px; }
+@media (max-width: 760px) {
+  .ws-body { grid-template-columns: minmax(0, 1fr); }
+  .ws-row { flex-wrap: wrap; }
+}
 .jev-suggest { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0 0 7px 12px; color: var(--muted); font-size: 12px; animation: rise 0.25s var(--ease) backwards; }
 .jev-suggest-tag { color: var(--dim); font-size: 11px; font-weight: 600; letter-spacing: 0.04em; }
 .jev-suggest button { min-height: 26px; padding: 2px 10px; border: 1px solid var(--line-2); border-radius: 999px; background: var(--surface-2); color: var(--ink); font-size: 12px; transition: border-color 0.2s, transform 0.2s var(--spring); }
@@ -1420,3 +1458,15 @@ body { background-image: var(--vignette), var(--horizon), var(--sky); background
 .sleep-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
 .sleep-row > span { font-size: 13px; color: var(--muted); }
 .sleep-row.check { cursor: pointer; }
+
+/* ── 버그 수정(2026-11-05) ── */
+/* 도크 툴팁이 열린 세션·도구 패널 뒤에 가려 조각만 보이던 것 */
+.dock { z-index: 7; }
+/* 세션 패널 머리: 이름과 세션 수를 한 줄 가운데에 */
+.panel-head { align-items: center; }
+/* 보내기 옆 ▾ 메뉴가 입력창 왼쪽 끝에 열리던 것: 버튼 위에 연다 */
+.composer-wrap > .menu.send-menu { left: auto; right: 0; }
+/* 좁은 칸의 긴 안내 문구는 글자 중간에서 잘리지 않고 말줄임 */
+.agent-talk input, .worker-compose input { text-overflow: ellipsis; }
+/* 도움말 바로 뒤의 스위치 줄에 여백 */
+.help + .toggle-row, .help + .set-row { margin-top: 14px; }

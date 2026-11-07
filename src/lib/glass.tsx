@@ -5,9 +5,10 @@
 //    판 크기가 바뀌면 필터의 좌표만 바꾼다(픽셀 계산·PNG 인코딩 없음).
 // 3) 반사광: 포인터 위치(--mx, --my)를 따라 움직이고, 누르면 판 안에서 빛난다(CSS).
 import { useEffect } from "react";
+import { isLowSpec, PERF_EVENT } from "./perf";
 
-/** 굴절을 거는 판: 떠 있는 크롬(도크·입력창·칩·첫 화면 카드·양쪽 사이드바)과 떠서 뜨는 창(설정·사용량·스킬 창, 메뉴, 기억 창). */
-const LIQUID = ".dock, .composer, .head-folder, .welcome-cards button, .panel-inner, .tools-inner, .modal, .menu, .slash-menu, .mem-pop";
+/** 굴절을 거는 판: 떠 있는 크롬(도크·입력창·칩·첫 화면 카드·양쪽 사이드바), 떠서 뜨는 창(설정·사용량·스킬 창, 메뉴, 기억 창), 대화 카드. */
+const LIQUID = ".dock, .composer, .head-folder, .welcome-cards button, .panel-inner, .tools-inner, .modal, .menu, .slash-menu, .mem-pop, .thread-inner > .card";
 /** 포인터 반사광이 따라오는 판 */
 const LIGHT = LIQUID;
 const IOR = 1.5;
@@ -179,7 +180,7 @@ let seq = 0;
 function buildFilter(w: number, h: number, r: number) {
   const short = Math.min(w, h);
   // 렌즈 폭: 판이 작을수록 판 전체가 물방울처럼 휜다(애플 툴바 버튼). 큰 판은 가장자리만.
-  const bezel = Math.max(6, Math.min(Math.round(short * 0.36), 26, Math.floor(short / 2)));
+  const bezel = Math.max(6, Math.min(Math.round(short * 0.4), 34, Math.floor(short / 2)));
   const rr = Math.min(r, Math.floor(short / 2));
   const t = tiles(rr, bezel);
   const m = t.m;
@@ -207,7 +208,7 @@ function buildFilter(w: number, h: number, r: number) {
   for (const p of parts) merge.appendChild(node("feMergeNode", { in: p }));
   f.appendChild(merge);
   // 밀림의 최대(px): 렌즈 폭에 비례
-  f.appendChild(node("feDisplacementMap", { in: "SourceGraphic", in2: "map", scale: Math.round(bezel * 1.8), xChannelSelector: "R", yChannelSelector: "G" }));
+  f.appendChild(node("feDisplacementMap", { in: "SourceGraphic", in2: "map", scale: Math.round(bezel * 2.4), xChannelSelector: "R", yChannelSelector: "G" }));
   return f;
 }
 
@@ -263,6 +264,7 @@ export function useLiquidRefraction() {
     let raf = 0;
     const flush = () => {
       raf = 0;
+      if (isLowSpec()) return dirty.clear();
       for (const e of dirty) {
         if (!e.isConnected) continue;
         const w = Math.round(e.offsetWidth);
@@ -295,24 +297,39 @@ export function useLiquidRefraction() {
           live.delete(e);
           ro.unobserve(e);
         }
+      if (isLowSpec()) return;
       document.querySelectorAll<HTMLElement>(LIQUID).forEach((e) => {
         if (live.has(e) || dirty.has(e)) return;
         ro.observe(e);
         mark(e);
       });
     };
-    scan();
+    // Refraction maps are built after the first paint so startup shows content sooner.
+    const first = window.setTimeout(scan, 200);
     // 세션을 바꾸거나 첫 화면이 다시 뜰 때 새로 생긴 판도 잡는다(스트리밍 중 잦은 변경은 프레임당 한 번으로 묶는다).
     let pending = 0;
     const mo = new MutationObserver(() => {
       if (!pending) pending = window.setTimeout(() => ((pending = 0), scan()), 120);
     });
     mo.observe(document.getElementById("root") ?? document.body, { childList: true, subtree: true });
+    // Low-spec on: drop every map. Off: rebuild them for the panels on screen.
+    const onPerf = () => {
+      for (const [e, v] of live) {
+        v.f.remove();
+        e.style.removeProperty("--lg-filter");
+        ro.unobserve(e);
+      }
+      live.clear();
+      if (!isLowSpec()) scan();
+    };
+    window.addEventListener(PERF_EVENT, onPerf);
     return () => {
+      window.removeEventListener(PERF_EVENT, onPerf);
       ro.disconnect();
       mo.disconnect();
       cancelAnimationFrame(raf);
       clearTimeout(pending);
+      clearTimeout(first);
       for (const v of live.values()) v.f.remove();
     };
   }, []);

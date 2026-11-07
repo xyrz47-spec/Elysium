@@ -130,6 +130,12 @@ pub fn conversation_messages(st: S, conversation_id: String) -> AppResult<Vec<Me
     store::list_messages(&st.db, &conversation_id)
 }
 
+/// Tasks still running (the window uses it to drop finished ones after a reload).
+#[tauri::command]
+pub fn tasks_running(st: S<'_>) -> Vec<String> {
+    st.tasks.lock().unwrap_or_else(|p| p.into_inner()).keys().cloned().collect()
+}
+
 /// 메인 창이 앞에 없으면 작업 표시줄 단추를 깜박여 알린다(작업이 끝났을 때).
 #[tauri::command]
 pub fn window_attention(app: AppHandle) -> AppResult<()> {
@@ -176,10 +182,10 @@ pub fn conversation_delete(app: AppHandle, st: S, conversation_id: String) -> Ap
 /// council: '회의' 버튼. 여러 AI가 라운드마다 서로의 발언을 읽고 대화하며 푼다(대화 모드).
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-pub fn chat_send(app: AppHandle, st: S, conversation_id: Option<String>, text: String, engine: Option<String>, work: Option<bool>, build: Option<bool>, workspace: Option<String>, council: Option<bool>, attachments: Option<Vec<String>>) -> AppResult<SendResult> {
+pub fn chat_send(app: AppHandle, st: S, conversation_id: Option<String>, text: String, engine: Option<String>, work: Option<bool>, build: Option<bool>, workspace: Option<String>, council: Option<bool>, attachments: Option<Vec<String>>, setup: Option<orchestrator::WorkSetup>) -> AppResult<SendResult> {
     let choice = engine.as_deref().filter(|e| *e != "auto").map(|e| EngineId::parse(e).ok_or_else(|| AppError::msg(format!("알 수 없는 엔진: {e}")))).transpose()?;
     let workspace = workspace.filter(|w| !w.trim().is_empty()).map(|w| checked_dir(&w)).transpose()?;
-    orchestrator::send(&app, st.inner(), conversation_id, text, choice, work.unwrap_or(false), build.unwrap_or(false), workspace, council.unwrap_or(false), attachments.unwrap_or_default()).map_err(AppError::msg)
+    orchestrator::send(&app, st.inner(), conversation_id, text, choice, work.unwrap_or(false), build.unwrap_or(false), workspace, council.unwrap_or(false), attachments.unwrap_or_default(), setup.unwrap_or_default()).map_err(AppError::msg)
 }
 
 // ---------------------------------------------------------------------------
@@ -414,7 +420,7 @@ fn query_value(v: &str) -> String {
     v.bytes().map(|b| if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
-/// 워커·그룹을 따로 띄운다(다른 모니터로 옮길 수 있다). 이미 열려 있으면 앞으로 가져온다.
+/// 워커·팀을 따로 띄운다(다른 모니터로 옮길 수 있다). 이미 열려 있으면 앞으로 가져온다.
 #[tauri::command]
 pub async fn worker_window_open(app: AppHandle, task_id: String, key: String, title: String) -> AppResult<()> {
     let label = window_label(&task_id, &key);
@@ -448,6 +454,12 @@ pub fn task_steer(app: AppHandle, st: S, task_id: String, text: String) -> AppRe
         return Err(AppError::msg("에이전트가 시작된 후 다시 보내 주십시오"));
     }
     Ok(())
+}
+
+/// Model names the work setup panel can offer (only those an installed AI can run).
+#[tauri::command]
+pub fn work_models(st: S) -> Vec<&'static str> {
+    crate::intent::model_choices(&st.installed())
 }
 
 /// 곁질문: 대화 기록·세션 메모리·CLI 세션을 건드리지 않고 지금 진행 상황이나 프로젝트에 대해 묻는다. 답은 side:* 이벤트로 온다.

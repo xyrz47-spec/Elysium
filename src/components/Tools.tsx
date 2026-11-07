@@ -1,16 +1,20 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
-import { api, baseName, ENGINE_LABEL, errorText, type EngineId, type MemoryView, type Message, type Settings } from "../lib/api";
+import { api, baseName, ENGINE_LABEL, errorText, type EngineId, type MemoryView } from "../lib/api";
 import { useTauriEvent } from "../lib/events";
-import { useApp, type AgentRun, type Live } from "../store";
-import Segmented from "./Segmented";
-import { AgentsIcon, ArrowDownIcon, ArrowUpIcon, ChatIcon, ChevronIcon, CloseIcon, DownloadIcon, FolderIcon, InfoIcon, ListIcon, SearchIcon, SendIcon, StopIcon, TrashIcon } from "./Icons";
+import { useApp, type AgentRun, type Live, type SideAsk } from "../store";
+import { ChartIcon, ChatIcon, ChevronIcon, CloseIcon, FolderIcon, InfoIcon, SendIcon, StopIcon, TerminalIcon, TrashIcon } from "./Icons";
+import TerminalTab, { T as TERM } from "./TerminalTab";
 import Markdown from "./Markdown";
-import { LeadSection, QueueCard } from "./LeadPanel";
+import { LeadSection, QueueCard, nowText } from "./LeadPanel";
+import { AgentBoard, Grip, GroupMenu, useAgentShown, useBoardFocus } from "./AgentBoard";
+import { groupOps } from "../lib/agentGroups";
 import { BgJobs } from "./BgJobs";
+import { PowerToggle } from "./PowerBanner";
+import LimitsTab, { LIMIT_TEXT } from "./LimitsTab";
 import { tailText } from "../lib/panel";
-import { INTEGRATE, pair, ROLE_LABEL } from "./Thread";
+import { INTEGRATE, ROLE_LABEL } from "./Thread";
 
-export type ToolTab = "info" | "agents" | "side" | "outline" | "find" | "export";
+export type ToolTab = "info" | "limits" | "side" | "terminal";
 
 /** 에이전트 탭 문구(설정 창도 같이 쓴다) */
 export const A = {
@@ -19,11 +23,7 @@ export const A = {
   running: "실행 현황",
   idle: "현재 실행 중인 에이전트가 없습니다. 요청을 보내면 초안, 검토, 토론 등 작업 중인 AI의 상태가 여기에 표시됩니다.",
   roster: "사용 가능한 엔진",
-  preset: "동시 실행 수",
-  presetHelp: "2개 이상 설정 시 질문 답변과 파일 작업이 여러 에이전트에 분할되어 병렬 진행 후 통합되며, 토큰 소모량이 증가합니다. 메시지에 '에이전트 3개로'나 'opus랑 gpt-5로'처럼 입력하여 바로 지정할 수도 있습니다.",
-  off: "꺼짐",
-  auto: "자동",
-  autoHelp: "JEV가 요청마다 판단해, 독립된 부분으로 나뉘는 파일 작업일 때만 여러 에이전트를 실행하고 각 부분의 AI와 강도를 정합니다. 숫자는 개수를 고정합니다.",
+  autoCount: "AI가 요청과 대화를 분석해 에이전트 수를 최대 64개까지 자동 결정합니다. 수를 고정하려면 '에이전트 3개로'처럼 메시지에 입력하시면 됩니다.",
   open: "이동",
   stop: "중지",
   stopTask: "강제 종료",
@@ -62,16 +62,36 @@ const S = {
   thinking: "답변 준비 중",
   stopped: "답변 중지됨",
   note: "저장되지 않으며 대화에 영향 없음",
+  asked: "확인 중인 워커",
 };
 
-const AGENT_AUTO = "auto";
-/** 동시 실행 수 고르기(도구 패널·설정 창이 같이 쓴다) */
-export const agentChoice = {
-  value: (s: Settings) => (s.agentsAuto ? AGENT_AUTO : String(s.agents ?? 1)),
-  options: [AGENT_AUTO, ...Array.from({ length: 16 }, (_, i) => String(i + 1))].map((v) => ({ value: v, label: v === AGENT_AUTO ? A.auto : v === "1" ? A.off : v })),
-  apply: (s: Settings, v: string): Settings => (v === AGENT_AUTO ? { ...s, agentsAuto: true } : { ...s, agentsAuto: false, agents: Number(v) }),
-  help: (s: Settings) => (s.agentsAuto ? A.autoHelp : A.presetHelp),
+/** Status of one worker the lead asked */
+const ASK_STATE: Record<SideAsk["state"], string> = {
+  ask: "응답 대기 중",
+  ok: "응답 완료",
+  fail: "미응답 로그 참조",
+  log: "활동 로그 참조",
+  done: "작업 완료",
 };
+
+/** Workers the lead asked for this answer; each reply opens on click. */
+function SideAsks({ asks }: { asks: SideAsk[] }) {
+  return (
+    <div className="side-asks">
+      <div className="side-by">{S.asked}</div>
+      {asks.map((a) => (
+        <details key={a.key} className={`side-ask ${a.state}`}>
+          <summary>
+            <span className="side-ask-name">{a.title}</span>
+            <span className="tag">{ASK_STATE[a.state]}</span>
+          </summary>
+          {a.state === "ok" && a.text && <Markdown text={a.text} />}
+          {a.state === "fail" && a.text && <div className="agent-err">{a.text}</div>}
+        </details>
+      ))}
+    </div>
+  );
+}
 
 const STATE_LABEL: Record<AgentRun["state"], string> = {
   run: "실행 중",
@@ -91,6 +111,9 @@ function AgentRow({ l, a, now }: { l: Live; a: AgentRun; now: number }) {
   const { cancelAgent, toast } = useApp();
   const [open, setOpen] = useState(false);
   const [msg, setMsg] = useState("");
+  const row = useRef<HTMLLIElement>(null);
+  const shown = useAgentShown(a.key);
+  useBoardFocus(a.key, row, () => setOpen(true));
   const talk = async () => {
     const t = msg.trim();
     if (!t) return;
@@ -109,9 +132,11 @@ function AgentRow({ l, a, now }: { l: Live; a: AgentRun; now: number }) {
     if (el) el.scrollTop = el.scrollHeight;
   }, [text, open]);
   const name = part?.title ?? a.label;
+  if (!shown) return null;
   return (
-    <li className={`agent-run ${a.state} ${open ? "open" : ""}`}>
+    <li ref={row} className={`agent-run ${a.state} ${open ? "open" : ""}`}>
       <div className="agent-row">
+        <Grip keys={[a.key]} label={name} />
         <button className="agent-toggle" onClick={() => setOpen((o) => !o)} aria-expanded={open}>
           <i className="agent-dot" aria-hidden />
           <div className="agent-main">
@@ -126,6 +151,7 @@ function AgentRow({ l, a, now }: { l: Live; a: AgentRun; now: number }) {
           </div>
           <ChevronIcon open={open} />
         </button>
+        <GroupMenu keys={[a.key]} label={name} />
         {a.state === "run" && (
           <button className="agent-stop" onClick={() => cancelAgent(l.taskId, a.key)} title={A.stopAgent} aria-label={`${A.stopAgent} · ${name}`}>
             <StopIcon />
@@ -197,16 +223,19 @@ function modeOf(l: Live): string | null {
   return null;
 }
 
-function AgentsTab({ onClose }: { onClose: () => void }) {
-  const { live, engines, conversations, conversationId, openConversation, cancel, cancelAll, approvals, settings, saveSettings } = useApp();
+/** Agent status board. Shown in the side panel, or as the main view next to the chat (`main`). */
+export function AgentsTab({ onClose, main = false }: { onClose: () => void; main?: boolean }) {
+  const { live, engines, conversations, conversationId, openConversation, cancel, cancelAll, approvals } = useApp();
   const [, tick] = useState(0);
+  // 끝난 작업의 그룹은 지운다.
+  useEffect(() => groupOps.prune(live.map((l) => l.taskId)), [live]);
   // 실행 중이면 경과 시간을 1초마다 다시 그린다.
   useEffect(() => {
     if (!live.length) return;
     const t = setInterval(() => tick((x) => x + 1), 1000);
     return () => clearInterval(t);
   }, [live.length]);
-  const tasks = [...live].sort((a, b) => a.startedAt - b.startedAt);
+  const tasks = [...live].sort((a, b) => (main ? Number(b.conversationId === conversationId) - Number(a.conversationId === conversationId) : 0) || a.startedAt - b.startedAt);
   const busy = new Map<string, number>();
   for (const l of live) for (const a of Object.values(l.agents)) if (a.state === "run") busy.set(a.engine, (busy.get(a.engine) ?? 0) + 1);
   const installed = engines.filter((e) => e.installed);
@@ -217,6 +246,7 @@ function AgentsTab({ onClose }: { onClose: () => void }) {
         <h4>
           {A.running}
           {tasks.length > 0 && <span className="agent-count">{tasks.length}</span>}
+          {main && <PowerToggle />}
           {tasks.length > 1 && (
             <button className="btn sm danger agent-stop-all" onClick={cancelAll}>
               {A.stopAll}
@@ -244,14 +274,26 @@ function AgentsTab({ onClose }: { onClose: () => void }) {
                 </div>
               )}
               {l.lead && <LeadSection l={l} />}
-              <ul className="agent-runs">
-                {runs.length === 0 && <li className="agent-run wait">{waiting ? A.approval : A.preparing}</li>}
-                {runs
-                  .filter((a) => !l.lead || (!a.key.startsWith("agent:") && !a.key.startsWith("lead")))
-                  .map((a) => (
-                    <AgentRow key={a.key} l={l} a={a} now={now} />
-                  ))}
-              </ul>
+              <AgentBoard
+                l={l}
+                runs={l.lead ? [] : runs}
+                name={(a) => l.parts[a.key]?.title ?? a.label}
+                now={nowText}
+                row={(a) => (
+                  <ul className="agent-runs">
+                    <AgentRow l={l} a={a} now={now} />
+                  </ul>
+                )}
+              >
+                <ul className="agent-runs">
+                  {runs.length === 0 && <li className="agent-run wait">{waiting ? A.approval : A.preparing}</li>}
+                  {runs
+                    .filter((a) => !l.lead || (!a.key.startsWith("agent:") && !a.key.startsWith("lead")))
+                    .map((a) => (
+                      <AgentRow key={a.key} l={l} a={a} now={now} />
+                    ))}
+                </ul>
+              </AgentBoard>
               <BgJobs l={l} />
               <div className="row">
                 {l.conversationId !== conversationId && (
@@ -291,50 +333,20 @@ function AgentsTab({ onClose }: { onClose: () => void }) {
             ))}
           </ul>
         )}
+        <p className="tool-help">{A.autoCount}</p>
       </section>
-      {settings && (
-        <section className="tool-sec">
-          <h4>{A.preset}</h4>
-          <Segmented
-            label={A.preset}
-            className="wide dense"
-            value={agentChoice.value(settings)}
-            options={agentChoice.options}
-            onChange={(v) => saveSettings(agentChoice.apply(settings, v))}
-          />
-          <p className="tool-help">{agentChoice.help(settings)}</p>
-        </section>
-      )}
     </div>
   );
 }
 
 const TABS: { id: ToolTab; label: string; icon: ReactNode; tip: string }[] = [
   { id: "info", label: "세션 정보", icon: <InfoIcon />, tip: "세션 정보: 폴더·AI·토큰·비용·기억" },
-  { id: "agents", label: A.title, icon: <AgentsIcon />, tip: A.tip },
+  { id: "limits", label: LIMIT_TEXT.title, icon: <ChartIcon />, tip: LIMIT_TEXT.tip },
   { id: "side", label: S.title, icon: <ChatIcon />, tip: S.tip },
-  { id: "outline", label: "목차", icon: <ListIcon />, tip: "목차: 질문으로 바로 이동" },
-  { id: "find", label: "찾기", icon: <SearchIcon />, tip: "세션에서 찾기 (Ctrl+F)" },
-  { id: "export", label: "내보내기", icon: <DownloadIcon />, tip: "마크다운으로 복사·저장" },
+  { id: "terminal", label: TERM.title, icon: <TerminalIcon />, tip: TERM.tip },
 ];
 
 const label = (id: unknown) => (typeof id === "string" ? (ENGINE_LABEL[id as EngineId] ?? id) : null);
-const answeredBy = (m: Message | null) => (m?.data ? label(m.data.judgedBy) ?? label(m.data.reviewedBy) ?? label(m.data.draftedBy) : null);
-
-/** 본문의 그 카드로 부드럽게 옮기고 잠깐 빛나게 한다. */
-function jumpTo(key: string) {
-  const el = document.getElementById(`ex-${key}`);
-  if (!el) return;
-  el.scrollIntoView({ behavior: "smooth", block: "start" });
-  el.classList.remove("flash");
-  void el.offsetWidth;
-  el.classList.add("flash");
-}
-
-function scrollThread(to: "top" | "bottom") {
-  const t = document.querySelector<HTMLElement>(".thread");
-  t?.scrollTo({ top: to === "top" ? 0 : t.scrollHeight, behavior: "smooth" });
-}
 
 function tokens(n: number) {
   return n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : String(n);
@@ -439,87 +451,6 @@ function InfoTab() {
   );
 }
 
-function OutlineTab() {
-  const { messages, conversationId } = useApp();
-  const ex = pair(messages).filter((e) => e.user);
-  if (!conversationId || ex.length === 0) return <Empty>질문을 보내면 여기에 목차가 생깁니다. 누르면 그 답으로 이동합니다.</Empty>;
-  return (
-    <div className="tool-body">
-      <div className="row tool-jump">
-        <button className="btn sm ghost" onClick={() => scrollThread("top")}>
-          <ArrowUpIcon /> 맨 위
-        </button>
-        <button className="btn sm ghost" onClick={() => scrollThread("bottom")}>
-          <ArrowDownIcon /> 맨 아래
-        </button>
-      </div>
-      <ol className="tool-outline">
-        {ex.map((e, i) => (
-          <li key={e.key} style={{ "--i": i } as CSSProperties}>
-            <button onClick={() => jumpTo(e.key)}>
-              <span className="tool-num">{i + 1}</span>
-              <span className="tool-q">{e.user!.content}</span>
-              <span className="tool-by">{e.answer ? answeredBy(e.answer) ?? "답함" : "답 기다리는 중"}</span>
-            </button>
-          </li>
-        ))}
-      </ol>
-    </div>
-  );
-}
-
-function highlight(text: string, q: string): ReactNode {
-  const i = text.toLowerCase().indexOf(q.toLowerCase());
-  if (i < 0) return text.slice(0, 90);
-  const start = Math.max(0, i - 30);
-  return (
-    <>
-      {start > 0 && "…"}
-      {text.slice(start, i)}
-      <mark>{text.slice(i, i + q.length)}</mark>
-      {text.slice(i + q.length, i + q.length + 60)}…
-    </>
-  );
-}
-
-function FindTab({ focusKey }: { focusKey: number }) {
-  const { messages, conversationId } = useApp();
-  const [q, setQ] = useState("");
-  const input = useRef<HTMLInputElement>(null);
-  useEffect(() => input.current?.focus(), [focusKey]);
-  const ex = pair(messages);
-  const hits = q.trim().length < 1 ? [] : ex.flatMap((e) => [e.user, e.answer].filter((m): m is Message => !!m && m.content.toLowerCase().includes(q.trim().toLowerCase())).map((m) => ({ key: e.key, m })));
-  return (
-    <div className="tool-body">
-      <div className="tool-search">
-        <SearchIcon />
-        <input ref={input} type="text" value={q} onChange={(e) => setQ(e.target.value)} placeholder="이 세션에서 찾기" aria-label="세션에서 찾기" onKeyDown={(e) => e.key === "Enter" && hits[0] && jumpTo(hits[0].key)} />
-      </div>
-      {!conversationId ? (
-        <Empty>세션을 열면 그 세션의 질문과 답에서 찾습니다.</Empty>
-      ) : q.trim() === "" ? (
-        <Empty>찾을 낱말을 입력하세요. Enter를 누르면 첫 결과로 이동합니다.</Empty>
-      ) : hits.length === 0 ? (
-        <Empty>"{q}"가 이 세션에 없습니다.</Empty>
-      ) : (
-        <>
-          <p className="tool-count">{hits.length}곳</p>
-          <ul className="tool-hits">
-            {hits.map((h, i) => (
-              <li key={`${h.m.id}-${i}`}>
-                <button onClick={() => jumpTo(h.key)}>
-                  <span className="tool-by">{h.m.role === "user" ? "질문" : `답${answeredBy(h.m) ? ` · ${answeredBy(h.m)}` : ""}`}</span>
-                  <span className="tool-snip">{highlight(h.m.content, q.trim())}</span>
-                </button>
-              </li>
-            ))}
-          </ul>
-        </>
-      )}
-    </div>
-  );
-}
-
 function SideTab() {
   const { side, askSide, stopSide, clearSide, engines, toast } = useApp();
   const [q, setQ] = useState("");
@@ -549,6 +480,7 @@ function SideTab() {
             </div>
           ) : (
             <div key={t.id} className={`side-a ${t.state ?? ""}`}>
+              {t.asks && t.asks.length > 0 && <SideAsks asks={t.asks} />}
               {t.engine && <div className="side-by">{label(t.engine)}</div>}
               {t.text && <Markdown text={t.text} />}
               {t.state === "run" && <div className="side-act">{t.activity ?? S.thinking}</div>}
@@ -594,66 +526,15 @@ function SideTab() {
   );
 }
 
-function ExportTab() {
-  const { conversationId, conversations, toast } = useApp();
-  const c = conversations.find((x) => x.id === conversationId);
-  const [busy, setBusy] = useState(false);
-  if (!c) return <Empty>세션을 열면 그 세션의 질문과 답을 마크다운으로 복사하거나 파일로 저장할 수 있습니다.</Empty>;
-  return (
-    <div className="tool-body">
-      <p className="tool-help">질문, 답(누가 답했는지), 세션 요약을 마크다운으로 만듭니다.</p>
-      <button
-        className="btn wide"
-        disabled={busy}
-        onClick={async () => {
-          setBusy(true);
-          try {
-            await navigator.clipboard.writeText(await api.conversationMarkdown(c.id));
-            toast("마크다운을 복사했습니다.");
-          } catch (e) {
-            toast(errorText(e), "error");
-          } finally {
-            setBusy(false);
-          }
-        }}
-      >
-        마크다운으로 복사
-      </button>
-      <button
-        className="btn wide primary"
-        disabled={busy}
-        onClick={async () => {
-          setBusy(true);
-          try {
-            const p = await api.conversationExport(c.id);
-            toast(`저장했습니다: ${baseName(p)}`);
-          } catch (e) {
-            toast(errorText(e), "error");
-          } finally {
-            setBusy(false);
-          }
-        }}
-      >
-        작업 폴더에 .md로 저장
-      </button>
-      <p className="tool-help">저장 위치: 이 세션의 작업 폴더 안 "Elysium 내보내기". 저장하면 탐색기에서 파일을 보여 줍니다.</p>
-    </div>
-  );
-}
-
 // ---------------------------------------------------------------------------
 
 /** 오른쪽 도구 도크(왼쪽 도크와 대칭) */
 export function ToolDock({ tab, onTab }: { tab: ToolTab | null; onTab: (t: ToolTab | null) => void }) {
-  const { live } = useApp();
-  // 지금 돌고 있는 AI 수(에이전트 탭 배지)
-  const running = live.reduce((n, l) => n + Object.values(l.agents).filter((a) => a.state === "run").length, 0);
   return (
     <nav className="dock tools-dock" aria-label="도구">
       {TABS.map((t) => (
         <button key={t.id} className={`dock-btn ${tab === t.id ? "on" : ""}`} onClick={() => onTab(tab === t.id ? null : t.id)} aria-label={t.label} aria-pressed={tab === t.id} data-tip={t.tip}>
           {t.icon}
-          {t.id === "agents" && running > 0 && <span className="dock-count">{running}</span>}
         </button>
       ))}
     </nav>
@@ -661,7 +542,7 @@ export function ToolDock({ tab, onTab }: { tab: ToolTab | null; onTab: (t: ToolT
 }
 
 /** 오른쪽 도구 패널: 본문을 밀지 않고 위에 떠 있다. */
-export function ToolPanel({ tab, onTab, focusKey, onResizeStart, onResizeKey }: { tab: ToolTab | null; onTab: (t: ToolTab | null) => void; focusKey: number; onResizeStart: (e: React.PointerEvent) => void; onResizeKey: (e: React.KeyboardEvent) => void }) {
+export function ToolPanel({ tab, onTab, onResizeStart, onResizeKey }: { tab: ToolTab | null; onTab: (t: ToolTab | null) => void; onResizeStart: (e: React.PointerEvent) => void; onResizeKey: (e: React.KeyboardEvent) => void }) {
   const [shown, setShown] = useState<ToolTab>(tab ?? "info");
   useEffect(() => {
     if (tab) setShown(tab);
@@ -680,11 +561,9 @@ export function ToolPanel({ tab, onTab, focusKey, onResizeStart, onResizeKey }: 
           </button>
         </div>
         {shown === "info" && <InfoTab />}
-        {shown === "agents" && <AgentsTab onClose={() => onTab(null)} />}
+        {shown === "limits" && <LimitsTab />}
         {shown === "side" && <SideTab />}
-        {shown === "outline" && <OutlineTab />}
-        {shown === "find" && <FindTab focusKey={focusKey} />}
-        {shown === "export" && <ExportTab />}
+        {shown === "terminal" && <TerminalTab />}
       </div>
     </aside>
   );

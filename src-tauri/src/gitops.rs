@@ -201,6 +201,28 @@ pub fn parse_status(out: &str) -> Vec<String> {
     paths
 }
 
+/// How a failed commit can be recovered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitFailure {
+    /// Another git process holds a lock: wait and try again.
+    Busy,
+    /// Git identity or signing is missing: only the person can fix it.
+    NeedsUser,
+    /// A hook or the change itself was rejected: the lead can fix files and try again.
+    Fixable,
+}
+
+pub fn commit_failure(err: &str) -> CommitFailure {
+    let e = err.to_ascii_lowercase();
+    if e.contains("index.lock") || e.contains(".lock': file exists") || e.contains("cannot lock ref") || (e.contains("unable to create") && e.contains(".lock")) || e.contains("another git process") {
+        CommitFailure::Busy
+    } else if e.contains("tell me who you are") || e.contains("empty ident") || e.contains("user.email") || e.contains("gpg failed") || e.contains("failed to sign") || e.contains("signing failed") || e.contains("dubious ownership") {
+        CommitFailure::NeedsUser
+    } else {
+        CommitFailure::Fixable
+    }
+}
+
 /// 앞뒤 상태를 비교해 그 사이에 바뀐 경로
 pub fn changed_between(before: &BTreeMap<String, Option<[u8; 32]>>, after: &BTreeMap<String, Option<[u8; 32]>>) -> Vec<String> {
     let mut out: Vec<String> = after.iter().filter(|(p, h)| before.get(*p) != Some(h)).map(|(p, _)| p.clone()).collect();
@@ -230,6 +252,27 @@ mod tests {
         g(r.path(), &["add", "."]);
         g(r.path(), &["commit", "-qm", "base"]);
         r
+    }
+
+    #[test]
+    fn commit_failures_are_classified() {
+        assert_eq!(commit_failure("fatal: Unable to create 'C:/r/.git/index.lock': File exists."), CommitFailure::Busy);
+        assert_eq!(commit_failure("error: cannot lock ref 'HEAD': Unable to create"), CommitFailure::Busy);
+        assert_eq!(commit_failure("*** Please tell me who you are."), CommitFailure::NeedsUser);
+        assert_eq!(commit_failure("error: gpg failed to sign the data"), CommitFailure::NeedsUser);
+        assert_eq!(commit_failure("husky - pre-commit hook exited with code 1 (error)"), CommitFailure::Fixable);
+    }
+
+    #[test]
+    fn hook_rejection_surfaces_as_error() {
+        let r = repo();
+        let hooks = r.path().join(".git/hooks");
+        std::fs::write(hooks.join("pre-commit"), "#!/bin/sh\necho lint failed >&2\nexit 1\n").unwrap();
+        let repo = open(r.path()).unwrap();
+        std::fs::write(r.path().join("a.txt"), "changed").unwrap();
+        let e = repo.commit(&["a.txt".into()], "m").unwrap_err();
+        assert!(e.contains("lint failed"), "{e}");
+        assert_eq!(commit_failure(&e), CommitFailure::Fixable);
     }
 
     #[test]

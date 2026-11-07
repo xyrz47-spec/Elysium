@@ -1,4 +1,12 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
+import LazyDetails from "./LazyDetails";
+import { LoadEarlier, TAIL_TEXT, useKeepScroll } from "../lib/tail";
+
+const CONT_TEXT = {
+  label: "이어서 진행",
+  tip: "지금까지의 진행 내역과 현재 파일 상태를 확인하여 남은 작업을 이어서 진행합니다.",
+  busy: "현재 진행 중인 작업이 완료된 후 사용할 수 있습니다.",
+};
 import TokenMeter from "./TokenMeter";
 import { sumUsage } from "../lib/usage";
 import { ENGINE_LABEL, TIER_LABEL, stripFileMarkers, type Approval, type Budget, type CouncilTurn, type EngineId, type Judgment, type Message, type MessageData, type Step } from "../lib/api";
@@ -8,7 +16,7 @@ import { LiveBrief } from "./LeadPanel";
 import { SavedLeadLog } from "./LeadPanel";
 import { hideBlocks } from "../lib/panel";
 import { MessageAttachments } from "./Attachments";
-import { ChevronIcon, CopyIcon, CouncilIcon, EditIcon, FolderIcon, RedoIcon, SparkIcon, WrenchIcon } from "./Icons";
+import { ArrowDownIcon, ChevronIcon, CopyIcon, CouncilIcon, EditIcon, FolderIcon, RedoIcon, SparkIcon, WrenchIcon } from "./Icons";
 
 /** 첫 화면 예시: 눌러서 입력창에 넣고, 만들기(또는 Enter)로 보낸다 */
 const SUGGESTIONS: { title: string; text: string; tone: string }[] = [
@@ -137,6 +145,10 @@ function stepNodes(steps: Step[], council?: MessageData["council"], work = false
     out.push({ key: `s${i}`, kind: s.role, title: s.label, sub: `${role} · ${s.ok ? secs(s.ms) : "실패"}${t ? ` · ${t}` : ""}`, state: s.ok ? "ok" : "fail" });
   });
   flush(steps.length);
+  // The assigner (roadmap) is shown before the splitter (plan), as in the live view.
+  for (let i = 0; i + 1 < out.length; i++) {
+    if (out[i].kind === "plan" && out[i + 1].kind === "roadmap") [out[i], out[i + 1]] = [out[i + 1], out[i]];
+  }
   return out;
 }
 
@@ -172,8 +184,9 @@ function teamNodes(l: Live): RibbonNode[] {
   const plan = Object.values(l.agents).find((a) => a.role === "plan");
   const roadmap = Object.values(l.agents).filter((a) => a.role === "roadmap");
   const out: RibbonNode[] = [];
-  if (l.work) out.push({ key: "plan", kind: "plan", title: ENGINE_LABEL[t.synth], sub: ROLE_LABEL.plan, state: plan ? plan.state : "wait" });
+  // The assigner (roadmap) is shown before the splitter (plan).
   if (roadmap.length) out.push({ key: "roadmap", kind: "roadmap", title: ENGINE_LABEL.opencode, sub: ROLE_LABEL.roadmap, state: roadmap.some((a) => a.state === "run") ? "run" : roadmap[roadmap.length - 1].state });
+  if (l.work) out.push({ key: "plan", kind: "plan", title: ENGINE_LABEL[t.synth], sub: ROLE_LABEL.plan, state: plan ? plan.state : "wait" });
   out.push({ key: "team", kind: "agent", title: l.work ? workTitle(total) : agentsTitle(total), sub: `${ok}/${total} · ${t.agents.map((a) => ENGINE_LABEL[a.engine]).filter((v, i, x) => x.indexOf(v) === i).join(" · ")}`, state });
   out.push({ key: "synth", kind: "synth", title: ENGINE_LABEL[t.synth], sub: l.work ? INTEGRATE : ROLE_LABEL.synth, state: synth ? (synth.state === "run" ? "run" : synth.state) : "wait" });
   return out;
@@ -348,11 +361,16 @@ function Details({ data }: { data: MessageData }) {
           <SavedLeadLog decisions={data.team?.decisions} groupLog={data.team?.groupLog} leadLog={data.team?.leadLog} orgLog={data.team?.orgLog} />
           {data.team?.agents.map((a, i) =>
             a.text || (a.files && a.files.length) ? (
-              <details key={`t${i}`} className="draft">
-                <summary>
-                  {a.title ? partTitle(i + 1, a.title) : agentAnswerTitle(i + 1)} · {ENGINE_LABEL[a.engine]}
-                  {a.model ? ` · ${a.model}` : ""}
-                </summary>
+              <LazyDetails
+                key={`t${i}`}
+                className="draft"
+                summary={
+                  <>
+                    {a.title ? partTitle(i + 1, a.title) : agentAnswerTitle(i + 1)} · {ENGINE_LABEL[a.engine]}
+                    {a.model ? ` · ${a.model}` : ""}
+                  </>
+                }
+              >
                 {a.files && a.files.length > 0 && (
                   <div className="part-files">
                     <b>{CHANGED}</b>
@@ -362,22 +380,18 @@ function Details({ data }: { data: MessageData }) {
                   </div>
                 )}
                 {a.text && <Markdown text={a.text} />}
-              </details>
+              </LazyDetails>
             ) : null,
           )}
           {data.debate?.rounds.filter((r) => r.text).map((r, i) => (
-            <details key={i} className="draft">
-              <summary>
-                {r.round === 1 ? "토론 1차 답" : "반론과 고친 답"} ({ENGINE_LABEL[r.engine]})
-              </summary>
+            <LazyDetails key={i} className="draft" summary={<>{r.round === 1 ? "토론 1차 답" : "반론과 고친 답"} ({ENGINE_LABEL[r.engine]})</>}>
               <Markdown text={r.text} />
-            </details>
+            </LazyDetails>
           ))}
           {data.draft && (
-            <details className="draft">
-              <summary>검토 전 초안 ({data.draftedBy ? ENGINE_LABEL[data.draftedBy] : ""})</summary>
+            <LazyDetails className="draft" summary={<>검토 전 초안 ({data.draftedBy ? ENGINE_LABEL[data.draftedBy] : ""})</>}>
               <Markdown text={data.draft} />
-            </details>
+            </LazyDetails>
           )}
         </div>
       )}
@@ -431,7 +445,7 @@ export function pair(messages: Message[]): Exchange[] {
 
 /** 결과 카드: 요청(머리) → 릴레이 리본 → 결과(본문) → 과정·복사(꼬리) */
 function Card({ ex, live, approvals, index, busy, onPick }: { ex: Exchange; live?: Live; approvals: Approval[]; index: number; busy: boolean; onPick: (t: string) => void }) {
-  const { toast, send } = useApp();
+  const { toast, send, resume, conversationId } = useApp();
   const a = ex.answer;
   const data = a?.data ?? null;
   const failed = !!a && a.content.startsWith("⚠");
@@ -470,12 +484,16 @@ function Card({ ex, live, approvals, index, busy, onPick }: { ex: Exchange; live
       {live && <LiveBrief l={live} />}
       {live?.council && <CouncilWindows seats={liveSeats(live)} max={live.council.rounds} />}
       {!live && data?.council && (
-        <details className="council-log">
-          <summary>
-            <CouncilIcon size={14} /> 회의 대화 기록 보기
-          </summary>
+        <LazyDetails
+          className="council-log"
+          summary={
+            <>
+              <CouncilIcon size={14} /> 회의 대화 기록 보기
+            </>
+          }
+        >
           <CouncilWindows seats={savedSeats(data.council)} max={data.council.maxRounds} />
-        </details>
+        </LazyDetails>
       )}
       {approvals.map((ap) => (
         <ApprovalView key={ap.id} a={ap} />
@@ -518,6 +536,11 @@ function Card({ ex, live, approvals, index, busy, onPick }: { ex: Exchange; live
               <button className="foot-btn" title="이 질문을 입력창에 넣어 고친 뒤 보냅니다" onClick={() => onPick(ex.user!.content)}>
                 <EditIcon /> 고쳐서 보내기
               </button>
+              {data?.error && conversationId && (
+                <button className="foot-btn resume" disabled={busy} title={busy ? CONT_TEXT.busy : CONT_TEXT.tip} onClick={() => resume(conversationId, a.id)}>
+                  <RedoIcon /> {CONT_TEXT.label}
+                </button>
+              )}
             </>
           )}
         </footer>
@@ -559,6 +582,13 @@ function Welcome({ onPick }: { onPick: (t: string) => void }) {
   );
 }
 
+const BOTTOM_TEXT = "맨 아래로 이동";
+
+/** Answer cards drawn at first in a long session; older ones load on demand. */
+const CARD_STEP = 20;
+/** The outline/find panel asks the thread to draw every card before jumping to one. */
+export const THREAD_REVEAL = "elysium:thread-reveal";
+
 export default function Thread({ onPick }: { onPick: (t: string) => void }) {
   const { messages, live, conversationId, approvals } = useApp();
   const ref = useRef<HTMLDivElement>(null);
@@ -566,6 +596,23 @@ export default function Thread({ onPick }: { onPick: (t: string) => void }) {
   const pending = approvals.filter((a) => a.conversationId === conversationId);
   const stick = useRef(true);
   const exchanges = pair(messages);
+  const [limit, setLimit] = useState(CARD_STEP);
+  useEffect(() => setLimit(CARD_STEP), [conversationId]);
+  useEffect(() => {
+    const all = () => setLimit(Infinity);
+    window.addEventListener(THREAD_REVEAL, all);
+    return () => window.removeEventListener(THREAD_REVEAL, all);
+  }, []);
+  const shown = Math.min(exchanges.length, limit);
+  const keep = useKeepScroll(ref, shown);
+  // Shown while the reader is not at the bottom of the conversation.
+  const [away, setAway] = useState(false);
+  const toBottom = () => {
+    const el = ref.current;
+    if (!el) return;
+    stick.current = true;
+    el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+  };
 
   useEffect(() => {
     const el = ref.current;
@@ -582,20 +629,30 @@ export default function Thread({ onPick }: { onPick: (t: string) => void }) {
   // 진행 중인 요청은 답이 아직 없는 마지막 카드에 붙인다.
   const lastOpen = exchanges.length && !exchanges[exchanges.length - 1].answer ? exchanges.length - 1 : -1;
   return (
+    <div className="thread-wrap">
     <div
       className="thread"
       ref={ref}
       onScroll={(e) => {
         const el = e.currentTarget;
         stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+        const off = el.scrollHeight - el.scrollTop - el.clientHeight > 240;
+        if (off !== away) setAway(off);
       }}
       aria-live="polite"
     >
       <div className="thread-inner">
-        {exchanges.map((ex, i) => (
+        <LoadEarlier hidden={exchanges.length - shown} label={TAIL_TEXT.items} onMore={() => (keep(), (stick.current = false), setLimit((n) => n + CARD_STEP))} />
+        {exchanges.map((ex, i) => i < exchanges.length - shown ? null : (
           <Card key={ex.key} ex={ex} index={i} live={i === lastOpen ? mine[0] : undefined} approvals={i === lastOpen ? pending : []} busy={mine.length > 0} onPick={onPick} />
         ))}
       </div>
+    </div>
+    {away && (
+      <button type="button" className="to-bottom" onClick={toBottom} aria-label={BOTTOM_TEXT} title={BOTTOM_TEXT}>
+        <ArrowDownIcon />
+      </button>
+    )}
     </div>
   );
 }

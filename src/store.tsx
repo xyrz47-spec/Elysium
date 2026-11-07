@@ -1,13 +1,51 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { api, errorText, type BgJob, type GroupInfo, type GroupNote, type OrgPost, type OrgUnit, type LeadCommit, type LeadNote, type LeadDecision, type LeadPolicy, type LeadQuestion, type QueueView, type Approval, type Conversation, type EngineChoice, type EngineId, type EngineInfo, type Budget, type CouncilPlan, type DebatePlan, type Judgment, type Message, type Settings, type SkillRef, type SkillsView, type TeamPlan } from "./lib/api";
+import { api, errorText, type BgJob, type GroupInfo, type GroupNote, type OrgPost, type OrgUnit, type LeadCommit, type LeadNote, type LeadDecision, type LeadPolicy, type LeadQuestion, type QueueView, type Approval, type Conversation, type EngineChoice, type EngineId, type EngineInfo, type Budget, type CouncilPlan, type DebatePlan, type Judgment, type Message, type Settings, type SkillRef, type SkillsView, type TeamPlan, type WorkSetup } from "./lib/api";
 import { useTauriEvent } from "./lib/events";
 import { emit } from "@tauri-apps/api/event";
 import { ACTIVITY_KEEP, STREAM_KEEP, hideBlocks } from "./lib/panel";
 import { liveTurn, turnEvent, type RunUsage } from "./lib/usage";
 import { isSleeping } from "./lib/sleep";
+import { isLowSpec } from "./lib/perf";
 
 /** 총괄 활동 기록을 화면에 몇 개까지 둘지 */
 const TIMELINE_KEEP = 300;
+/** Running tasks are kept in sessionStorage so a reloaded window shows them again (sessionStorage survives reloads only). */
+const LIVE_KEY = "elysium.live";
+const LIVE_SAVE_MS = 3000;
+/** Streamed text kept per agent in the saved copy */
+const LIVE_STREAM_KEEP = 12_000;
+
+function loadLive(): Record<string, Live> {
+  try {
+    const v = sessionStorage.getItem(LIVE_KEY);
+    return v ? (JSON.parse(v) as Record<string, Live>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveLive(m: Record<string, Live>) {
+  const slim = (full: boolean) =>
+    Object.fromEntries(
+      Object.entries(m).map(([id, l]) => [
+        id,
+        { ...l, text: l.text.slice(-LIVE_STREAM_KEEP), streams: full ? Object.fromEntries(Object.entries(l.streams).map(([k, t]) => [k, t.slice(-LIVE_STREAM_KEEP)])) : {} },
+      ]),
+    );
+  try {
+    sessionStorage.setItem(LIVE_KEY, JSON.stringify(slim(true)));
+  } catch {
+    // Too big: keep the state without streamed text.
+    try {
+      sessionStorage.setItem(LIVE_KEY, JSON.stringify(slim(false)));
+    } catch {
+      /* not saved: a reload starts empty */
+    }
+  }
+}
+
+/** Command log entries kept on screen per task (reviews + commands agents ran) */
+const DECISIONS_KEEP = 1000;
 /** 팀장 보고를 몇 개까지 둘지 */
 const ORG_LOG_KEEP = 400;
 /** 창 테스트 로그를 화면에 몇 줄까지 둘지(백엔드 보관량과 같다) */
@@ -17,6 +55,8 @@ const TEST_LOG_KEEP = 4000;
 const DELTA_FLUSH_MS = 50;
 /** 취침 중에는 화면이 꺼져 있으니 드물게 반영한다 */
 const SLEEP_FLUSH_MS = 2000;
+/** Low-spec mode redraws streamed text less often */
+const LOW_FLUSH_MS = 160;
 
 export interface Toast {
   id: number;
@@ -48,6 +88,16 @@ export interface AgentRun {
   bg?: number;
 }
 
+/** A worker the lead asked for a side question (a fork of its session, like /btw). */
+export interface SideAsk {
+  key: string;
+  title: string;
+  label: string;
+  /** ask: waiting · ok: answered · fail: no answer · log: cannot be asked · done: already finished */
+  state: "ask" | "ok" | "fail" | "log" | "done";
+  text: string;
+}
+
 /** 곁질문 한 차례. 앱 메모리에만 두고 대화 기록에 남기지 않는다. */
 export interface SideTurn {
   id: string;
@@ -58,6 +108,8 @@ export interface SideTurn {
   activity?: string | null;
   error?: string | null;
   stopped?: boolean;
+  /** Workers asked for this answer */
+  asks?: SideAsk[];
 }
 
 /** 병렬 작업의 하위 작업(실행 key → 이름·맡은 파일) */
@@ -161,7 +213,9 @@ interface AppCtx {
   approvals: Approval[];
   decide: (id: string, approve: boolean) => Promise<void>;
   /** work: 작업 모드(허락을 받은 뒤 파일 수정) · build: '만들기' — 폴더 안에서 승인 없이 끝까지 완성 · council: '회의' — 여러 AI가 서로 대화하며 푼다 */
-    send: (text: string, engine: EngineChoice, work: boolean, build: boolean, council?: boolean, attachments?: string[]) => Promise<boolean>;
+    send: (text: string, engine: EngineChoice, work: boolean, build: boolean, council?: boolean, attachments?: string[], setup?: WorkSetup | null) => Promise<boolean>;
+    /** Continue a stopped, failed or interrupted answer from where it stopped */
+    resume: (conversationId: string, messageId: string) => Promise<boolean>;
   cancel: (taskId: string) => void;
   /** 에이전트 하나만 멈춘다 */
   cancelAgent: (taskId: string, key: string) => void;
@@ -222,7 +276,7 @@ const blank = (taskId: string, conversationId: string, work: boolean): Live => (
 
 /** 곁질문에 보내는 진행 상황의 전체 길이(백엔드 SIDE_PROGRESS_CHARS와 맞춘다) */
 const PROGRESS_CHARS = 15000;
-const WAIT_NOTE: Record<string, string> = { review: "명령 검토 대기", question: "사용자 답 대기", test: "창 테스트 결과 대기", command: "할 일을 끝내고 백그라운드 명령 결과 대기", idle: "할 일을 끝내고 메시지 대기", commit: "변경 반영·커밋 검토 중" };
+const WAIT_NOTE: Record<string, string> = { review: "명령 검토 대기", question: "사용자 답 대기", test: "창 테스트 결과 대기", command: "할 일을 끝내고 백그라운드 명령 결과 대기", idle: "할 일을 끝내고 메시지 대기", commit: "변경 반영·커밋 검토 중", retry: "오류 발생 후 재시도 대기 중" };
 
 function secs(ms: number): string {
   const s = Math.max(0, Math.round(ms / 1000));
@@ -297,7 +351,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
-  const [live, setLive] = useState<Record<string, Live>>({});
+  const [live, setLive] = useState<Record<string, Live>>(loadLive);
   const [queue, setQueue] = useState<QueueView>({ capacity: 1, running: [], waiting: [], recent: [] });
   const [testLogs, setTestLogs] = useState<Record<number, string[]>>({});
   const [approvals, setApprovals] = useState<Approval[]>([]);
@@ -358,6 +412,25 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, [refreshConversations, refreshSkills, toast]);
 
   useEffect(() => loadMessages(conversationId), [conversationId, loadMessages]);
+  // After a reload: drop restored tasks that finished meanwhile.
+  useEffect(() => {
+    api
+      .tasksRunning()
+      .then((ids) => setLive((m) => Object.fromEntries(Object.entries(m).filter(([id]) => ids.includes(id)))))
+      .catch(() => {});
+  }, []);
+  // Save the running tasks now and then (not on every streamed letter).
+  const liveRef = useRef(live);
+  liveRef.current = live;
+  useEffect(() => {
+    let last: Record<string, Live> | null = null;
+    const t = window.setInterval(() => {
+      if (liveRef.current === last) return;
+      last = liveRef.current;
+      saveLive(last);
+    }, LIVE_SAVE_MS);
+    return () => window.clearInterval(t);
+  }, []);
 
   const patch = (taskId: string, f: (l: Live) => Live) => setLive((m) => (m[taskId] ? { ...m, [taskId]: f(m[taskId]) } : m));
   // 글자 조각은 모아 두었다가 짧은 간격마다 한 번에 반영한다. 병렬 에이전트가 많으면 조각마다 다시 그려 화면이 느려진다.
@@ -387,7 +460,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     });
   }, []);
   const queueDeltas = () => {
-    if (pending.current.timer == null) pending.current.timer = window.setTimeout(flushDeltas, isSleeping() ? SLEEP_FLUSH_MS : DELTA_FLUSH_MS);
+    if (pending.current.timer == null) pending.current.timer = window.setTimeout(flushDeltas, isSleeping() ? SLEEP_FLUSH_MS : isLowSpec() ? LOW_FLUSH_MS : DELTA_FLUSH_MS);
   };
   useEffect(
     () => () => {
@@ -444,7 +517,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const patchLead = (taskId: string, fn: (d: LeadState) => LeadState) => patch(taskId, (l) => (l.lead ? { ...l, lead: fn(l.lead) } : l));
   useTauriEvent<{ taskId: string; text: string }>("lead:said", (p) => patchLead(p.taskId, (d) => ({ ...d, said: [...d.said, { who: "lead", text: p.text }] })));
   useTauriEvent<{ taskId: string; text: string }>("lead:user", (p) => patchLead(p.taskId, (d) => ({ ...d, said: [...d.said, { who: "user", text: p.text }] })));
-  useTauriEvent<LeadDecision>("lead:decision", (p) => patchLead(p.taskId, (d) => ({ ...d, decisions: [...d.decisions, p] })));
+  useTauriEvent<LeadDecision>("lead:decision", (p) => patchLead(p.taskId, (d) => ({ ...d, decisions: [...d.decisions, p].slice(-DECISIONS_KEEP) })));
   useTauriEvent<{ taskId: string; policy: LeadPolicy }>("lead:policy", (p) => patchLead(p.taskId, (d) => ({ ...d, policy: p.policy })));
   useTauriEvent<LeadQuestion>("lead:question", (p) => patchLead(p.taskId, (d) => ({ ...d, questions: [...d.questions.filter((q) => q.id !== p.id), p] })));
   useTauriEvent<{ id: string }>("lead:question-closed", (p) =>
@@ -472,9 +545,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     api.queueGet().then(setQueue).catch(() => {});
   }, []);
-  // 별도 창이 열리면 지금까지의 상태를 채워 준다.
-  const liveRef = useRef(live);
-  liveRef.current = live;
+  // 별도 창이 열리면 지금까지의 상태를 채워 준다(liveRef는 위에서 만든다).
   useTauriEvent<{ label: string; task: string; keys: string[] }>("worker-window:hello", (p) => {
     const l = liveRef.current[p.task];
     const pick = <T,>(from: Record<string, T> | undefined) => Object.fromEntries(p.keys.filter((k) => from?.[k] !== undefined).map((k) => [k, from![k]]));
@@ -509,12 +580,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
       return { ...m, [p.taskId]: { ...l, parts: { ...l.parts, [p.key]: { title: p.title, files: p.files } } } };
     }),
   );
-  // 총괄이 워커를 지웠다: 카드·글·사용량을 바로 뺀다.
+  // 총괄이 워커를 지웠다: 카드·글은 바로 빼고, 이미 쓴 사용량은 합계에 남긴다.
   useTauriEvent<{ taskId: string; key: string }>("task:agent-removed", (p) =>
     patch(p.taskId, (l) => {
       const drop = <T,>(r: Record<string, T>) => Object.fromEntries(Object.entries(r).filter(([k]) => k !== p.key));
       const lead = l.lead && { ...l.lead, groups: l.lead.groups.map((g) => ({ ...g, keys: g.keys.filter((k) => k !== p.key) })).filter((g) => g.keys.length > 0) };
-      return { ...l, lead, agents: drop(l.agents), parts: drop(l.parts), streams: drop(l.streams), usage: drop(l.usage), gone: { ...l.gone, [p.key]: true } };
+      return { ...l, lead, agents: drop(l.agents), parts: drop(l.parts), streams: drop(l.streams), gone: { ...l.gone, [p.key]: true } };
     }),
   );
   // 병렬 작업을 나눌 수 없어 한 AI로 돌아갈 때
@@ -534,8 +605,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
   useTauriEvent<{ taskId: string; text: string }>("task:activity", (p) => patch(p.taskId, (l) => ({ ...l, activities: [...l.activities, p.text].slice(-12) })));
   useTauriEvent<Approval>("task:approval", (a) => setApprovals((x) => [...x.filter((y) => y.id !== a.id), a]));
   useTauriEvent<Approval>("approval:decided", (a) => setApprovals((x) => x.filter((y) => y.id !== a.id)));
-  useTauriEvent<{ conversationId: string; taskId: string }>("message:created", (p) => {
+  useTauriEvent<{ conversationId: string; taskId: string; role?: string }>("message:created", (p) => {
     if (p.conversationId === conversationId) loadMessages(conversationId);
+    // A question sent from the phone may start a new conversation: show it in the session list right away.
+    if (p.role === "user") refreshConversations();
     setApprovals((x) => x.filter((y) => y.taskId !== p.taskId));
   });
   useTauriEvent<{ taskId: string }>("task:done", (p) => {
@@ -550,6 +623,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   useTauriEvent<{ sideId: string; engine: EngineId }>("side:started", (p) => patchSide(p.sideId, (t) => ({ ...t, engine: p.engine, text: "", activity: null })));
   useTauriEvent<{ sideId: string; delta: string }>("side:delta", (p) => patchSide(p.sideId, (t) => ({ ...t, text: t.text + p.delta })));
   useTauriEvent<{ sideId: string; text: string }>("side:activity", (p) => patchSide(p.sideId, (t) => ({ ...t, activity: p.text })));
+  useTauriEvent<{ sideId: string; asks: SideAsk[] }>("side:asks", (p) => patchSide(p.sideId, (t) => ({ ...t, asks: p.asks })));
   useTauriEvent<{ sideId: string; ok: boolean; text: string; error: string | null; engine: EngineId | null; stopped: boolean }>("side:done", (p) =>
     patchSide(p.sideId, (t) => ({ ...t, state: p.ok ? "ok" : "fail", text: p.text || t.text, engine: p.engine ?? t.engine, error: p.error, stopped: p.stopped, activity: null })),
   );
@@ -568,9 +642,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
   });
 
   const send = useCallback(
-    async (text: string, engine: EngineChoice, work: boolean, build: boolean, council = false, attachments: string[] = []) => {
+    async (text: string, engine: EngineChoice, work: boolean, build: boolean, council = false, attachments: string[] = [], setup: WorkSetup | null = null) => {
       try {
-        const r = await api.chatSend(conversationId, text, engine, work, build, conversationId ? null : newFolder, council, attachments);
+        const r = await api.chatSend(conversationId, text, engine, work, build, conversationId ? null : newFolder, council, attachments, setup);
         if (!conversationId) setNewFolder(null);
         setLive((m) => ({ ...m, [r.taskId]: m[r.taskId] ?? blank(r.taskId, r.conversationId, !council && (work || build)) }));
         if (r.conversationId !== conversationId) setConversationId(r.conversationId);
@@ -583,6 +657,22 @@ export function AppProvider({ children }: { children: ReactNode }) {
       }
     },
     [conversationId, loadMessages, refreshConversations, toast, newFolder],
+  );
+
+  const resume = useCallback(
+    async (conv: string, messageId: string) => {
+      try {
+        const r = await api.chatContinue(conv, messageId);
+        setLive((m) => ({ ...m, [r.taskId]: m[r.taskId] ?? blank(r.taskId, r.conversationId, true) }));
+        loadMessages(r.conversationId);
+        refreshConversations();
+        return true;
+      } catch (e) {
+        toast(errorText(e), "error");
+        return false;
+      }
+    },
+    [loadMessages, refreshConversations, toast],
   );
 
   const chooseFolder = useCallback(
@@ -723,6 +813,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       approvals,
       decide,
       send,
+      resume,
       cancel,
       cancelAgent,
       cancelAll,

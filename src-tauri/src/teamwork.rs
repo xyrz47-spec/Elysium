@@ -424,7 +424,7 @@ pub struct Part {
     /// 이 에이전트가 맡는 파일·폴더(다른 에이전트는 건드리지 않는다)
     #[serde(default)]
     pub files: Vec<String>,
-    /// 이 하위 작업을 함께 맡는 워커 수. 2 이상이면 그룹으로 대화하며 같은 작업 공간에서 일한다.
+    /// 이 하위 작업을 함께 맡는 워커 수. 2 이상이면 팀으로 대화하며 같은 작업 공간에서 일한다.
     #[serde(default = "one")]
     pub members: usize,
     /// 이 하위 작업(팀)이 속한 부서들(바깥 → 안쪽). 비어 있으면 총괄 바로 아래다.
@@ -456,7 +456,7 @@ pub fn parse_parts(text: &str, n: usize) -> Option<Vec<Part>> {
         p.members = p.members.max(1);
         p.org = p.org.iter().map(|d| d.trim().to_string()).filter(|d| !d.is_empty()).take(MAX_ORG_DEPTH).collect();
     }
-    // 합이 워커 수를 넘으면 가장 큰 그룹부터 줄인다.
+    // 합이 워커 수를 넘으면 가장 큰 팀부터 줄인다.
     while parts.iter().map(|p| p.members).sum::<usize>() > n {
         if let Some(big) = parts.iter_mut().filter(|p| p.members > 1).max_by_key(|p| p.members) {
             big.members -= 1;
@@ -518,7 +518,7 @@ pub fn split_prompt(request: &str, listing: &str, n: usize) -> String {
          - 공통 설정·진입 파일(package.json, main 등)처럼 여럿이 고쳐야 하는 파일은 한 하위 작업에만 맡기고, 다른 작업의 task에는 '그 파일은 건드리지 말 것'이라고 적으세요.\n\
          - 각 task는 다른 에이전트의 결과를 보지 않고도 끝낼 수 있게 필요한 이름·경로·인터페이스를 구체적으로 적으세요.\n\
          - 나눌수록 손해인 작은 요청이거나 서로 너무 얽혀 있으면 하위 작업 1개만 쓰세요.\n\
-         - 그룹: members가 2 이상인 하위 작업은 그 수만큼의 워커가 한 그룹이 되어 대화하며 같은 작업 공간에서 함께 합니다. 요청문에 적힌 그룹은 그대로 따르세요. 적혀 있지 않으면 서로 많이 얽혀 혼자 하기 어려운 하위 작업만 묶고 나머지는 members를 1로 두세요. members의 합은 {n}을 넘을 수 없습니다.\n\
+         - 팀: members가 2 이상인 하위 작업은 그 수만큼의 워커가 한 팀이 되어 대화하며 같은 작업 공간에서 함께 합니다. 요청문에 적힌 팀은 그대로 따르세요. 적혀 있지 않으면 서로 많이 얽혀 혼자 하기 어려운 하위 작업만 묶고 나머지는 members를 1로 두세요. members의 합은 {n}을 넘을 수 없습니다.\n\
          - 부서(org): 요청문이 팀을 본부·부서로 묶었거나 하위 작업이 6개 이상인 큰 작업이면, 서로 맞춰야 하는 하위 작업끼리 같은 부서 이름을 org에 쓰세요(바깥 부서부터, 최대 {depth}단계). 같은 부서의 팀장끼리만 짧게 보고를 주고받으므로, 서로 상관없는 하위 작업은 다른 부서에 두거나 org를 비우세요.\n\
          파일을 고치지 말고, 설명 없이 아래 형식의 JSON 배열 하나만 답하세요.\n\
          [{{\"title\": \"짧은 이름\", \"task\": \"이 에이전트가 할 일(구체적으로)\", \"files\": [\"맡는 파일·폴더 경로\"], \"members\": 1, \"org\": []}}]",
@@ -599,7 +599,7 @@ pub fn org_note(i: usize, parts: &[Part], peers: &[Vec<usize>], group: bool) -> 
     if names.is_empty() {
         s.push_str(" 다른 팀과 직접 대화하지 않습니다.\n");
     } else if group {
-        s.push_str(&format!(" 그룹장(그룹원 1)이 팀을 대표해 {} 팀장과 짧은 보고를 주고받습니다.\n", names.join(", ")));
+        s.push_str(&format!(" 팀장(팀원 1)이 팀을 대표해 {} 팀장과 짧은 보고를 주고받습니다.\n", names.join(", ")));
     } else {
         s.push_str(&format!(" 당신이 팀장으로 {} 팀장과 짧은 보고를 주고받습니다. 받은 보고는 다음 차례 앞에 붙습니다.\n", names.join(", ")));
     }
@@ -613,7 +613,12 @@ pub struct PartResult<'a> {
     pub ok: bool,
     pub summary: &'a str,
     pub files: Vec<String>,
+    /// Work the agent reported as unfinished (lead::left_over)
+    pub left: Option<String>,
 }
+
+/// Told to the integrator for a part that ended with work left over.
+const PART_LEFT: &str = "[끝내지 못함] 이 작업은 완료되지 않았으므로 아래 남은 작업을 누락 없이 직접 완료하거나 다음 로드맵 단계로 인계하세요.";
 
 /// 충돌 파일의 다른 판(먼저 쓴 판은 이미 원래 폴더에 있다)
 pub struct ConflictView {
@@ -630,6 +635,9 @@ pub fn integrate_prompt(request: &str, results: &[PartResult], conflicts: &[Conf
         let files = if r.files.is_empty() { "-".to_string() } else { r.files.join(", ") };
         if r.ok {
             s.push_str(&format!("[에이전트 {}: {} · {}] 합친 파일: {files}\n{}\n\n", i + 1, r.title, r.who, r.summary.chars().take(3000).collect::<String>()));
+            if let Some(left) = &r.left {
+                s.push_str(&format!("{PART_LEFT}\n{left}\n\n"));
+            }
         } else {
             s.push_str(&format!("[에이전트 {}: {} · {}] 실패하거나 중지되어 합치지 않았습니다. 이 부분은 당신이 직접 끝내세요.\n\n", i + 1, r.title, r.who));
         }
@@ -660,6 +668,16 @@ pub fn integrate_prompt(request: &str, results: &[PartResult], conflicts: &[Conf
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integrate_prompt_passes_on_unfinished_work() {
+        let done = PartResult { title: "a", who: "x".into(), ok: true, summary: "끝", files: vec![], left: None };
+        let half = PartResult { title: "b", who: "y".into(), ok: true, summary: "일부", files: vec![], left: Some("- 테스트 실행".into()) };
+        let s = integrate_prompt("요청", &[done], &[]);
+        assert!(!s.contains(PART_LEFT));
+        let s = integrate_prompt("요청", &[half], &[]);
+        assert!(s.contains(PART_LEFT) && s.contains("- 테스트 실행"));
+    }
 
     #[test]
     fn snapshot_copy_diff_and_apply_round_trip() {
@@ -925,14 +943,14 @@ run/
     #[test]
     fn one_group_alone_counts_as_a_split() {
         let g = parse_parts("[{\"title\":\"a\",\"task\":\"x\",\"members\":2}]", 2).unwrap();
-        assert_eq!(g.len(), 1, "워커 둘이 한 그룹이면 나눌 수 있는 것");
+        assert_eq!(g.len(), 1, "워커 둘이 한 팀이면 나눌 수 있는 것");
         assert!(parse_parts("[{\"title\":\"a\",\"task\":\"x\"}]", 2).is_none(), "워커 하나뿐이면 나눈 것이 아니다");
     }
 
     #[test]
     fn split_prompt_demands_written_groups() {
         let p = split_prompt("요청", "목록", 4);
-        assert!(p.contains("members") && p.contains("요청문에 적힌 그룹"), "{p}");
+        assert!(p.contains("members") && p.contains("요청문에 적힌 팀"), "{p}");
     }
 
     #[test]

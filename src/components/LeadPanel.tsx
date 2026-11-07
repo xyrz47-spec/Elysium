@@ -1,4 +1,4 @@
-// 병렬 작업의 총괄 화면: 총괄 카드, 워커·그룹 카드, 창 테스트 대기열, 명령 판단 기록
+// 병렬 작업의 총괄 화면: 총괄 카드, 워커·팀 카드(에이전트 판), 창 테스트 대기열, 명령 판단 기록
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { api, errorText, type GroupNote, type LeadCommit, type LeadDecision, type LeadNote, type OrgPost, type OrgUnit, type TestDone, type TestItem } from "../lib/api";
@@ -6,11 +6,15 @@ import { hideBlocks, tailText } from "../lib/panel";
 import { LAYOUT_DEFAULT, move, usePanelLayout, type SectionId } from "../lib/layout";
 import { useApp, type AgentRun, type Live } from "../store";
 import { ArrowDownIcon, ArrowUpIcon, ChevronIcon, CloseIcon, GearIcon, SendIcon, StopIcon } from "./Icons";
+import { AgentBoard, Grip, GroupMenu, useAgentShown, useBoardFocus, useShownCheck } from "./AgentBoard";
 import TokenMeter from "./TokenMeter";
 import Markdown from "./Markdown";
 import LiveMarkdown from "./LiveMarkdown";
+import LazyDetails from "./LazyDetails";
+import Segmented from "./Segmented";
 import { total } from "../lib/usage";
-import { doneRatio, phaseOf, workerCounts, type Phase } from "../lib/progress";
+import { LoadEarlier, TAIL_TEXT, useKeepScroll, useTail } from "../lib/tail";
+import { doneRatio, phaseOf, shownState, workerCounts, type Phase } from "../lib/progress";
 
 
 export const LT = {
@@ -24,7 +28,7 @@ export const LT = {
   reportPlaceholder: "어떤 문제가 발생했는지 설명해 주세요",
   stop: "중지",
   openWindow: "새 창에서 열기",
-  group: "작업그룹",
+  group: "팀",
   member: "작업자",
   noTalk: "대화가 아직 시작되지 않았습니다.",
   waitReview: "검토 대기 중",
@@ -55,7 +59,7 @@ export const LT = {
   winOutput: "작성 내용",
   winActivity: "사용 도구",
   winFiles: "담당 파일",
-  winTalk: "그룹 대화",
+  winTalk: "팀 대화",
   winNoOutput: "아직 작성된 내용이 없습니다.",
   winCut: "이전 출력 내용이 생략되었습니다.",
   winConnecting: "상태를 불러오는 중...",
@@ -73,6 +77,7 @@ export const LT = {
   elapsed: "작업 시간",
   statTools: "도구 사용",
   waitCommit: "병합 및 검토 중",
+  waitRetry: "오류 후 재시도 대기 중",
   leadIdle: "작업 결과 및 요청 대기 중",
   leadJudging: "검토 중",
   leadWorking: "직접 편집 중",
@@ -125,12 +130,12 @@ export const LT = {
   briefToggle: "채팅 답변에 진행 요약 표시",
   layoutReset: "초기화",
   moreWorkers: "+{n}개",
-  leader: "그룹장",
-  memberN: "그룹원 {n}",
+  leader: "팀장",
+  memberN: "팀원 {n}",
   tabOutput: "작성 내용",
   tabActivity: "사용 도구",
   tabFiles: "담당 파일",
-  tabTalk: "그룹 대화",
+  tabTalk: "팀 대화",
   tabOrg: "팀장 보고",
   tabCommands: "명령 검토",
   emptyActivity: "아직 사용한 도구가 없습니다.",
@@ -144,7 +149,7 @@ export const LT = {
   teamCount: "팀 {n}개",
   doneLine: "작업이 완료되었습니다",
   winTabs: "보기 선택",
-  membersLabel: "그룹원 목록",
+  membersLabel: "팀원 목록",
   round: "{n}라운드",
 };
 
@@ -163,8 +168,17 @@ const KIND: Record<LeadNote["kind"], string> = {
 };
 
 
-export const VERDICT: Record<LeadDecision["verdict"], string> = { once: LT.once, deny: LT.deny, similar: LT.similar, all: LT.all, ask_user: LT.once };
-const WAIT: Record<string, string> = { review: LT.waitReview, question: LT.waitQuestion, test: LT.waitTest, command: LT.waitCommand, idle: LT.waitMail, commit: LT.waitCommit };
+const CMD_TEXT = {
+  ran: "직접 실행",
+  all: "전체 {n}",
+  reviewed: "검토 {n}",
+  direct: "직접 실행 {n}",
+  filter: "명령어 필터",
+  title: "명령어 로그",
+};
+
+export const VERDICT: Record<LeadDecision["verdict"], string> = { once: LT.once, deny: LT.deny, similar: LT.similar, all: LT.all, ask_user: LT.once, ran: CMD_TEXT.ran };
+const WAIT: Record<string, string> = { review: LT.waitReview, question: LT.waitQuestion, test: LT.waitTest, command: LT.waitCommand, idle: LT.waitMail, commit: LT.waitCommit, retry: LT.waitRetry };
 
 /** 지금 상태 + 백그라운드 명령 수("작업 중 · 명령 2개 실행 중") */
 export function runState(a: AgentRun): string {
@@ -173,12 +187,7 @@ export function runState(a: AgentRun): string {
   return a.bg ? `${now} · ${LT.bgRunning.replace("{n}", String(a.bg))}` : now;
 }
 
-/** 화면에 보일 상태: 작업 중(블루) · 대기(회색) · 할 일 끝남(민트 옅게) · 완료 · 실패 */
-export type Shown = "working" | "waiting" | "idle" | "ok" | "fail";
-export function shownState(a: AgentRun): Shown {
-  if (a.state !== "run") return a.state === "ok" && !a.stopped ? "ok" : "fail";
-  return a.wait === "idle" ? "idle" : a.wait ? "waiting" : "working";
-}
+export { shownState, type Shown } from "../lib/progress";
 
 /** 1초마다 다시 그려 경과 시간을 보여 준다(실행 중일 때만 돈다). */
 function useNow(on: boolean): number {
@@ -239,6 +248,16 @@ export function NowLine({ run, big = false }: { run: AgentRun; big?: boolean }) 
     </div>
   );
 }
+
+/** 지금 하는 일을 한 줄 글로: 기다리는 이유, 마지막 도구 사용, 오류, 아니면 마지막 활동 */
+export function nowText(a: AgentRun): string {
+  const last = a.activities[a.activities.length - 1];
+  if (a.state === "run") return (a.wait && WAIT[a.wait]) || (last ? splitActivity(last).detail : LT.winThinking);
+  return (a.state === "fail" && !a.stopped && a.error) || (last ? splitActivity(last).detail : "");
+}
+
+/** 에이전트 key를 번호 순서로(agent:2가 agent:10보다 먼저) */
+export const byKeyNum = (a: { key: string }, b: { key: string }) => a.key.localeCompare(b.key, undefined, { numeric: true });
 
 /** 실시간 출력의 마지막 몇 줄(긴 글 전체를 매번 다루지 않게 끝부분만 본다) */
 export function tailLines(text: string | undefined, n: number): string {
@@ -408,6 +427,68 @@ function SaidList({ said }: { said: { who: string; text: string }[] }) {
   );
 }
 
+const TALK_TEXT = {
+  title: "총괄과의 대화",
+  more: "이전 메시지 {n}개 더보기",
+  less: "최근 메시지만 보기",
+};
+const TALK_OPEN_KEY = "elysium.leadTalkOpen";
+/** Messages drawn when the lead chat is expanded; older ones load on demand. */
+const TALK_STEP = 20;
+
+function loadTalkOpen(): boolean {
+  try {
+    return localStorage.getItem(TALK_OPEN_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+/** Chat with the lead. Folded (default): only the latest exchange, from the user's last message on. */
+function LeadTalk({ said }: { said: { who: string; text: string }[] }) {
+  const [open, setOpen] = useState(loadTalkOpen);
+  const tail = useTail(said.length, TALK_STEP);
+  const toggle = () => {
+    setOpen((o) => {
+      try {
+        localStorage.setItem(TALK_OPEN_KEY, o ? "0" : "1");
+      } catch {
+        /* not saved: this run only */
+      }
+      return !o;
+    });
+  };
+  const lastAsk = said.map((s) => s.who).lastIndexOf("user");
+  const from = Math.max(said.length - 2, lastAsk >= 0 ? lastAsk : said.length - 1, 0);
+  const latest = said.slice(Math.min(from, said.length - 1));
+  const hidden = said.length - latest.length;
+  return (
+    <div className={`lead-talk ${open ? "open" : ""}`}>
+      <div className="lead-talk-head">
+        <span className="lead-talk-title">
+          {TALK_TEXT.title} <span className="agent-count">{said.length}</span>
+        </span>
+        <div className="spacer" />
+        {(hidden > 0 || open) && (
+          <button type="button" className="link" onClick={toggle} aria-expanded={open}>
+            {open ? TALK_TEXT.less : TALK_TEXT.more.replace("{n}", String(hidden))}
+          </button>
+        )}
+      </div>
+      {open ? (
+        <>
+          <LoadEarlier hidden={tail.hidden} label={TAIL_TEXT.items} onMore={tail.more} />
+          <SaidList said={said.slice(said.length - tail.shown)} />
+        </>
+      ) : (
+        <div className="lead-talk-latest">
+          <SaidList said={latest} />
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** 실시간 출력 미리보기. 누르면 전체 로그 창이 열린다. */
 function LiveTail({ text, title, onOpen }: { text: string; title: string; onOpen: () => void }) {
   return (
@@ -432,7 +513,7 @@ function LeadCard({ l, onLog }: { l: Live; onLog: (key: string) => void }) {
       {lead.questions.map((q) => (
         <QuestionCard key={q.id} id={q.id} question={q.question} options={q.options} />
       ))}
-      {lead.said.length > 0 && <SaidList said={lead.said.slice(-6)} />}
+      {lead.said.length > 0 && <LeadTalk said={lead.said} />}
       <LineBox
         placeholder={direct ? LT.directPlaceholder : LT.leadPlaceholder}
         label={LT.send}
@@ -490,11 +571,11 @@ function CardActions({ l, about, stopKeys, windowKey, title, onLog }: { l: Live;
 }
 
 /** 카드마다 펼침을 따로 정할 수 있고, 정하지 않았으면 패널 구성의 기본 밀도를 따른다. */
-function useCardOpen(): [boolean, () => void] {
+function useCardOpen(): [boolean, () => void, (open: boolean) => void] {
   const [layout] = usePanelLayout();
   const [own, setOwn] = useState<boolean | null>(null);
   const open = own ?? layout.density === "full";
-  return [open, () => setOwn(!open)];
+  return [open, () => setOwn(!open), setOwn];
 }
 
 function FoldButton({ open, onClick }: { open: boolean; onClick: () => void }) {
@@ -506,37 +587,52 @@ function FoldButton({ open, onClick }: { open: boolean; onClick: () => void }) {
   );
 }
 
-function WorkerCard({ l, a, onLog }: { l: Live; a: AgentRun; onLog: (key: string) => void }) {
-  const [open, toggle] = useCardOpen();
-  const title = l.parts[a.key]?.title ?? a.label;
+/** 워커 한 줄: 번호(끌어서 그룹으로)·이름·상태·시간, 아래 줄에 AI와 지금 하는 일. 누르면 통계·실시간 출력·조작이 펼쳐진다. */
+function WorkerCard({ l, a, onLog, title: name, tag }: { l: Live; a: AgentRun; onLog: (key: string) => void; title?: string; tag?: string }) {
+  const [open, toggle, setOpen] = useCardOpen();
+  const ref = useRef<HTMLDivElement>(null);
+  const shown = useAgentShown(a.key);
+  useBoardFocus(a.key, ref, () => setOpen(true));
+  if (!shown) return null;
+  const title = name ?? l.parts[a.key]?.title ?? a.label;
   const last = a.activities[a.activities.length - 1];
   const st = shownState(a);
   const tail = open && st === "working" ? tailLines(l.streams[a.key], 3) : "";
+  const who = [a.label, a.model, a.effort].filter(Boolean).join(" · ");
   return (
-    <div className={`lead-worker ${a.state} st-${st} ${open ? "open" : "compact"}`}>
+    <div ref={ref} className={`lead-worker aline ${a.state} st-${st} ${open ? "open" : "compact"}`}>
       <div className="lead-line">
+        <Grip keys={[a.key]} label={title} />
         <i className="agent-dot" aria-hidden />
-        <b title={title}>{title}</b>
+        <button type="button" className="aline-name" onClick={toggle} aria-expanded={open} title={title}>
+          <b>{title}</b>
+          {tag && <span className="tag">{tag}</span>}
+        </button>
         <div className="spacer" />
+        <span className={`agent-state st-${st}`}>{a.stopped ? LT.failed : runState(a)}</span>
         <Elapsed run={a} />
+        <GroupMenu keys={[a.key]} label={title} />
         <FoldButton open={open} onClick={toggle} />
       </div>
-      <div className="lead-line sub">
-        <span className="agent-role">{[a.label, a.effort].filter(Boolean).join(" · ")}</span>
-        <span className={`agent-state st-${st}`}>{a.stopped ? LT.failed : runState(a)}</span>
+      <div className="lead-line sub aline-sub">
+        <span className="agent-role" title={who}>
+          {who}
+        </span>
+        <div className="aline-now">
+          {a.state === "fail" && a.error && !a.stopped ? (
+            <div className="agent-err" title={a.error}>
+              {a.error}
+            </div>
+          ) : a.state === "run" ? (
+            <NowLine run={a} />
+          ) : (
+            <div className="agent-act" title={last}>
+              {last ?? " "}
+            </div>
+          )}
+        </div>
         <TokenMeter t={total(l.usage[a.key])} live={st === "working"} compact />
       </div>
-      {a.state === "fail" && a.error && !a.stopped ? (
-        <div className="agent-err" title={a.error}>
-          {a.error}
-        </div>
-      ) : a.state === "run" ? (
-        <NowLine run={a} />
-      ) : (
-        <div className="agent-act" title={last}>
-          {last ?? " "}
-        </div>
-      )}
       {open && (
         <>
           <div className="lead-line sub worker-stats">
@@ -551,25 +647,29 @@ function WorkerCard({ l, a, onLog }: { l: Live; a: AgentRun; onLog: (key: string
   );
 }
 
-function GroupCard({ l, index, title, keys }: { l: Live; index: number; title: string; keys: string[] }) {
+/** 팀 하나(워커 둘 이상이 함께 맡은 하위 작업): 팀 이름·대화, 아래에 팀원마다 한 줄 */
+function TeamCard({ l, index, title, keys, onLog }: { l: Live; index: number; title: string; keys: string[]; onLog: (key: string) => void }) {
   const [open, toggle] = useCardOpen();
+  const check = useShownCheck();
+  const all = keys.map((k) => l.agents[k]).filter(Boolean);
+  const members = all.filter((a) => check(a.key));
+  if (!members.length) return null;
   const talk = l.lead!.groupLog.filter((g) => g.group === index).slice(open ? -5 : -1);
-  const members = keys.map((k) => l.agents[k]).filter(Boolean);
+  const free = members.map((a) => a.key);
   return (
     <div className={`lead-worker group ${open ? "open" : "compact"}`}>
       <div className="lead-line">
+        <Grip keys={free} label={title} />
         <span className="tag">{LT.group}</span>
         <b title={title}>{title}</b>
+        <span className="org-dots" aria-hidden>
+          {all.map((a) => (
+            <i key={a.key} className={`agent-dot st-${shownState(a)}`} />
+          ))}
+        </span>
         <div className="spacer" />
+        <GroupMenu keys={free} label={title} />
         <FoldButton open={open} onClick={toggle} />
-      </div>
-      <div className="lead-members">
-        {members.map((a, i) => (
-          <span key={a.key} className={`lead-member ${a.state} st-${shownState(a)}`}>
-            <i className="agent-dot" aria-hidden /> {LT.memberN.replace("{n}", String(i + 1))}
-            {i === 0 && <span className="tag">{LT.leader}</span>} · {a.stopped ? LT.failed : runState(a)}
-          </span>
-        ))}
       </div>
       {talk.length === 0 ? (
         <div className="agent-sub">{LT.noTalk}</div>
@@ -582,6 +682,11 @@ function GroupCard({ l, index, title, keys }: { l: Live; index: number; title: s
           ))}
         </ul>
       )}
+      <div className="team-members" role="group" aria-label={LT.membersLabel}>
+        {members.map((a) => (
+          <WorkerCard key={a.key} l={l} a={a} onLog={onLog} title={LT.memberN.replace("{n}", String(keys.indexOf(a.key) + 1))} tag={keys[0] === a.key ? LT.leader : undefined} />
+        ))}
+      </div>
       {open && <CardActions l={l} about={keys[0]} stopKeys={keys} windowKey={`group:${index}:${keys.join(",")}`} title={title} />}
     </div>
   );
@@ -630,9 +735,9 @@ function Room({ posts }: { posts: OrgPost[] }) {
   );
 }
 
-/** 팀 하나: 둘 이상이면 그룹 카드, 하나면 워커 카드 */
+/** 조직의 팀 하나: 둘 이상이면 팀 카드, 하나면 워커 카드 */
 function UnitCard({ l, u, onLog }: { l: Live; u: OrgUnit; onLog: (key: string) => void }) {
-  if (u.keys.length > 1) return <GroupCard l={l} index={u.index} title={u.title} keys={u.keys} />;
+  if (u.keys.length > 1) return <TeamCard l={l} index={u.index} title={u.title} keys={u.keys} onLog={onLog} />;
   const a = l.agents[u.keys[0]];
   return a ? <WorkerCard l={l} a={a} onLog={onLog} /> : null;
 }
@@ -640,12 +745,15 @@ function UnitCard({ l, u, onLog }: { l: Live; u: OrgUnit; onLog: (key: string) =
 /** 부서 하나와 그 아래(하위 부서, 팀). 접으면 팀 상태만 점으로 보인다. */
 function Dept({ l, path, units, onLog }: { l: Live; path: string[]; units: OrgUnit[]; onLog: (key: string) => void }) {
   const [open, setOpen] = useState(true);
+  const check = useShownCheck();
   const lead = l.lead!;
   const inside = units.filter((u) => path.every((d, i) => u.org[i] === d) && u.org.length >= path.length);
   const direct = inside.filter((u) => u.org.length === path.length);
   const subs = [...new Set(inside.filter((u) => u.org.length > path.length).map((u) => u.org[path.length]))];
   const runs = inside.flatMap((u) => u.keys.map((k) => l.agents[k]).filter(Boolean));
   const posts = roomPosts(lead.org, lead.orgLog, path);
+  // 거르거나 그룹으로 옮겨 이 부서에 보일 에이전트가 없으면 부서째 숨긴다.
+  if (path.length && runs.length && !runs.some((a) => check(a.key))) return null;
   const body = (
     <>
       <Room posts={posts} />
@@ -677,7 +785,7 @@ function Dept({ l, path, units, onLog }: { l: Live; path: string[]; units: OrgUn
   );
 }
 
-/** 조직도: 부서 → 하위 부서 → 팀(그룹·워커). 부서마다 그 안 팀장끼리 주고받은 보고가 보인다. */
+/** 조직도: 부서 → 하위 부서 → 팀(여럿이 함께 하는 팀·혼자 하는 워커). 부서마다 그 안 팀장끼리 주고받은 보고가 보인다. */
 function OrgTree({ l, onLog }: { l: Live; onLog: (key: string) => void }) {
   return <Dept l={l} path={[]} units={l.lead!.org} onLog={onLog} />;
 }
@@ -685,22 +793,30 @@ function OrgTree({ l, onLog }: { l: Live; onLog: (key: string) => void }) {
 /** 최근 판단 몇 개만 보이고, 펼치면 전체를 본다. 자동 허용 해제 버튼은 접어도 보인다. */
 const DECISIONS_SHOWN = 3;
 
+type CmdFilter = "all" | "reviewed" | "direct";
+
 function DecisionLog({ l }: { l: Live }) {
   const { toast } = useApp();
   const [open, setOpen] = useState(false);
+  const [filter, setFilter] = useState<CmdFilter>("all");
   const lead = l.lead!;
   const auto = lead.policy.allowAll || lead.policy.rules.length > 0;
-  const denied = lead.decisions.filter((d) => d.verdict === "deny").length;
-  const allowed = lead.decisions.length - denied;
-  const recent = lead.decisions.slice(-(open ? 30 : DECISIONS_SHOWN)).reverse();
+  const direct = lead.decisions.filter((d) => d.verdict === "ran");
+  const reviewed = lead.decisions.filter((d) => d.verdict !== "ran");
+  const denied = reviewed.filter((d) => d.verdict === "deny").length;
+  const allowed = reviewed.length - denied;
+  const list = filter === "direct" ? direct : filter === "reviewed" ? reviewed : lead.decisions;
+  const tail = useTail(list.length, 30);
+  const recent = list.slice(-(open ? tail.shown : DECISIONS_SHOWN)).reverse();
+  const who = (key: string) => (key.startsWith("lead") ? LT.lead : (l.parts[key]?.title ?? l.agents[key]?.label ?? key));
   return (
     <div className={`lead-log ${open ? "open" : ""}`}>
       <div className="lead-line">
         <button className="lead-fold" onClick={() => setOpen((o) => !o)} aria-expanded={open} aria-label={LT.expand} disabled={lead.decisions.length <= DECISIONS_SHOWN && !open}>
           <i className="fold-chev" aria-hidden />
-          <b>{LT.decisions}</b>
+          <b>{CMD_TEXT.title}</b>
         </button>
-        {lead.decisions.length > 0 && (
+        {reviewed.length > 0 && (
           <>
             <span className="tag verdict once">{LT.allowed.replace("{n}", String(allowed))}</span>
             {denied > 0 && <span className="tag verdict deny">{LT.blocked.replace("{n}", String(denied))}</span>}
@@ -713,22 +829,37 @@ function DecisionLog({ l }: { l: Live }) {
         )}
       </div>
       {auto && <p className="lead-warn">{LT.autoOn}</p>}
-      {lead.decisions.length === 0 ? <div className="agent-sub">{LT.noDecisions}</div> : <DecisionRows items={recent} compact={!open} />}
-      {lead.decisions.length > DECISIONS_SHOWN && (
+      {direct.length > 0 && reviewed.length > 0 && (
+        <Segmented
+          label={CMD_TEXT.filter}
+          className="dense cmd-filter"
+          value={filter}
+          onChange={setFilter}
+          options={[
+            { value: "all", label: CMD_TEXT.all.replace("{n}", String(lead.decisions.length)) },
+            { value: "reviewed", label: CMD_TEXT.reviewed.replace("{n}", String(reviewed.length)) },
+            { value: "direct", label: CMD_TEXT.direct.replace("{n}", String(direct.length)) },
+          ]}
+        />
+      )}
+      {open && <LoadEarlier hidden={tail.hidden} label={TAIL_TEXT.items} onMore={tail.more} />}
+      {list.length === 0 ? <div className="agent-sub">{LT.noDecisions}</div> : <DecisionRows items={recent} compact={!open} who={who} />}
+      {list.length > DECISIONS_SHOWN && (
         <button className="link" onClick={() => setOpen((o) => !o)} aria-expanded={open}>
-          {open ? LT.showLess : LT.showAll.replace("{n}", String(lead.decisions.length))}
+          {open ? LT.showLess : LT.showAll.replace("{n}", String(list.length))}
         </button>
       )}
     </div>
   );
 }
 
-function DecisionRows({ items, compact = false }: { items: LeadDecision[]; compact?: boolean }) {
+function DecisionRows({ items, compact = false, who }: { items: LeadDecision[]; compact?: boolean; who?: (key: string) => string }) {
   return (
     <ul className={`lead-decisions ${compact ? "compact" : ""}`}>
       {items.map((d) => (
         <li key={d.id}>
           <span className={`tag verdict ${d.verdict}`}>{VERDICT[d.verdict]}</span>
+          {d.verdict === "ran" && who && <span className="agent-sub cmd-who">{who(d.key)}</span>}
           <code title={d.command}>{d.pattern ?? d.command}</code>
           {!compact && byLabel(d.by) && <span className="agent-sub">{byLabel(d.by)}</span>}
           {!compact && d.reason && <div className="agent-sub lead-reason">{d.reason}</div>}
@@ -799,25 +930,35 @@ export function LeadSection({ l }: { l: Live }) {
   const [editing, setEditing] = useState(false);
   const [logKey, setLogKey] = useState<string | null>(null);
   const inOrg = new Set(lead.org.flatMap((u) => u.keys));
-  const inGroup = new Set(lead.groups.flatMap((g) => g.keys));
-  const solo = Object.values(l.agents)
-    .filter((a) => a.key.startsWith("agent:") && !inGroup.has(a.key) && !inOrg.has(a.key))
-    .sort((a, b) => a.key.localeCompare(b.key));
+  const inTeam = new Set(lead.groups.flatMap((g) => g.keys));
+  const workers = Object.values(l.agents)
+    .filter((a) => a.key.startsWith("agent:"))
+    .sort(byKeyNum);
+  const solo = workers.filter((a) => !inTeam.has(a.key) && !inOrg.has(a.key));
+  // 팀원은 그룹 칸에서 '팀 이름 · 팀원 n'으로 보인다.
+  const teamOf = new Map<string, { title: string; keys: string[] }>();
+  for (const t of [...lead.groups, ...lead.org.filter((u) => u.keys.length > 1)]) for (const k of t.keys) teamOf.set(k, t);
+  const nameOf = (a: AgentRun) => {
+    const t = teamOf.get(a.key);
+    return t ? `${t.title} · ${LT.memberN.replace("{n}", String(t.keys.indexOf(a.key) + 1))}` : (l.parts[a.key]?.title ?? a.label);
+  };
   const section: Record<SectionId, ReactNode> = {
     progress: <ProgressOverview key="progress" l={l} />,
     lead: <LeadCard key="lead" l={l} onLog={setLogKey} />,
     workers: (
-      <div key="workers" className="lead-workers">
-        {lead.org.length > 0 && <OrgTree l={l} onLog={setLogKey} />}
-        {lead.groups
-          .filter((g) => !g.keys.some((k) => inOrg.has(k)))
-          .map((g) => (
-            <GroupCard key={g.index} l={l} index={g.index} title={g.title} keys={g.keys} />
+      <AgentBoard key="workers" l={l} runs={workers} name={nameOf} now={nowText} row={(a) => <WorkerCard l={l} a={a} onLog={setLogKey} title={nameOf(a)} />}>
+        <div className="lead-workers">
+          {lead.org.length > 0 && <OrgTree l={l} onLog={setLogKey} />}
+          {lead.groups
+            .filter((g) => !g.keys.some((k) => inOrg.has(k)))
+            .map((g) => (
+              <TeamCard key={g.index} l={l} index={g.index} title={g.title} keys={g.keys} onLog={setLogKey} />
+            ))}
+          {solo.map((a) => (
+            <WorkerCard key={a.key} l={l} a={a} onLog={setLogKey} />
           ))}
-        {solo.map((a) => (
-          <WorkerCard key={a.key} l={l} a={a} onLog={setLogKey} />
-        ))}
-      </div>
+        </div>
+      </AgentBoard>
     ),
     decisions: <DecisionLog key="decisions" l={l} />,
   };
@@ -927,7 +1068,7 @@ export function LiveBrief({ l }: { l: Live }) {
   const [layout] = usePanelLayout();
   const workers = Object.values(l.agents)
     .filter((a) => a.key.startsWith("agent:"))
-    .sort((a, b) => a.key.localeCompare(b.key));
+    .sort(byKeyNum);
   if (!layout.brief || (!l.lead && workers.length === 0)) return null;
   const c = workerCounts(Object.values(l.agents));
   const pct = Math.round(doneRatio(c) * 100);
@@ -1029,6 +1170,9 @@ export function SlotsPicker() {
   );
 }
 
+/** Log lines drawn at first; older lines load on demand. */
+export const LOG_LINE_STEP = 400;
+
 /** 창 테스트 로그: 맨 아래에 있으면 새 줄을 따라가고, 위로 올리면 멈춘다. */
 function TestLog({ id }: { id: number }) {
   const { testLogs, loadTestLog } = useApp();
@@ -1036,6 +1180,8 @@ function TestLog({ id }: { id: number }) {
   const box = useRef<HTMLPreElement>(null);
   const [follow, setFollow] = useState(true);
   useEffect(() => loadTestLog(id), [id, loadTestLog]);
+  const tail = useTail(lines.length, LOG_LINE_STEP);
+  const keep = useKeepScroll(box, tail.shown);
   useLayoutEffect(() => {
     if (follow && box.current) box.current.scrollTop = box.current.scrollHeight;
   }, [lines.length, follow]);
@@ -1055,7 +1201,8 @@ function TestLog({ id }: { id: number }) {
         )}
       </div>
       <pre ref={box} onScroll={onScroll} tabIndex={0}>
-        {lines.length ? lines.join("\n") : LT.logEmpty}
+        <LoadEarlier hidden={tail.hidden} label={TAIL_TEXT.lines} onMore={() => (keep(), setFollow(false), tail.more())} />
+        {lines.length ? lines.slice(lines.length - tail.shown).join("\n") : LT.logEmpty}
       </pre>
     </div>
   );
@@ -1132,12 +1279,22 @@ export function QueueCard() {
   );
 }
 
-/** 끝난 작업의 판단 기록과 그룹 대화 */
+/** 끝난 작업의 판단 기록과 팀 대화 */
 export function SavedLeadLog({ decisions, groupLog, leadLog, orgLog }: { decisions?: LeadDecision[]; groupLog?: GroupNote[]; leadLog?: LeadNote[]; orgLog?: OrgPost[] }): ReactNode {
   if (!decisions?.length && !groupLog?.length && !leadLog?.length && !orgLog?.length) return null;
   return (
-    <details className="draft">
-      <summary>{LT.savedLog}</summary>
+    <LazyDetails className="draft" summary={LT.savedLog}>
+      <SavedLogBody decisions={decisions} groupLog={groupLog} leadLog={leadLog} orgLog={orgLog} />
+    </LazyDetails>
+  );
+}
+
+/** Drawn only when the saved log is opened; long team talk and reports show their newest part first. */
+function SavedLogBody({ decisions, groupLog, leadLog, orgLog }: { decisions?: LeadDecision[]; groupLog?: GroupNote[]; leadLog?: LeadNote[]; orgLog?: OrgPost[] }) {
+  const talk = useTail(groupLog?.length ?? 0, SAVED_STEP);
+  const posts = useTail(orgLog?.length ?? 0, SAVED_STEP);
+  return (
+    <>
       {leadLog && leadLog.length > 0 && (
         <>
           <h5 className="lead-queue-sub">{LT.leadLog}</h5>
@@ -1147,7 +1304,8 @@ export function SavedLeadLog({ decisions, groupLog, leadLog, orgLog }: { decisio
       {decisions && decisions.length > 0 && <DecisionRows items={decisions} />}
       {groupLog && groupLog.length > 0 && (
         <ul className="lead-said">
-          {groupLog.map((g, i) => (
+          <LoadEarlier hidden={talk.hidden} label={TAIL_TEXT.items} onMore={talk.more} />
+          {groupLog.slice(groupLog.length - talk.shown).map((g, i) => (
             <li key={i}>
               <b>{g.who}</b> <Markdown text={hideBlocks(g.text)} />
             </li>
@@ -1158,7 +1316,8 @@ export function SavedLeadLog({ decisions, groupLog, leadLog, orgLog }: { decisio
         <>
           <h5 className="lead-queue-sub">{LT.orgBoard}</h5>
           <ul className="lead-said">
-            {orgLog.map((p, i) => (
+            <LoadEarlier hidden={posts.hidden} label={TAIL_TEXT.items} onMore={posts.more} />
+            {orgLog.slice(orgLog.length - posts.shown).map((p, i) => (
               <li key={i}>
                 <b>{p.title}</b> <Markdown text={p.text} />
               </li>
@@ -1166,6 +1325,8 @@ export function SavedLeadLog({ decisions, groupLog, leadLog, orgLog }: { decisio
           </ul>
         </>
       )}
-    </details>
+    </>
   );
 }
+
+const SAVED_STEP = 30;

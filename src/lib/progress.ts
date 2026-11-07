@@ -33,6 +33,13 @@ export function workerCounts(runs: RunLike[]): Counts {
   return c;
 }
 
+/** 화면에 보일 상태: 작업 중(블루) · 대기(회색) · 할 일 끝남(민트 옅게) · 완료 · 실패 */
+export type Shown = "working" | "waiting" | "idle" | "ok" | "fail";
+export function shownState(a: RunLike): Shown {
+  if (a.state !== "run") return a.state === "ok" && !a.stopped ? "ok" : "fail";
+  return a.wait === "idle" ? "idle" : a.wait ? "waiting" : "working";
+}
+
 /** 지금 단계: 나누기 → 워커 작업 → 통합 → 끝 */
 export function phaseOf(runs: RunLike[]): Phase {
   const running = (f: (a: RunLike) => boolean) => runs.some((a) => a.state === "run" && f(a));

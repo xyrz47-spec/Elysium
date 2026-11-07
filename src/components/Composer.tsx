@@ -3,8 +3,9 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { api, baseName, errorText, toBase64, type Attachment, type EngineChoice, type Suggestion } from "../lib/api";
 import { useApp } from "../store";
 import { DraftAttachments } from "./Attachments";
-import { BookIcon, ChatIcon, ChevronIcon, ClipIcon, CloseIcon, CouncilIcon, FolderIcon, SendIcon, SparkIcon, StopIcon, WrenchIcon } from "./Icons";
+import { BookIcon, ChatIcon, ChevronIcon, ClipIcon, CloseIcon, CouncilIcon, FolderIcon, SendIcon, SlidersIcon, SparkIcon, StopIcon, WrenchIcon } from "./Icons";
 import Segmented from "./Segmented";
+import WorkSetupPanel, { T as SETUP, isDefault, loadSetup, saveSetup } from "./WorkSetupPanel";
 
 /** 한 메시지에 붙일 수 있는 파일 수(백엔드 attachments::MAX_PER_MESSAGE와 같다) */
 const MAX_FILES = 10;
@@ -29,6 +30,10 @@ export default function Composer({ draft, onDraftUsed }: { draft?: string | null
   const [sendMenu, setSendMenu] = useState(false);
   const [promptMenu, setPromptMenu] = useState(false);
   const [pick, setPick] = useState(0);
+  // How the next request runs (who works on it and how). Kept for following messages until reset.
+  const [setup, setSetup] = useState(loadSetup);
+  const [setupOpen, setSetupOpen] = useState(false);
+  useEffect(() => saveSetup(setup), [setup]);
   const ref = useRef<HTMLTextAreaElement>(null);
 
   const running = conversationId ? live.find((l) => l.conversationId === conversationId) : undefined;
@@ -156,7 +161,7 @@ export default function Composer({ draft, onDraftUsed }: { draft?: string | null
     const sending = files;
     setText("");
     setFiles([]);
-    const ok = await send(t, engine, !council && (work || build), build && !council, council, sending.map((f) => f.id));
+    const ok = await send(t, engine, !council && (work || build), build && !council, council, sending.map((f) => f.id), isDefault(setup) ? null : setup);
     // 보내지 못했으면 쓴 글과 파일을 되돌린다.
     if (!ok) {
       setText((cur) => cur || t);
@@ -338,6 +343,7 @@ export default function Composer({ draft, onDraftUsed }: { draft?: string | null
           )}
         </div>
       )}
+      {setupOpen && !running && <WorkSetupPanel value={setup} onChange={setSetup} onClose={() => setSetupOpen(false)} work={work} />}
       <div className={`composer ${work ? "work" : ""} ${dropping ? "dropping" : ""}`}>
         <DraftAttachments items={files} onRemove={removeFile} />
         <textarea
@@ -376,6 +382,17 @@ export default function Composer({ draft, onDraftUsed }: { draft?: string | null
             title="자주 쓰는 프롬프트"
           >
             <BookIcon />
+          </button>
+          <button
+            className={`pill attach-btn setup-btn ${setupOpen ? "on" : ""}`}
+            onClick={() => setSetupOpen((o) => !o)}
+            disabled={!!running}
+            aria-expanded={setupOpen}
+            aria-label={SETUP.open}
+            title={SETUP.open}
+          >
+            <SlidersIcon />
+            {!isDefault(setup) && <span className="setup-dot">{SETUP.custom}</span>}
           </button>
           <div className="pill-menu">
             <button className="pill" onClick={() => setMenu((m) => !m)} aria-haspopup="menu" aria-expanded={menu} title="답할 AI">

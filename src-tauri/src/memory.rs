@@ -268,6 +268,9 @@ pub fn select(c: &Candidates, need: impl Fn(&str) -> Option<f64>) -> Selection {
 /// - history: 이번 요청을 뺀 이 세션의 메시지(오래된 것부터)
 /// - seen_at: 이 엔진이 자기 세션으로 마지막에 본 시각(이어 쓰는 엔진만). None이면 요약 + 최근 대화를 다 붙인다.
 /// - sel: JEV가 거른 결과(있으면 남긴 요약·대화만 붙인다)
+/// seen_at에 이 값을 주면 최근 대화는 빼고 세션 요약만 붙인다(병렬 워커: 전체 요청과 자기 몫을 따로 받는다).
+pub const SUMMARY_ONLY: &str = "summary-only";
+
 pub fn context(summary: Option<&str>, upto: Option<&str>, history: &[Turn], seen_at: Option<&str>, prompt: &str, sel: Option<&Selection>) -> String {
     let summary = match sel {
         Some(s) => s.summary.as_deref(),
@@ -278,6 +281,7 @@ pub fn context(summary: Option<&str>, upto: Option<&str>, history: &[Turn], seen
     let indexed: Vec<(usize, &Turn)> = history.iter().enumerate().collect();
     let after_summary: Vec<(usize, &Turn)> = indexed.iter().copied().filter(|(_, t)| upto.is_none_or(|u| t.at.as_str() > u)).collect();
     let (show_summary, recent, head) = match seen_at {
+        Some(SUMMARY_ONLY) => (true, vec![], ""),
         Some(seen) => {
             let unseen: Vec<(usize, &Turn)> = indexed.iter().copied().filter(|(_, t)| t.at.as_str() > seen).collect();
             // 요약된 부분도 못 봤다면(이 엔진이 오래 쉬었으면) 요약도 준다.
@@ -355,6 +359,16 @@ mod tests {
 
     fn t(role: &str, by: Option<&str>, c: &str, at: &str) -> Turn {
         Turn { role: role.into(), by: by.map(str::to_string), content: c.into(), at: at.into() }
+    }
+
+    #[test]
+    fn summary_only_mark_drops_recent_turns() {
+        // 병렬 워커는 최근 대화 전문 없이 요약만 받는다(orchestrator의 WORKER_MEMORY).
+        let h = vec![t("user", None, "지난 질문 전문", "2026-11-05T01:00:00Z"), t("assistant", Some("claude"), "지난 답 전문", "2026-11-05T01:01:00Z")];
+        let c = context(Some("결정: Rust로 간다"), Some("2026-11-05T00:00:00Z"), &h, Some(SUMMARY_ONLY), "하위 작업", None);
+        assert!(c.contains("결정: Rust로 간다") && c.ends_with("하위 작업"), "{c}");
+        assert!(!c.contains("지난 질문 전문") && !c.contains("지난 답 전문"), "{c}");
+        assert_eq!(context(None, None, &h, Some(SUMMARY_ONLY), "하위 작업", None), "하위 작업", "요약이 없으면 요청만");
     }
 
     #[test]

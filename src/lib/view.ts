@@ -2,7 +2,8 @@
 import { api } from "./api";
 
 export type UiScale = 0.9 | 1 | 1.1 | 1.2;
-export type ChatWidth = "normal" | "wide";
+export type ChatWidth = "normal" | "wide" | "full";
+const WIDTHS: ChatWidth[] = ["normal", "wide", "full"];
 
 const SCALE_KEY = "elysium.scale";
 const WIDTH_KEY = "elysium.chatWidth";
@@ -19,7 +20,8 @@ export function applyScale(s: UiScale) {
 }
 
 export function loadWidth(): ChatWidth {
-  return localStorage.getItem(WIDTH_KEY) === "wide" ? "wide" : "normal";
+  const v = localStorage.getItem(WIDTH_KEY) as ChatWidth | null;
+  return v && WIDTHS.includes(v) ? v : "full";
 }
 
 export function applyWidth(w: ChatWidth) {

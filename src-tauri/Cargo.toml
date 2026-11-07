@@ -1,6 +1,6 @@
 [package]
 name = "elysium"
-version = "0.2.0"
+version = "1.0.0"
 description = "Elysium — 여러 AI CLI를 엮어 완성된 답을 내는 AI 클라이언트"
 edition = "2021"
 rust-version = "1.90"
@@ -39,6 +39,7 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 local-ip-address = "0.6"
 # 다른 네트워크에서의 원격 연결: 공개키로 연결하는 QUIC(홀펀칭, 안 되면 암호화된 채 릴레이 경유). 포트 포워딩 불필요
 iroh = { version = "1.4", default-features = false, features = ["tls-ring", "portmapper"] }
+portable-pty = "0.9.0"
 
 [dev-dependencies]
 tempfile = "3"

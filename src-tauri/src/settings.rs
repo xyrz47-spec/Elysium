@@ -27,10 +27,6 @@ pub struct Settings {
     pub jev_enabled: bool,
     /// API 엔진별 모델 이름(engine id → model). 없으면 기본 모델.
     pub models: BTreeMap<String, String>,
-    /// 대화 요청마다 동시에 돌릴 에이전트 수(1이면 끔, 최대 16). 요청 글에서 따로 정하면 그 수를 쓴다.
-    pub agents: u8,
-    /// true면 JEV가 요청을 보고 동시 에이전트 수를 정한다(JEV를 못 쓰면 1개). false면 agents를 그대로 쓴다.
-    pub agents_auto: bool,
     /// 입력하는 동안 JEV가 모드·스킬을 추천한다(보내기 전의 글이 TypeSafe로 전송됨). JEV가 켜져 있을 때만 돈다.
     pub jev_suggest: bool,
     /// 창을 띄우는 실행(창 테스트)를 동시에 몇 개까지 돌릴지(앱 전체, 1~8)
@@ -47,6 +43,8 @@ pub struct Settings {
     pub prompts: Vec<SavedPrompt>,
     /// 작업이 끝났을 때 창이 앞에 없으면 작업 표시줄에서 알린다
     pub notify_done: bool,
+    /// Allow shutting down / restarting / logging off after a task, when the user asked for it in that task.
+    pub power_on_done: bool,
 }
 
 /// 자주 쓰는 프롬프트 하나
@@ -118,8 +116,6 @@ impl Default for Settings {
             review: ReviewMode::Auto,
             jev_enabled: false,
             models: BTreeMap::new(),
-            agents: 1,
-            agents_auto: true,
             jev_suggest: true,
             test_slots: 1,
             lead_commit: true,
@@ -128,6 +124,7 @@ impl Default for Settings {
             answer_length: "auto".into(),
             prompts: vec![],
             notify_done: true,
+            power_on_done: false,
         }
     }
 }
@@ -143,7 +140,6 @@ impl Settings {
     pub fn sanitized(mut self) -> Self {
         self.workspace_dir = self.workspace_dir.map(|d| d.trim().to_string()).filter(|d| !d.is_empty());
         self.models = self.models.into_iter().map(|(k, v)| (k, v.trim().to_string())).filter(|(_, v)| !v.is_empty()).collect();
-        self.agents = self.agents.clamp(1, crate::intent::MAX_AGENTS as u8);
         self.test_slots = self.test_slots.clamp(1, 8);
         self.instructions = self.instructions.trim().chars().take(INSTRUCTIONS_MAX).collect();
         if !LANGS.contains(&self.answer_lang.as_str()) {
@@ -205,12 +201,8 @@ mod tests {
         assert_eq!(back.review, ReviewMode::Off);
         // 빈 문자열은 기본 폴더로
         assert!(Settings { workspace_dir: Some("   ".into()), ..Default::default() }.sanitized().workspace_dir.is_none());
-        // 예전 설정(에이전트 수 없음)은 1개로, 범위 밖은 1~16으로
-        let old: Settings = serde_json::from_str(r#"{"review":"auto","jevEnabled":false,"models":{}}"#).unwrap();
-        assert_eq!(old.agents, 1);
-        assert!(old.agents_auto, "예전 설정도 JEV 자동 분배로 시작");
-        assert_eq!(Settings { agents: 99, ..Default::default() }.sanitized().agents, 16);
-        assert_eq!(Settings { agents: 0, ..Default::default() }.sanitized().agents, 1);
+        // 예전 설정의 동시 에이전트 수(agents·agentsAuto)는 읽기만 하고 버린다: 이제 AI가 요청마다 정한다.
+        let old: Settings = serde_json::from_str(r#"{"review":"auto","jevEnabled":false,"models":{},"agents":4,"agentsAuto":false}"#).unwrap();
         assert_eq!(old.test_slots, 1, "예전 설정의 테스트 동시 실행은 1개");
         assert!(old.lead_commit, "예전 설정도 총괄 커밋을 켠 채로 시작");
         assert_eq!(Settings { test_slots: 0, ..Default::default() }.sanitized().test_slots, 1);

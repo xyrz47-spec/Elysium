@@ -1,7 +1,8 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { api, errorText, type BgJob } from "../lib/api";
 import { useApp, type Live } from "../store";
-import { LT } from "./LeadPanel";
+import { LOG_LINE_STEP, LT } from "./LeadPanel";
+import { LoadEarlier, TAIL_TEXT, useKeepScroll, useTail } from "../lib/tail";
 
 /** 실행 중인 명령의 출력을 다시 읽는 간격(ms) */
 const POLL_MS = 1000;
@@ -18,6 +19,8 @@ const T = {
   output: "출력 보기",
   hide: "출력 닫기",
   tail: "최근 출력만 표시됩니다",
+  fold: "목록 접기",
+  unfold: "목록 펼치기",
 };
 
 const TAG: Record<BgJob["state"], [string, string]> = {
@@ -49,6 +52,9 @@ function BgOutput({ job }: { job: BgJob }) {
       clearInterval(t);
     };
   }, [job.id, live]);
+  const all = useMemo(() => (text ? text.split("\n") : []), [text]);
+  const tail = useTail(all.length, LOG_LINE_STEP);
+  const keep = useKeepScroll(box, tail.shown);
   useLayoutEffect(() => {
     if (follow && box.current) box.current.scrollTop = box.current.scrollHeight;
   }, [text, follow]);
@@ -56,7 +62,7 @@ function BgOutput({ job }: { job: BgJob }) {
     const b = box.current;
     if (b) setFollow(b.scrollHeight - b.scrollTop - b.clientHeight < 24);
   };
-  const lines = text ? text.split("\n").length : 0;
+  const lines = all.length;
   return (
     <div className="test-log">
       <div className="test-log-head">
@@ -70,7 +76,8 @@ function BgOutput({ job }: { job: BgJob }) {
         )}
       </div>
       <pre ref={box} onScroll={onScroll} tabIndex={0}>
-        {err ?? (text?.trim() ? text : LT.logEmpty)}
+        {!err && <LoadEarlier hidden={tail.hidden} label={TAIL_TEXT.lines} onMore={() => (keep(), setFollow(false), tail.more())} />}
+        {err ?? (text?.trim() ? all.slice(all.length - tail.shown).join("\n") : LT.logEmpty)}
       </pre>
     </div>
   );
@@ -101,9 +108,27 @@ function BgRow({ job, who }: { job: BgJob; who: string }) {
   );
 }
 
+const BG_OPEN_KEY = "elysium.bgJobsOpen";
+/** Folded by default: the list can be long and polls output while open. */
+function loadBgOpen(): boolean {
+  try {
+    return localStorage.getItem(BG_OPEN_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
 /** 이 작업에서 에이전트가 뒤에서 돌리는 명령. 실행 중인 것을 먼저 보인다. */
 export function BgJobs({ l }: { l: Live }) {
   const [loaded, setLoaded] = useState<Record<string, BgJob>>({});
+  const [open, setOpen] = useState(loadBgOpen);
+  useEffect(() => {
+    try {
+      localStorage.setItem(BG_OPEN_KEY, open ? "1" : "0");
+    } catch {
+      /* not saved: this run only */
+    }
+  }, [open]);
   // 앱을 다시 연 경우처럼 이벤트를 놓쳤을 때를 위해 한 번 읽어 둔다.
   useEffect(() => {
     api
@@ -116,15 +141,20 @@ export function BgJobs({ l }: { l: Live }) {
   const running = jobs.filter((j) => j.state === "run").length;
   const who = (key: string) => l.parts[key]?.title ?? l.agents[key]?.label ?? key;
   return (
-    <div className="bg-jobs">
+    <div className={`bg-jobs ${open ? "open" : ""}`}>
       <h5 className="lead-queue-sub">
-        {T.title} <span>{T.count.replace("{r}", String(running)).replace("{n}", String(jobs.length))}</span>
+        <button type="button" className="bg-fold" onClick={() => setOpen((o) => !o)} aria-expanded={open} title={open ? T.fold : T.unfold}>
+          <i className="fold-chev" aria-hidden />
+          {T.title} <span>{T.count.replace("{r}", String(running)).replace("{n}", String(jobs.length))}</span>
+        </button>
       </h5>
-      <ul className="lead-queue">
-        {jobs.map((j) => (
-          <BgRow key={j.id} job={j} who={who(j.key)} />
-        ))}
-      </ul>
+      {open && (
+        <ul className="lead-queue">
+          {jobs.map((j) => (
+            <BgRow key={j.id} job={j} who={who(j.key)} />
+          ))}
+        </ul>
+      )}
     </div>
   );
 }
